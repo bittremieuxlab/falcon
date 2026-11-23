@@ -395,3 +395,30 @@ class TestCliUtilityActionsAndErrorFormatting:
             "Consensus",
         ):
             assert heading in help_text
+
+    def test_non_utf8_config_file_exits_2_on_cli(self, tmp_path, capsys):
+        binary = tmp_path / "bad_bytes.toml"
+        binary.write_bytes(b"\xff\xfe[clustering]\n")
+        with pytest.raises(SystemExit) as exc_info:
+            parse_cli(["in.mgf", "out", "-c", str(binary)])
+        assert exc_info.value.code == 2
+        assert "bad_bytes.toml" in capsys.readouterr().err
+
+    def test_format_validation_error_strips_value_error_prefix(self):
+        with pytest.raises(ValidationError) as exc_info:
+            FalconSettings.model_validate(
+                {"preprocessing": {"min_mz": 500.0, "max_mz": 100.0}}
+            )
+        formatted = format_validation_error(exc_info.value)
+        assert "Value error, " not in formatted
+        assert "min_mz" in formatted
+
+    def test_main_returns_2_when_save_config_unwritable(
+        self, tmp_path, capsys
+    ):
+        from falcon.falcon import main as falcon_main
+
+        dest = tmp_path / "no_such_dir" / "saved.toml"
+        rc = falcon_main(["in.mgf", "out", "--save-config", str(dest)])
+        assert rc == 2
+        assert "Failed to write configuration" in capsys.readouterr().err

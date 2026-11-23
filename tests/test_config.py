@@ -850,3 +850,32 @@ class TestSerializationSchemaAndStaging:
         assert settings.clustering.min_matched_peaks == 6
         assert settings.clustering.fragment_tol == 0.05
         assert settings.consensus == MedoidConsensusConfig()
+
+    def test_symlink_loop_raises_config_error(self, tmp_path):
+        loop = tmp_path / "loop.toml"
+        loop.symlink_to(loop)
+        with pytest.raises(ConfigError, match=r"loop\.toml"):
+            load_toml_file(loop)
+
+    def test_literal_dot_slash_none_work_dir_round_trips(self, tmp_path):
+        cfg = FalconConfig(
+            io=IOConfig.model_validate(
+                {
+                    "input_filenames": ["a.mgf"],
+                    "output_filename": "out",
+                    "work_dir": "./none",
+                }
+            )
+        )
+        toml_text = cfg.to_toml()
+        assert 'work_dir = "./none"' in toml_text
+        replayed = tmp_path / "replay_none.toml"
+        replayed.write_text(toml_text, encoding="utf-8")
+        reloaded = load_config(config_files=[replayed])
+        assert reloaded.io.work_dir == Path("none")
+
+    def test_falcon_settings_to_metadata_lines(self):
+        lines = FalconSettings().to_metadata_lines()
+        assert lines[0].startswith("falcon version ")
+        assert "io.work_dir = None" in lines
+        assert "consensus.method = medoid" in lines

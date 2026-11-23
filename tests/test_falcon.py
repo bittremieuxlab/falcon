@@ -14,7 +14,6 @@ from falcon.config import (
     AverageConsensusConfig,
     ClusteringConfig,
     MedoidConsensusConfig,
-    PreprocessingConfig,
     build_staging_manifest,
     load_config,
 )
@@ -254,40 +253,50 @@ class TestLoadOrPrepareBuckets:
             falcon_mod._load_or_prepare_buckets(cfg, tmp_path, lambda s: None)
 
     @pytest.mark.parametrize(
-        "corrupt_content",
+        ("corrupt_bytes", "expected_match"),
         [
-            "{not valid json",
-            json.dumps({"schema_version": 999, "buckets": []}),
-            json.dumps(
-                {
-                    "schema_version": 1,
-                    "inputs": [],
-                    "preprocessing": PreprocessingConfig().model_dump(
-                        mode="json"
-                    ),
-                    "fragment_tol": 0.05,
-                    "precursor_charge_buckets": None,
-                    "buckets": "bad",
-                }
+            (b"{not valid json", "Corrupted staging cache manifest"),
+            (b"\xff\xfe", "Corrupted staging cache manifest"),
+            (
+                json.dumps({"schema_version": 999, "buckets": []}).encode(),
+                "schema_version",
             ),
         ],
     )
     def test_corrupted_staging_cache_json_raises_value_error(
-        self, tmp_path, corrupt_content
+        self, tmp_path, corrupt_bytes, expected_match
     ):
         input_file = tmp_path / "in.mgf"
         input_file.write_text("v1")
         spectra_dir = tmp_path / "spectra"
         spectra_dir.mkdir()
-        (spectra_dir / "staging_cache.json").write_text(
-            corrupt_content, encoding="utf-8"
-        )
+        (spectra_dir / "staging_cache.json").write_bytes(corrupt_bytes)
         cfg = make_falcon_config(
             input_filenames=[str(input_file)],
             output_filename=tmp_path / "out",
             io={"work_dir": str(tmp_path)},
         )
-        with pytest.raises(ValueError, match="cache"):
+        with pytest.raises(ValueError, match=expected_match):
+            falcon_mod._load_or_prepare_buckets(cfg, tmp_path, lambda s: None)
+
+    def test_invalid_buckets_in_matching_manifest_raises_actionable_error(
+        self, tmp_path
+    ):
+        input_file = tmp_path / "in.mgf"
+        input_file.write_text("v1")
+        spectra_dir = tmp_path / "spectra"
+        spectra_dir.mkdir()
+        cfg = make_falcon_config(
+            input_filenames=[str(input_file)],
+            output_filename=tmp_path / "out",
+            io={"work_dir": str(tmp_path)},
+        )
+        manifest = build_staging_manifest(cfg, [input_file])
+        manifest["buckets"] = "bad"
+        (spectra_dir / "staging_cache.json").write_text(
+            json.dumps(manifest), encoding="utf-8"
+        )
+        with pytest.raises(ValueError, match="Invalid staging cache buckets"):
             falcon_mod._load_or_prepare_buckets(cfg, tmp_path, lambda s: None)
 
     @pytest.mark.parametrize(
@@ -536,3 +545,26 @@ class TestRunClusteringAndExportResults:
         assert falcon_mod.run(cfg) == 0
         assert shutdown_called is False
         assert (tmp_path / "prog_out.csv").is_file()
+
+    def test_run_cleans_up_temp_work_dir_if_logging_raises(
+        self, tmp_path, monkeypatch
+    ):
+        created: list[str] = []
+        orig_mkdtemp = falcon_mod.tempfile.mkdtemp
+
+        def _track(*args, **kwargs):
+            d = orig_mkdtemp(*args, **kwargs)
+            created.append(d)
+            return d
+
+        def _boom(*_args, **_kwargs):
+            raise RuntimeError("log handler boom")
+
+        monkeypatch.setattr(falcon_mod.tempfile, "mkdtemp", _track)
+        monkeypatch.setattr(falcon_mod, "_log_config", _boom)
+
+        cfg = make_falcon_config(output_filename=tmp_path / "out")
+        with pytest.raises(RuntimeError, match="log handler boom"):
+            falcon_mod.run(cfg)
+        assert len(created) == 1
+        assert not os.path.exists(created[0])

@@ -551,7 +551,17 @@ def load_toml_file(
         If the file is missing, is a directory, cannot be decoded as
         UTF-8 TOML, has invalid ``extends`` entries, or forms a cycle.
     """
-    resolved = path.resolve()
+    origin = (
+        f" (referenced by {_referenced_by})"
+        if _referenced_by is not None
+        else ""
+    )
+    try:
+        resolved = path.resolve()
+    except (OSError, RuntimeError) as exc:
+        raise ConfigError(
+            f"Failed to resolve configuration file {path}{origin}: {exc}"
+        ) from exc
     if resolved in _stack:
         cycle_start = _stack.index(resolved)
         cycle_trace = " -> ".join(
@@ -559,11 +569,6 @@ def load_toml_file(
         )
         raise ConfigError(f"Cycle detected in config 'extends': {cycle_trace}")
 
-    origin = (
-        f" (referenced by {_referenced_by})"
-        if _referenced_by is not None
-        else ""
-    )
     if not path.exists():
         raise ConfigError(f"Configuration file not found: {path}{origin}")
     if path.is_dir():
@@ -711,7 +716,12 @@ def _format_toml(
     else:
         lines.append('# output_filename = ""')
     if effective_work_dir is not None:
-        lines.append(f"work_dir = {_toml_literal(effective_work_dir)}")
+        work_dir_str = (
+            "./none"
+            if effective_work_dir == Path("none")
+            else str(effective_work_dir)
+        )
+        lines.append(f"work_dir = {_toml_literal(work_dir_str)}")
     else:
         lines.append('# work_dir = "none"')
     lines.append(f"overwrite = {_toml_literal(cfg.io.overwrite)}")

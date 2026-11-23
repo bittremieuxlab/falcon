@@ -75,8 +75,8 @@ def run(config: FalconConfig) -> int:
         exist and ``config.io.overwrite`` is ``False``.
     """
     work_dir, rm_work_dir = _setup_work_dir(config.io.work_dir)
-    _log_config(config, work_dir)
     try:
+        _log_config(config, work_dir)
         # Abort if outputs already exist and overwrite was not enabled.
         if _validate_outputs(config.io):
             return 1
@@ -339,7 +339,7 @@ def _load_or_prepare_buckets(
     elif cache_path.is_file():
         try:
             cached = json.loads(cache_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ValueError(
                 f"Corrupted staging cache manifest at {cache_path}; "
                 "rerun with --overwrite or a different --work-dir."
