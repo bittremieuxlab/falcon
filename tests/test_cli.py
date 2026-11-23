@@ -422,3 +422,251 @@ class TestCliUtilityActionsAndErrorFormatting:
         rc = falcon_main(["in.mgf", "out", "--save-config", str(dest)])
         assert rc == 2
         assert "Failed to write configuration" in capsys.readouterr().err
+
+
+class TestSaveConfigInputAliasProtection:
+    def test_main_rejects_direct_and_relative_input_alias_before_writing(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        from falcon import falcon as falcon_mod
+
+        input_file = tmp_path / "sample.mgf"
+        original = "BEGIN IONS\nPEPMASS=500.0\nEND IONS\n"
+        input_file.write_text(original, encoding="utf-8")
+
+        def _fail_run(_cfg):
+            raise AssertionError("run() must not execute on alias error")
+
+        monkeypatch.setattr(falcon_mod, "run", _fail_run)
+
+        # Direct path alias.
+        rc = falcon_mod.main(
+            [
+                str(input_file),
+                str(tmp_path / "out"),
+                "--save-config",
+                str(input_file),
+            ]
+        )
+        assert rc == 2
+        assert "aliases input file" in capsys.readouterr().err
+        assert input_file.read_text(encoding="utf-8") == original
+
+        # Non-normalized relative alias pointing to the same file.
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        rel_alias = sub / ".." / "sample.mgf"
+        rc2 = falcon_mod.main(
+            [
+                str(input_file),
+                str(tmp_path / "out"),
+                "--save-config",
+                str(rel_alias),
+            ]
+        )
+        assert rc2 == 2
+        assert "aliases input file" in capsys.readouterr().err
+        assert input_file.read_text(encoding="utf-8") == original
+
+    def test_main_rejects_glob_selected_input_alias_before_writing(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        from falcon import falcon as falcon_mod
+
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        spec_a = data_dir / "a.mgf"
+        spec_b = data_dir / "b.mgf"
+        spec_a.write_text("MGF_A\n", encoding="utf-8")
+        spec_b.write_text("MGF_B\n", encoding="utf-8")
+
+        def _fail_run(_cfg):
+            raise AssertionError("run() must not execute on alias error")
+
+        monkeypatch.setattr(falcon_mod, "run", _fail_run)
+
+        # CLI glob selecting b.mgf.
+        rc = falcon_mod.main(
+            [
+                str(data_dir / "*.mgf"),
+                str(tmp_path / "out"),
+                "--save-config",
+                str(spec_b),
+            ]
+        )
+        assert rc == 2
+        assert "aliases input file" in capsys.readouterr().err
+        assert spec_b.read_text(encoding="utf-8") == "MGF_B\n"
+
+        # Glob declared inside a TOML config file.
+        run_toml = tmp_path / "run.toml"
+        run_toml.write_text(
+            "[io]\n"
+            f'input_filenames = ["{data_dir / "*.mgf"}"]\n'
+            f'output_filename = "{tmp_path / "out"}"\n',
+            encoding="utf-8",
+        )
+        rc2 = falcon_mod.main(
+            ["-c", str(run_toml), "--save-config", str(spec_a)]
+        )
+        assert rc2 == 2
+        assert "aliases input file" in capsys.readouterr().err
+        assert spec_a.read_text(encoding="utf-8") == "MGF_A\n"
+
+    def test_rejects_symlink_and_hardlink_aliases_before_writing(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        import os
+
+        from falcon import falcon as falcon_mod
+
+        real_mgf = tmp_path / "real.mgf"
+        real_mgf.write_text("REAL_MGF\n", encoding="utf-8")
+        sym_dest = tmp_path / "sym_config.toml"
+        sym_dest.symlink_to(real_mgf)
+        hard_dest = tmp_path / "hard_config.toml"
+        os.link(real_mgf, hard_dest)
+
+        def _fail_run(_cfg):
+            raise AssertionError("run() must not execute on alias error")
+
+        monkeypatch.setattr(falcon_mod, "run", _fail_run)
+
+        for dest in (sym_dest, hard_dest):
+            rc = falcon_mod.main(
+                [
+                    str(real_mgf),
+                    str(tmp_path / "out"),
+                    "--save-config",
+                    str(dest),
+                ]
+            )
+            assert rc == 2
+            assert "aliases input file" in capsys.readouterr().err
+            assert real_mgf.read_text(encoding="utf-8") == "REAL_MGF\n"
+
+        # Reverse direction: symlinked input, real path as save target.
+        sym_in = tmp_path / "in_link.mgf"
+        sym_in.symlink_to(real_mgf)
+        rc_rev = falcon_mod.main(
+            [
+                str(sym_in),
+                str(tmp_path / "out"),
+                "--save-config",
+                str(real_mgf),
+            ]
+        )
+        assert rc_rev == 2
+        assert "aliases input file" in capsys.readouterr().err
+        assert real_mgf.read_text(encoding="utf-8") == "REAL_MGF\n"
+
+    def test_rejects_nonexistent_literal_input_and_symlink_loop(
+        self, tmp_path, capsys
+    ):
+        from falcon.falcon import main as falcon_main
+
+        missing = tmp_path / "missing.mgf"
+        rc = falcon_main(
+            [
+                str(missing),
+                str(tmp_path / "out"),
+                "--save-config",
+                str(missing),
+            ]
+        )
+        assert rc == 2
+        assert "aliases input file" in capsys.readouterr().err
+        assert not missing.exists()
+
+        loop = tmp_path / "loop.toml"
+        loop.symlink_to(loop)
+        rc_loop = falcon_main(
+            [
+                str(tmp_path / "other.mgf"),
+                str(tmp_path / "out"),
+                "--save-config",
+                str(loop),
+            ]
+        )
+        assert rc_loop == 2
+        assert (
+            "Failed to resolve --save-config path" in capsys.readouterr().err
+        )
+
+    def test_distinct_destinations_remain_valid_with_glob_inputs(
+        self, tmp_path, monkeypatch
+    ):
+        from falcon import falcon as falcon_mod
+
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        (data_dir / "a.mgf").write_text("MGF_A\n", encoding="utf-8")
+        # Distinct new destination in the same directory as the glob.
+        new_dest = data_dir / "saved.toml"
+        # Distinct existing TOML file may still be updated.
+        existing_dest = tmp_path / "existing.toml"
+        existing_dest.write_text("# old\n", encoding="utf-8")
+
+        monkeypatch.setattr(falcon_mod, "run", lambda _cfg: 0)
+
+        for dest in (new_dest, existing_dest):
+            rc = falcon_mod.main(
+                [
+                    str(data_dir / "*.mgf"),
+                    str(tmp_path / "out"),
+                    "--save-config",
+                    str(dest),
+                ]
+            )
+            assert rc == 0
+            assert dest.is_file()
+            loaded = load_config(config_files=[dest])
+            assert loaded.io.input_filenames == (str(data_dir / "*.mgf"),)
+        assert (data_dir / "a.mgf").read_text(encoding="utf-8") == "MGF_A\n"
+
+    def test_unmatched_glob_and_broken_input_symlink_allow_distinct_save(
+        self, tmp_path
+    ):
+        # Unmatched glob does not block saving to a distinct file.
+        dest = tmp_path / "saved.toml"
+        cfg = load_config(
+            overrides={
+                "io": {
+                    "input_filenames": [str(tmp_path / "none_*.mgf")],
+                    "output_filename": str(tmp_path / "out"),
+                }
+            }
+        )
+        write_saved_config(cfg, dest)
+        assert dest.is_file()
+
+        # A symlink-loop input does not crash saving elsewhere.
+        bad_input = tmp_path / "bad_input.mgf"
+        bad_input.symlink_to(bad_input)
+        dest2 = tmp_path / "saved2.toml"
+        cfg2 = load_config(
+            overrides={
+                "io": {
+                    "input_filenames": [str(bad_input)],
+                    "output_filename": str(tmp_path / "out"),
+                }
+            }
+        )
+        write_saved_config(cfg2, dest2)
+        assert dest2.is_file()
+
+        # Direct write_saved_config rejects dangling symlink to input.
+        missing_in = tmp_path / "future.mgf"
+        dangling = tmp_path / "dangling.toml"
+        dangling.symlink_to(missing_in)
+        cfg3 = load_config(
+            overrides={
+                "io": {
+                    "input_filenames": [str(missing_in)],
+                    "output_filename": str(tmp_path / "out"),
+                }
+            }
+        )
+        with pytest.raises(ConfigError, match="aliases input file"):
+            write_saved_config(cfg3, dangling)
+        assert not missing_in.exists()

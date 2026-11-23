@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import glob
+import os
 import textwrap
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -595,6 +597,75 @@ def parse_cli(args: Sequence[str] | None = None) -> CliResult:
         parser.error(format_validation_error(exc))
 
 
+def _expand_input_candidates(patterns: Sequence[str]) -> list[Path]:
+    """Expand input patterns into glob matches and literal paths."""
+    candidates: list[Path] = []
+    for pattern in patterns:
+        matches = sorted(glob.glob(pattern))
+        if matches:
+            candidates.extend(Path(match) for match in matches)
+        elif not glob.has_magic(pattern):
+            candidates.append(Path(pattern))
+    return candidates
+
+
+def _paths_alias(
+    destination: Path,
+    resolved_dest: Path,
+    dest_exists: bool,
+    candidate: Path,
+) -> bool:
+    """Return True if ``destination`` aliases ``candidate``."""
+    try:
+        if resolved_dest == candidate.resolve():
+            return True
+    except (OSError, RuntimeError):
+        return False
+    if dest_exists and candidate.exists():
+        try:
+            return os.path.samefile(destination, candidate)
+        except OSError:
+            return False
+    return False
+
+
+def _validate_save_destination(
+    config: FalconConfig, destination: Path
+) -> None:
+    """
+    Ensure ``destination`` is a file path distinct from all inputs.
+
+    Checks both literal paths and files matched by input globs in
+    ``config.io.input_filenames``, catching relative paths, symlinks,
+    and hardlinks before any write occurs.
+
+    Raises
+    ------
+    ConfigError
+        If ``destination`` is a directory, cannot be resolved, or
+        aliases any input file.
+    """
+    if destination.exists() and destination.is_dir():
+        raise ConfigError(
+            f"--save-config path is a directory, expected a file path: "
+            f"{destination}"
+        )
+    try:
+        resolved_dest = destination.resolve()
+    except (OSError, RuntimeError) as exc:
+        raise ConfigError(
+            f"Failed to resolve --save-config path {destination}: {exc}"
+        ) from exc
+
+    dest_exists = destination.exists()
+    for candidate in _expand_input_candidates(config.io.input_filenames):
+        if _paths_alias(destination, resolved_dest, dest_exists, candidate):
+            raise ConfigError(
+                f"--save-config path {destination} aliases input file "
+                f"{candidate}; choose a distinct destination"
+            )
+
+
 def write_saved_config(config: FalconConfig, destination: Path) -> None:
     """
     Write a resolved ``FalconConfig`` as TOML to ``destination``.
@@ -604,18 +675,16 @@ def write_saved_config(config: FalconConfig, destination: Path) -> None:
     config : FalconConfig
         Validated run configuration to serialize.
     destination : Path
-        Target TOML file path (must not be an existing directory).
+        Target TOML file path (must not be a directory or alias any
+        configured input peak file).
 
     Raises
     ------
     ConfigError
-        If ``destination`` is a directory or cannot be written.
+        If ``destination`` is a directory, aliases an input file, or
+        cannot be written.
     """
-    if destination.exists() and destination.is_dir():
-        raise ConfigError(
-            f"--save-config path is a directory, expected a file path: "
-            f"{destination}"
-        )
+    _validate_save_destination(config, destination)
     try:
         destination.write_text(config.to_toml(), encoding="utf-8")
     except OSError as exc:
