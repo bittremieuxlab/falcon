@@ -694,6 +694,94 @@ class TestSerializationSchemaAndStaging:
         replayed.write_text(toml_text, encoding="utf-8")
         assert load_config(config_files=[replayed]) == custom
 
+    def test_to_toml_round_trip_non_bmp_filenames(self, tmp_path):
+        cfg = FalconConfig(
+            io=IOConfig(
+                input_filenames=(
+                    str(tmp_path / "sample_🧪.mgf"),
+                    "spectra_𝄞/*.mzML",
+                ),
+                output_filename=tmp_path / "results_🧬" / "run_🧪",
+                work_dir=tmp_path / "work_🔬",
+            )
+        )
+        toml_text = cfg.to_toml()
+        parsed = tomllib.loads(toml_text)
+        assert parsed["io"]["input_filenames"] == list(cfg.io.input_filenames)
+        assert parsed["io"]["output_filename"] == str(cfg.io.output_filename)
+        assert parsed["io"]["work_dir"] == str(cfg.io.work_dir)
+
+        saved = tmp_path / "saved_🧪.toml"
+        saved.write_text(toml_text, encoding="utf-8")
+        assert load_config(config_files=[saved]) == cfg
+
+        settings = FalconSettings(
+            io=PartialIOConfig(
+                input_filenames=("inspect_🧪.mgf",),
+                output_filename=Path("inspect_🧬"),
+                work_dir=Path("work_🔬"),
+            )
+        )
+        settings_toml = settings.to_toml()
+        assert load_settings(overrides=tomllib.loads(settings_toml)) == (
+            settings
+        )
+
+    def test_to_toml_escapes_quotes_backslashes_and_control_chars(
+        self, tmp_path
+    ):
+        all_controls = "".join(chr(code) for code in range(0x20)) + "\x7f"
+        special_str = f'in_\\"quote"\\path_{all_controls}_end.mgf'
+        special_path = Path(f'dir_\\sub"q"_{all_controls}_out')
+        special_work = Path('work_\\t\t"q"\n\r\b\f\x1b\x7f')
+        cfg = FalconConfig(
+            io=IOConfig(
+                input_filenames=(special_str,),
+                output_filename=special_path,
+                work_dir=special_work,
+            )
+        )
+        toml_text = cfg.to_toml()
+        # Verify key TOML basic-string escapes appear in the raw output.
+        for expected_escape in (
+            r"\\",
+            r"\"",
+            r"\b",
+            r"\t",
+            r"\n",
+            r"\f",
+            r"\r",
+            r"\u0000",
+            r"\u001b",
+            r"\u007f",
+        ):
+            assert expected_escape in toml_text
+        # No raw DEL or C0 control characters outside line breaks.
+        for line in toml_text.splitlines():
+            assert all(ord(ch) >= 0x20 and ord(ch) != 0x7F for ch in line)
+
+        saved = tmp_path / "escaped.toml"
+        saved.write_text(toml_text, encoding="utf-8")
+        assert load_config(config_files=[saved]) == cfg
+
+    @pytest.mark.parametrize(
+        "io_kwargs",
+        [
+            {
+                "input_filenames": ("bad_\ud800.mgf",),
+                "output_filename": Path("o"),
+            },
+            {
+                "input_filenames": ("ok.mgf",),
+                "output_filename": Path("bad_\udfff"),
+            },
+        ],
+    )
+    def test_to_toml_rejects_lone_surrogates(self, io_kwargs):
+        cfg = FalconConfig(io=IOConfig(**io_kwargs))
+        with pytest.raises(ConfigError, match="surrogate"):
+            cfg.to_toml()
+
     def test_to_metadata_lines_medoid_and_average(self, tmp_path):
         work_dir = tmp_path / "wd"
         medoid_cfg = FalconConfig(

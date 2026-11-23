@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import copy
-import json
 import math
 import os
 import tomllib
@@ -678,6 +677,39 @@ def load_config(
 # ----------------------------------------------------------------------
 
 
+_TOML_ESCAPES: dict[str, str] = {
+    "\\": "\\\\",
+    '"': '\\"',
+    "\b": "\\b",
+    "\t": "\\t",
+    "\n": "\\n",
+    "\f": "\\f",
+    "\r": "\\r",
+}
+
+
+def _toml_string(value: str) -> str:
+    """Encode ``value`` as a valid TOML 1.0 basic string literal."""
+    parts: list[str] = ['"']
+    for ch in value:
+        escaped = _TOML_ESCAPES.get(ch)
+        if escaped is not None:
+            parts.append(escaped)
+            continue
+        code = ord(ch)
+        if 0xD800 <= code <= 0xDFFF:
+            raise ConfigError(
+                f"Cannot serialize lone surrogate code point U+{code:04X} "
+                "to TOML."
+            )
+        if code < 0x20 or code == 0x7F:
+            parts.append(f"\\u{code:04x}")
+        else:
+            parts.append(ch)
+    parts.append('"')
+    return "".join(parts)
+
+
 def _toml_literal(value: Any) -> str:
     """Format a validated scalar or nested list as a TOML literal."""
     if isinstance(value, bool):
@@ -686,10 +718,8 @@ def _toml_literal(value: Any) -> str:
         return str(value)
     if isinstance(value, float):
         return repr(float(value))
-    if isinstance(value, Path):
-        return json.dumps(str(value))
-    if isinstance(value, str):
-        return json.dumps(value)
+    if isinstance(value, (Path, str)):
+        return _toml_string(str(value))
     if isinstance(value, (list, tuple)):
         return "[" + ", ".join(_toml_literal(v) for v in value) + "]"
     raise TypeError(f"Unsupported TOML value type: {type(value)}")
