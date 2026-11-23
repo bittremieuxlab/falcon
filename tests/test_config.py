@@ -1,11 +1,15 @@
 """Unit tests for falcon.config."""
 
+import json
+import os
+import tomllib
 from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
 from falcon.config import (
+    STAGING_CACHE_SCHEMA_VERSION,
     AverageConsensusConfig,
     ClusteringConfig,
     ConfigError,
@@ -16,6 +20,14 @@ from falcon.config import (
     PartialIOConfig,
     PrecursorTolerance,
     PreprocessingConfig,
+    build_json_schema,
+    build_staging_manifest,
+    deserialize_cached_buckets,
+    diff_staging_manifests,
+    load_config,
+    load_settings,
+    load_toml_file,
+    merge_config_dicts,
 )
 
 # ----------------------------------------------------------------------
@@ -405,3 +417,424 @@ class TestCrossFieldInvariants:
                 preprocessing=PreprocessingConfig(min_mz=0.0, max_mz=1500.0),
                 clustering=ClusteringConfig(fragment_tol=1e-8),
             )
+
+
+# ----------------------------------------------------------------------
+# Hierarchical merging and TOML loading with extends
+# ----------------------------------------------------------------------
+
+
+class TestHierarchicalMergeAndLoading:
+    def test_merge_config_dicts_deep_merges_and_does_not_mutate(self):
+        base = {
+            "preprocessing": {"min_mz": 101.0, "max_mz": 1500.0},
+            "clustering": {
+                "precursor_tol": {"mass": 20.0, "mode": "ppm"},
+                "precursor_charge_buckets": [[1], [2]],
+            },
+        }
+        override = {
+            "preprocessing": {"min_mz": 0.0},
+            "clustering": {
+                "precursor_tol": {"mass": 10.0},
+                "precursor_charge_buckets": [[2, 3]],
+            },
+        }
+        merged = merge_config_dicts(base, override)
+        assert merged == {
+            "preprocessing": {"min_mz": 0.0, "max_mz": 1500.0},
+            "clustering": {
+                "precursor_tol": {"mass": 10.0, "mode": "ppm"},
+                "precursor_charge_buckets": [[2, 3]],
+            },
+        }
+        # Originals remain untouched.
+        assert base["preprocessing"]["min_mz"] == 101.0
+        assert base["clustering"]["precursor_charge_buckets"] == [[1], [2]]
+        merged["clustering"]["precursor_charge_buckets"].append("other")
+        assert override["clustering"]["precursor_charge_buckets"] == [[2, 3]]
+
+    def test_consensus_discriminator_merge_semantics(self):
+        base = {
+            "consensus": {
+                "method": "average",
+                "outlier_cutoff_lower": 2.0,
+                "outlier_cutoff_upper": 3.0,
+            }
+        }
+        # Partial override without method preserves average + sibling cutoff.
+        partial = merge_config_dicts(
+            base, {"consensus": {"outlier_cutoff_upper": 2.5}}
+        )
+        settings_avg = FalconSettings.model_validate(partial)
+        assert settings_avg.consensus == AverageConsensusConfig(
+            outlier_cutoff_lower=2.0, outlier_cutoff_upper=2.5
+        )
+
+        # Switching method to medoid drops stale average-only cutoffs.
+        switched = merge_config_dicts(
+            base, {"consensus": {"method": "medoid"}}
+        )
+        settings_med = FalconSettings.model_validate(switched)
+        assert settings_med.consensus == MedoidConsensusConfig()
+
+        # Same-layer method=medoid + outlier_cutoff still fails validation.
+        conflict = merge_config_dicts(
+            base,
+            {"consensus": {"method": "medoid", "outlier_cutoff_lower": 2.0}},
+        )
+        with pytest.raises(ValidationError):
+            FalconSettings.model_validate(conflict)
+
+    def test_sparse_toml_layering_and_cli_overrides_precedence(self, tmp_path):
+        base_toml = tmp_path / "base.toml"
+        base_toml.write_text(
+            "[preprocessing]\n"
+            "min_mz = 0.0\n"
+            "max_mz = 1000.0\n"
+            "min_mz_range = 150.0\n"
+            "[clustering]\n"
+            "min_matched_peaks = 6\n"
+            "rt_tol = 30.0\n"
+            'precursor_charge_buckets = [[1], [2, 3], "other"]\n',
+            encoding="utf-8",
+        )
+        run_toml = tmp_path / "run.toml"
+        run_toml.write_text(
+            "[io]\n"
+            'input_filenames = ["a.mgf"]\n'
+            'output_filename = "results"\n'
+            "export_representatives = true\n"
+            "[clustering]\n"
+            "distance_threshold = 0.2\n"
+            'rt_tol = "none"\n'
+            'precursor_charge_buckets = "auto"\n',
+            encoding="utf-8",
+        )
+
+        cfg = load_config(
+            config_files=[base_toml, run_toml],
+            overrides={"clustering": {"distance_threshold": 0.15}},
+        )
+        assert cfg.io.input_filenames == ("a.mgf",)
+        assert cfg.io.output_filename == Path("results")
+        assert cfg.io.export_representatives is True
+        assert cfg.preprocessing.min_mz == 0.0
+        assert cfg.preprocessing.max_mz == 1000.0
+        assert cfg.preprocessing.min_mz_range == 150.0
+        assert cfg.preprocessing.min_peaks == 5  # untouched default
+        assert cfg.clustering.min_matched_peaks == 6
+        assert cfg.clustering.distance_threshold == 0.15
+        assert cfg.clustering.rt_tol is None
+        assert cfg.clustering.precursor_charge_buckets is None
+
+    def test_extends_single_and_list_relative_to_declaring_file(
+        self, tmp_path, monkeypatch
+    ):
+        presets = tmp_path / "presets"
+        runs = tmp_path / "runs"
+        other_cwd = tmp_path / "elsewhere"
+        presets.mkdir()
+        runs.mkdir()
+        other_cwd.mkdir()
+
+        (presets / "shared.toml").write_text(
+            "[preprocessing]\nmin_mz = 50.0\nmax_mz = 1200.0\n",
+            encoding="utf-8",
+        )
+        (presets / "left.toml").write_text(
+            'extends = "shared.toml"\n'
+            "[clustering]\nmin_matched_peaks = 6\ndistance_threshold = 0.2\n",
+            encoding="utf-8",
+        )
+        (presets / "right.toml").write_text(
+            'extends = "shared.toml"\n'
+            "[clustering]\ndistance_threshold = 0.15\n"
+            '[consensus]\nmethod = "average"\noutlier_cutoff_lower = 2.0\n',
+            encoding="utf-8",
+        )
+        child = runs / "exp.toml"
+        child.write_text(
+            'extends = ["../presets/left.toml", "../presets/right.toml"]\n'
+            "[preprocessing]\nmin_mz = 0.0\n",
+            encoding="utf-8",
+        )
+
+        # Invoke from unrelated CWD; relative extends must still resolve.
+        monkeypatch.chdir(other_cwd)
+        settings = load_settings(config_files=[child])
+        assert settings.preprocessing.min_mz == 0.0
+        assert settings.preprocessing.max_mz == 1200.0
+        assert settings.clustering.min_matched_peaks == 6
+        assert settings.clustering.distance_threshold == 0.15
+        assert settings.consensus == AverageConsensusConfig(
+            outlier_cutoff_lower=2.0, outlier_cutoff_upper=1.5
+        )
+
+    def test_extends_indirect_cycle_raises_config_error(self, tmp_path):
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        a = tmp_path / "a.toml"
+        b = sub / "b.toml"
+        a.write_text('extends = "sub/b.toml"\n', encoding="utf-8")
+        b.write_text('extends = "../a.toml"\n', encoding="utf-8")
+
+        with pytest.raises(ConfigError, match="Cycle"):
+            load_toml_file(a)
+
+    def test_no_silent_autoload_of_cwd_config_files(
+        self, tmp_path, monkeypatch
+    ):
+        (tmp_path / "config.ini").write_text("min_peaks = 99\n")
+        (tmp_path / "falcon.toml").write_text(
+            "[preprocessing]\nmin_peaks = 99\n"
+        )
+        monkeypatch.chdir(tmp_path)
+        settings = load_settings()
+        assert settings.preprocessing.min_peaks == 5
+
+    def test_invalid_toml_files_and_extends_raise_config_error(self, tmp_path):
+        # Missing file
+        with pytest.raises(ConfigError, match=r"missing\.toml"):
+            load_settings(config_files=[tmp_path / "missing.toml"])
+
+        # Directory path
+        d = tmp_path / "adir"
+        d.mkdir()
+        with pytest.raises(ConfigError, match="directory"):
+            load_settings(config_files=[d])
+
+        # Non-UTF-8 bytes
+        bad_bytes = tmp_path / "binary.toml"
+        bad_bytes.write_bytes(b"\xff\xfe[preprocessing]\n")
+        with pytest.raises(ConfigError, match=r"binary\.toml"):
+            load_settings(config_files=[bad_bytes])
+
+        # Invalid TOML syntax
+        bad_syntax = tmp_path / "syntax.toml"
+        bad_syntax.write_text("[preprocessing\nmin_peaks = 5\n")
+        with pytest.raises(ConfigError, match=r"syntax\.toml"):
+            load_settings(config_files=[bad_syntax])
+
+        # Missing extends target names both parent and child
+        bad_parent = tmp_path / "child.toml"
+        bad_parent.write_text('extends = "nope.toml"\n')
+        with pytest.raises(ConfigError, match=r"nope\.toml"):
+            load_settings(config_files=[bad_parent])
+
+    @pytest.mark.parametrize(
+        "extends_toml",
+        [
+            "extends = 123\n",
+            "extends = []\n",
+            'extends = ""\n',
+            'extends = [""]\n',
+            "extends = [1]\n",
+        ],
+    )
+    def test_invalid_extends_types_raise_config_error(
+        self, tmp_path, extends_toml
+    ):
+        bad = tmp_path / "bad_extends.toml"
+        bad.write_text(extends_toml, encoding="utf-8")
+        with pytest.raises(ConfigError, match="extends"):
+            load_settings(config_files=[bad])
+
+
+# ----------------------------------------------------------------------
+# TOML export, metadata lines, JSON Schema, and staging manifests
+# ----------------------------------------------------------------------
+
+
+class TestSerializationSchemaAndStaging:
+    def test_to_toml_round_trip_and_commented_disabled_fields(self, tmp_path):
+        default_settings = FalconSettings()
+        default_toml = default_settings.to_toml()
+        assert '# rt_tol = "none"' in default_toml
+        assert '# precursor_charge_buckets = "auto"' in default_toml
+        parsed_default = tomllib.loads(default_toml)
+        assert load_settings(overrides=parsed_default) == default_settings
+
+        custom = FalconConfig(
+            io=IOConfig(
+                input_filenames=("a.mgf", "b.mzml"),
+                output_filename=Path("dir/run_v1.2"),
+                work_dir=tmp_path / "falcon_work",
+                overwrite=True,
+                export_representatives=True,
+            ),
+            preprocessing=PreprocessingConfig(
+                min_peaks=3,
+                min_mz=0.0,
+                max_mz=1000.0,
+                min_mz_range=150.0,
+                remove_precursor_tol=None,
+                min_intensity=0.0,
+                max_peaks_used=None,
+                scaling="root",
+            ),
+            clustering=ClusteringConfig(
+                precursor_tol=PrecursorTolerance(mass=0.05, mode="Da"),
+                rt_tol=15.5,
+                fragment_tol=0.02,
+                linkage="average",
+                distance_threshold=0.25,
+                min_matched_peaks=6,
+                batch_size=1024,
+                precursor_charge_buckets=((1,), (2, 3), ("unknown",), "other"),
+            ),
+            consensus=AverageConsensusConfig(
+                outlier_cutoff_lower=2.0, outlier_cutoff_upper=3.0
+            ),
+        )
+        toml_text = custom.to_toml()
+        assert '\nremove_precursor_tol = "none"\n' in toml_text
+        assert '\nmax_peaks_used = "none"\n' in toml_text
+        replayed = tmp_path / "replayed.toml"
+        replayed.write_text(toml_text, encoding="utf-8")
+        assert load_config(config_files=[replayed]) == custom
+
+    def test_to_metadata_lines_medoid_and_average(self, tmp_path):
+        work_dir = tmp_path / "wd"
+        medoid_cfg = FalconConfig(
+            io=IOConfig(input_filenames=("in.mgf",), output_filename=Path("o"))
+        )
+        med_lines = medoid_cfg.to_metadata_lines(work_dir=work_dir)
+        assert any(line.startswith("falcon version ") for line in med_lines)
+        assert f"io.work_dir = {work_dir}" in med_lines
+        assert "clustering.precursor_tol = 20.0 ppm" in med_lines
+        assert "consensus.method = medoid" in med_lines
+        assert not any("outlier_cutoff" in line for line in med_lines)
+
+        avg_cfg = FalconConfig(
+            io=IOConfig(
+                input_filenames=("in.mgf",), output_filename=Path("o")
+            ),
+            consensus=AverageConsensusConfig(
+                outlier_cutoff_lower=2.0, outlier_cutoff_upper=3.5
+            ),
+        )
+        avg_lines = avg_cfg.to_metadata_lines()
+        assert "consensus.method = average" in avg_lines
+        assert "consensus.outlier_cutoff_lower = 2.0" in avg_lines
+        assert "consensus.outlier_cutoff_upper = 3.5" in avg_lines
+
+    def test_build_json_schema_is_json_serializable_with_extends_and_sentinels(
+        self,
+    ):
+        schema = build_json_schema()
+        serialized = json.dumps(schema)
+        assert isinstance(serialized, str)
+        assert "extends" in schema["properties"]
+        assert "io" in schema["properties"]
+        assert "preprocessing" in schema["properties"]
+        assert "clustering" in schema["properties"]
+        assert "consensus" in schema["properties"]
+        # Sentinels appear in schema definitions for TOML editors.
+        assert '"const": "none"' in serialized
+        assert '"const": "auto"' in serialized
+
+    def test_staging_manifest_and_diff_detects_only_staging_changes(
+        self, tmp_path
+    ):
+        f1 = tmp_path / "a.mgf"
+        f2 = tmp_path / "b.mgf"
+        f1.write_text("data1", encoding="utf-8")
+        f2.write_text("data2", encoding="utf-8")
+
+        base_cfg = FalconConfig(
+            io=IOConfig(
+                input_filenames=(str(f1),),
+                output_filename=tmp_path / "out1",
+            )
+        )
+        base_manifest = build_staging_manifest(
+            base_cfg, [f1], buckets=[(2,), ("unknown",), "other"]
+        )
+        assert base_manifest["schema_version"] == STAGING_CACHE_SCHEMA_VERSION
+        assert base_manifest["buckets"] == [[2], ["unknown"], "other"]
+        assert deserialize_cached_buckets(base_manifest["buckets"]) == [
+            (2,),
+            ("unknown",),
+            "other",
+        ]
+
+        # Clustering/consensus/output changes must NOT invalidate cache.
+        sweep_cfg = FalconConfig(
+            io=IOConfig(
+                input_filenames=(str(f1),),
+                output_filename=tmp_path / "out2",
+                export_representatives=True,
+            ),
+            clustering=ClusteringConfig(
+                distance_threshold=0.25,
+                linkage="average",
+                rt_tol=10.0,
+                min_matched_peaks=6,
+                batch_size=512,
+            ),
+            consensus=AverageConsensusConfig(),
+        )
+        assert (
+            diff_staging_manifests(
+                base_manifest, build_staging_manifest(sweep_cfg, [f1])
+            )
+            == []
+        )
+
+        # Preprocessing change invalidates cache.
+        prep_cfg = FalconConfig(
+            io=base_cfg.io,
+            preprocessing=PreprocessingConfig(min_mz=50.0),
+        )
+        assert diff_staging_manifests(
+            base_manifest, build_staging_manifest(prep_cfg, [f1])
+        ) == ["preprocessing"]
+
+        # fragment_tol change invalidates cache (affects get_dim bounds).
+        frag_cfg = FalconConfig(
+            io=base_cfg.io,
+            clustering=ClusteringConfig(fragment_tol=0.02),
+        )
+        assert diff_staging_manifests(
+            base_manifest, build_staging_manifest(frag_cfg, [f1])
+        ) == ["fragment_tol"]
+
+        # precursor_charge_buckets change invalidates cache.
+        bucket_cfg = FalconConfig(
+            io=base_cfg.io,
+            clustering=ClusteringConfig(precursor_charge_buckets=((2,),)),
+        )
+        assert diff_staging_manifests(
+            base_manifest, build_staging_manifest(bucket_cfg, [f1])
+        ) == ["precursor_charge_buckets"]
+
+        # Different input list invalidates cache.
+        assert diff_staging_manifests(
+            base_manifest, build_staging_manifest(base_cfg, [f1, f2])
+        ) == ["inputs"]
+
+        # Modified input file contents (size / mtime) invalidates cache.
+        f1.write_text("modified_longer_content", encoding="utf-8")
+        st = os.stat(f1)
+        os.utime(f1, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
+        assert diff_staging_manifests(
+            base_manifest, build_staging_manifest(base_cfg, [f1])
+        ) == ["inputs"]
+
+        # Corrupted / non-dict / wrong schema version manifests fail.
+        assert diff_staging_manifests(["legacy"], base_manifest) == [
+            "schema_version"
+        ]
+        bad_ver = {**base_manifest, "schema_version": 999}
+        assert diff_staging_manifests(bad_ver, base_manifest) == [
+            "schema_version"
+        ]
+
+    def test_deserialize_cached_buckets_rejects_corrupted_entries(self):
+        with pytest.raises(ValueError, match="buckets"):
+            deserialize_cached_buckets("not-a-list")
+        with pytest.raises(ValueError, match="bucket"):
+            deserialize_cached_buckets([123])
+        with pytest.raises(ValueError, match="bucket"):
+            deserialize_cached_buckets([[True]])
