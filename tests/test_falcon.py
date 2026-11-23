@@ -357,6 +357,110 @@ class TestLoadOrPrepareBuckets:
         assert saved["buckets"] == [[2]]
         assert saved["precursor_charge_buckets"] is None
 
+    def test_input_modified_during_staging_triggers_cache_mismatch(
+        self, tmp_path, monkeypatch
+    ):
+        input_file = tmp_path / "in.mgf"
+        input_file.write_text("v1")
+        pre_stat = os.stat(input_file)
+        spectra_dir = tmp_path / "spectra"
+        spectra_dir.mkdir()
+
+        cfg = make_falcon_config(
+            input_filenames=[str(input_file)],
+            output_filename=tmp_path / "out",
+            io={"work_dir": str(tmp_path)},
+        )
+
+        def _stage_while_input_changes(_inputs, _wd, _proc, _buckets):
+            input_file.write_text("v2_modified_during_staging")
+            st = os.stat(input_file)
+            os.utime(
+                input_file, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000)
+            )
+            return [(2,), ("unknown",), "other"]
+
+        monkeypatch.setattr(
+            falcon_mod, "_prepare_spectra", _stage_while_input_changes
+        )
+
+        buckets = falcon_mod._load_or_prepare_buckets(
+            cfg, tmp_path, lambda s: None
+        )
+        assert buckets == [(2,), ("unknown",), "other"]
+
+        saved = json.loads(
+            (spectra_dir / "staging_cache.json").read_text(encoding="utf-8")
+        )
+        assert saved["inputs"] == [
+            {
+                "path": str(input_file.resolve()),
+                "size": pre_stat.st_size,
+                "mtime_ns": pre_stat.st_mtime_ns,
+            }
+        ]
+        assert saved["buckets"] == [[2], ["unknown"], "other"]
+
+        with pytest.raises(
+            ValueError,
+            match=r"mismatched: inputs.*--overwrite.*--work-dir",
+        ):
+            falcon_mod._load_or_prepare_buckets(cfg, tmp_path, lambda s: None)
+
+    def test_fresh_staging_reuses_manifest_without_restatting_inputs(
+        self, tmp_path, monkeypatch
+    ):
+        input_file = tmp_path / "in.mgf"
+        input_file.write_text("v1")
+        spectra_dir = tmp_path / "spectra"
+        spectra_dir.mkdir()
+
+        cfg = make_falcon_config(
+            input_filenames=[str(input_file)],
+            output_filename=tmp_path / "out",
+            io={"work_dir": str(tmp_path)},
+            clustering={"precursor_charge_buckets": [[1, 2], "other"]},
+        )
+
+        build_calls = 0
+        orig_build = falcon_mod.build_staging_manifest
+
+        def _spy_build(*args, **kwargs):
+            nonlocal build_calls
+            build_calls += 1
+            return orig_build(*args, **kwargs)
+
+        monkeypatch.setattr(falcon_mod, "build_staging_manifest", _spy_build)
+        monkeypatch.setattr(
+            falcon_mod,
+            "_prepare_spectra",
+            lambda _inputs, _wd, _proc, _buckets: [
+                (2, 1),
+                ("unknown",),
+                "other",
+            ],
+        )
+
+        falcon_mod._load_or_prepare_buckets(cfg, tmp_path, lambda s: None)
+        assert build_calls == 1
+
+        saved = json.loads(
+            (spectra_dir / "staging_cache.json").read_text(encoding="utf-8")
+        )
+        expected = build_staging_manifest(
+            cfg, [input_file], buckets=[(2, 1), ("unknown",), "other"]
+        )
+        assert saved == expected
+
+        def _fail(*_args, **_kwargs):
+            raise AssertionError("_prepare_spectra should not be called")
+
+        monkeypatch.setattr(falcon_mod, "_prepare_spectra", _fail)
+        reused = falcon_mod._load_or_prepare_buckets(
+            cfg, tmp_path, lambda s: None
+        )
+        assert reused == [(1, 2), ("unknown",), "other"]
+
 
 # ----------------------------------------------------------------------
 # _run_clustering, _export_results, and programmatic run()

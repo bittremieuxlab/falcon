@@ -920,10 +920,23 @@ def build_json_schema() -> dict[str, Any]:
 # ----------------------------------------------------------------------
 
 
-def _serialize_buckets(
+def serialize_cached_buckets(
     buckets: Sequence[Any] | None,
 ) -> list[list[int | str] | str] | None:
-    """Convert charge bucket keys into deterministic JSON structures."""
+    """
+    Serialize charge bucket keys for ``staging_cache.json``.
+
+    Parameters
+    ----------
+    buckets : Sequence[Any] | None
+        Charge bucket keys (tuples of charges/``"unknown"`` or
+        ``"other"``), or ``None`` when unset.
+
+    Returns
+    -------
+    list[list[int | str] | str] | None
+        Deterministic JSON-serializable representation, or ``None``.
+    """
     if buckets is None:
         return None
     serialized: list[list[int | str] | str] = []
@@ -981,10 +994,10 @@ def build_staging_manifest(
         "inputs": input_entries,
         "preprocessing": config.preprocessing.model_dump(mode="json"),
         "fragment_tol": config.clustering.fragment_tol,
-        "precursor_charge_buckets": _serialize_buckets(
+        "precursor_charge_buckets": serialize_cached_buckets(
             config.clustering.precursor_charge_buckets
         ),
-        "buckets": _serialize_buckets(buckets),
+        "buckets": serialize_cached_buckets(buckets),
     }
 
 

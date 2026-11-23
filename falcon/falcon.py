@@ -36,6 +36,7 @@ from .config import (
     build_staging_manifest,
     deserialize_cached_buckets,
     diff_staging_manifests,
+    serialize_cached_buckets,
 )
 from .ms_io import ms_io
 from .spectra_io import (
@@ -373,9 +374,10 @@ def _load_or_prepare_buckets(
         process_spectrum,
         config.clustering.precursor_charge_buckets,
     )
-    manifest = build_staging_manifest(
-        config, resolved_inputs, buckets=charge_buckets
-    )
+    manifest = {
+        **expected_manifest,
+        "buckets": serialize_cached_buckets(charge_buckets),
+    }
     _write_json_atomic(cache_path, manifest)
     return charge_buckets
 
