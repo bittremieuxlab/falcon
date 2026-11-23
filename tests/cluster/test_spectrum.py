@@ -1,16 +1,15 @@
-"""Tests for falcon.cluster.spectrum — P1: Spectrum processing pipeline."""
+"""Tests for falcon.cluster.spectrum."""
 
 import math
 
 import numpy as np
-import pytest
 import spectrum_utils.spectrum as sus
 
 from falcon.cluster import spectrum
 
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 # _check_spectrum_valid
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 
 
 class TestCheckSpectrumValid:
@@ -45,9 +44,9 @@ class TestCheckSpectrumValid:
         )
 
 
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 # _norm_intensity
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 
 
 class TestNormIntensity:
@@ -62,9 +61,9 @@ class TestNormIntensity:
         assert abs(normed[0] / normed[1] - 6.0 / 8.0) < 1e-6
 
 
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 # get_dim
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 
 
 class TestGetDim:
@@ -85,9 +84,9 @@ class TestGetDim:
         assert n_bins == math.ceil((end - start) / 0.05)
 
 
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 # process_spectrum
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 
 
 class TestProcessSpectrum:
@@ -144,7 +143,7 @@ class TestProcessSpectrum:
             assert abs(mz_val - 500.0) > 1.5
 
     def test_intensity_filter(self):
-        """Peaks below min_intensity fraction of base peak should be removed."""
+        """Peaks below min_intensity of the base peak are removed."""
         spec = sus.MsmsSpectrum(
             "test:scan:5",
             precursor_mz=500.0,
@@ -166,7 +165,7 @@ class TestProcessSpectrum:
             min_intensity=0.01,
         )
         assert result is not None
-        # The 5.0 intensity peak (0.5% of 1000) should be removed at 1% threshold
+        # The 5.0 peak (0.5% of 1000) is removed at a 1% threshold.
         assert len(result["mz"]) < 6
 
     def test_max_peaks_used(self, simple_spectrum):

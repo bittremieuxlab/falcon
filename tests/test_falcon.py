@@ -1,34 +1,36 @@
-"""Tests for charge-bucket functionality in falcon.falcon."""
+"""Tests for charge buckets, Lance I/O, and the falcon CLI."""
 
-import collections
 import queue
 import threading
 
 import lance
 import numpy as np
+import pandas as pd
 import pyarrow as pa
 import pytest
 
+import falcon
+from falcon.config import config as _global_config
+from falcon.falcon import main as falcon_main
 from falcon.spectra_io import (
-    _PerChargeLockRegistry,
     _discover_auto_buckets,
+    _PerChargeLockRegistry,
     _write_spectra_lance,
     _write_to_dataset,
     bucket_key_to_str,
 )
-from falcon.config import config as _global_config
 
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 # Fixtures
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 
 
 @pytest.fixture
 def work_dir(tmp_path):
-    """Set config.work_dir to a temp directory for tests that call into lance writers.
+    """Set config.work_dir to a temp directory for Lance writer tests.
 
-    Config.__getattr__ raises RuntimeError when uninitialized, so we set the
-    attribute directly in __dict__ to bypass that guard.
+    Config.__getattr__ raises RuntimeError when uninitialized, so the
+    attribute is set directly in __dict__ to bypass that guard.
     """
     (tmp_path / "spectra").mkdir()
     _global_config.__dict__["work_dir"] = str(tmp_path)
@@ -36,9 +38,9 @@ def work_dir(tmp_path):
     del _global_config.__dict__["work_dir"]
 
 
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 # Helpers
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 
 SCHEMA = pa.schema(
     [
@@ -73,9 +75,9 @@ def _run_write_worker(
     work_dir,
     auto_bucket=False,
 ):
-    """Push spectra through _write_spectra_lance and return a dict of row counts.
+    """Push spectra through _write_spectra_lance and return row counts.
 
-    Requires the ``work_dir`` fixture to have set config.work_dir already.
+    Requires the ``work_dir`` fixture to have set config.work_dir.
     """
     q = queue.Queue()
     for spec in spectra:
@@ -96,9 +98,9 @@ def _run_write_worker(
     return counts
 
 
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 # bucket_key_to_str
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 
 
 class TestBucketKeyToStr:
@@ -130,9 +132,9 @@ class TestBucketKeyToStr:
             bucket_key_to_str(42)
 
 
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 # _write_to_dataset
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 
 
 class TestWriteToDataset:
@@ -163,9 +165,9 @@ class TestWriteToDataset:
         assert ds.count_rows() == 2
 
 
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 # Charge routing via _write_spectra_lance
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 
 
 class TestChargeRouting:
@@ -256,9 +258,9 @@ class TestChargeRouting:
         assert counts["spectra_charge_other.lance"] == 1
 
 
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 # Auto-bucket mode: every distinct charge clustered separately
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 
 
 class TestAutoBucketRouting:
@@ -297,7 +299,7 @@ class TestAutoBucketRouting:
         }
 
     def test_no_charge_is_dropped(self, work_dir):
-        # Charges that would be dropped without 'other' are still captured.
+        # Charges that would drop without 'other' are still kept.
         spectra = [_make_spec("x", 7), _make_spec("y", 13)]
         counts = _run_write_worker(
             spectra,
@@ -312,9 +314,9 @@ class TestAutoBucketRouting:
         }
 
 
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 # _discover_auto_buckets
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 
 
 class TestDiscoverAutoBuckets:
@@ -340,3 +342,107 @@ class TestDiscoverAutoBuckets:
             (3,),
             ("unknown",),
         ]
+
+
+# ----------------------------------------------------------------------
+# Package metadata & end-to-end CLI
+# ----------------------------------------------------------------------
+
+
+def test_version_is_non_empty_string():
+    assert isinstance(falcon.__version__, str)
+    assert falcon.__version__
+
+
+@pytest.fixture
+def reset_global_config():
+    """Restore global config state after CLI runs."""
+    prev_namespace = _global_config._namespace
+    yield
+    _global_config._namespace = prev_namespace
+    _global_config.__dict__.pop("work_dir", None)
+
+
+def _write_sample_mgf(path):
+    """Write a minimal MGF with two matching spectra and an outlier."""
+    peaks_a = "\n".join(
+        f"{mz:.1f} {inten:.1f}"
+        for mz, inten in [
+            (150.0, 100.0),
+            (250.0, 200.0),
+            (350.0, 150.0),
+            (450.0, 300.0),
+            (550.0, 250.0),
+            (650.0, 120.0),
+        ]
+    )
+    peaks_b = "\n".join(
+        f"{mz:.1f} {inten:.1f}"
+        for mz, inten in [
+            (180.0, 100.0),
+            (280.0, 200.0),
+            (380.0, 150.0),
+            (480.0, 300.0),
+            (580.0, 250.0),
+            (680.0, 120.0),
+        ]
+    )
+    path.write_text(
+        f"BEGIN IONS\n"
+        f"SCANS=1\n"
+        f"PEPMASS=500.0\n"
+        f"CHARGE=2+\n"
+        f"RTINSECONDS=10.0\n"
+        f"{peaks_a}\n"
+        f"END IONS\n"
+        f"BEGIN IONS\n"
+        f"SCANS=2\n"
+        f"PEPMASS=500.0\n"
+        f"CHARGE=2+\n"
+        f"RTINSECONDS=11.0\n"
+        f"{peaks_a}\n"
+        f"END IONS\n"
+        f"BEGIN IONS\n"
+        f"SCANS=3\n"
+        f"PEPMASS=600.0\n"
+        f"CHARGE=2+\n"
+        f"RTINSECONDS=20.0\n"
+        f"{peaks_b}\n"
+        f"END IONS\n"
+    )
+
+
+class TestMainCLI:
+    def test_end_to_end_clustering_and_overwrite(
+        self, tmp_path, reset_global_config
+    ):
+        mgf_path = tmp_path / "sample.mgf"
+        _write_sample_mgf(mgf_path)
+        out_prefix = tmp_path / "results"
+
+        rc = falcon_main(
+            [str(mgf_path), str(out_prefix), "--export_representatives"]
+        )
+        assert rc == 0
+
+        csv_path = tmp_path / "results.csv"
+        mgf_out_path = tmp_path / "results.mgf"
+        assert csv_path.is_file()
+        assert mgf_out_path.is_file()
+
+        df = pd.read_csv(csv_path, comment="#").set_index("identifier")
+        assert len(df) == 3
+        c1 = df.loc["sample:scan:1", "cluster"]
+        c2 = df.loc["sample:scan:2", "cluster"]
+        c3 = df.loc["sample:scan:3", "cluster"]
+        assert c1 == c2
+        assert c1 != c3
+        assert mgf_out_path.read_text().count("BEGIN IONS") == 2
+
+        # Re-running without --overwrite must abort with status 1.
+        assert falcon_main([str(mgf_path), str(out_prefix)]) == 1
+
+        # Re-running with --overwrite must succeed cleanly.
+        assert (
+            falcon_main([str(mgf_path), str(out_prefix), "--overwrite"]) == 0
+        )

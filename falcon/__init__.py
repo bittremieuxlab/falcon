@@ -1,16 +1,12 @@
+"""Large-scale tandem mass spectrum clustering."""
+
+from importlib.metadata import PackageNotFoundError, version
+
 pkg_name = "falcon-ms"
 
 try:
-    from importlib.metadata import version, PackageNotFoundError
+    __version__ = version(pkg_name)
+except PackageNotFoundError:
+    __version__ = "0.0.0.dev0"
 
-    try:
-        __version__ = version(pkg_name)
-    except PackageNotFoundError:
-        pass
-except ImportError:
-    from pkg_resources import get_distribution, DistributionNotFound
-
-    try:
-        __version__ = get_distribution(pkg_name).version
-    except DistributionNotFound:
-        pass
+__all__ = ["__version__"]

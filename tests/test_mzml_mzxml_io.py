@@ -1,4 +1,4 @@
-"""Tests for falcon.ms_io.mzml_io and mzxml_io — P2: XML peak file readers."""
+"""Tests for falcon.ms_io.mzml_io and falcon.ms_io.mzxml_io."""
 
 import math
 import os
@@ -11,9 +11,9 @@ from falcon.ms_io import mzml_io, mzxml_io
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 
 
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 # mzml_io._parse_spectrum
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 
 
 def _mzml_dict(scan=None, ion_extra=None):
@@ -56,7 +56,7 @@ class TestMzmlParseSpectrum:
         assert spec.retention_time == pytest.approx(6.0)
 
     def test_possible_charge_state_fallback(self):
-        """'possible charge state' is used when 'charge state' is absent."""
+        """Use 'possible charge state' if 'charge state' is absent."""
         spec = mzml_io._parse_spectrum(
             _mzml_dict(ion_extra={"possible charge state": 3})
         )
@@ -67,9 +67,9 @@ class TestMzmlParseSpectrum:
         assert spec.precursor_charge is None
 
 
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 # mzxml_io._parse_spectrum
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 
 
 def _mzxml_dict(extra_precursor=None, rt=None):
@@ -104,12 +104,12 @@ class TestMzxmlParseSpectrum:
         assert spec.precursor_charge == 2
 
 
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 # get_spectra over minimal real files (MS-level filtering + identifiers)
 #
-# The fixture files in tests/data each contain one MS1 and one MS2 scan. Each
-# peak list encodes a single (m/z=100.0, intensity=10.0) peak.
-# ---------------------------------------------------------------------------
+# The fixture files in tests/data each contain one MS1 and one MS2
+# scan. Each peak list encodes one (m/z=100.0, intensity=10.0) peak.
+# ----------------------------------------------------------------------
 
 
 class TestMzmlGetSpectra:

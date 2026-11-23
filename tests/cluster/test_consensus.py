@@ -1,14 +1,14 @@
-"""Tests for consensus spectrum methods — P2: Averaging, medoids, binning, outlier rejection."""
+"""Tests for falcon.cluster.consensus."""
 
-import numpy as np
 import numba as nb
+import numpy as np
 import pytest
 
-from falcon.cluster import cluster, similarity, consensus
+from falcon.cluster import consensus, similarity
 
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 # _spectrum_binning
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 
 
 class TestSpectrumBinning:
@@ -42,19 +42,19 @@ class TestSpectrumBinning:
                     intensity=intensity,
                 )
             )
-        bins_idx, bins_peaks, bins_mz = consensus._spectrum_binning(
+        _bins_idx, _bins_peaks, bins_mz = consensus._spectrum_binning(
             spectra, min_mz=50.0, max_mz=200.0, bin_size=1.0
         )
-        # The bin containing mz=150 should be filtered out (only 60% presence)
+        # Bin with mz=150 should be filtered out (60% presence).
         bin_mz_values = [float(m) for mz_bin in bins_mz for m in mz_bin]
-        assert not any(
-            149.5 <= m <= 150.5 for m in bin_mz_values
-        ), "Peak at mz=150 (60% presence) should be filtered out"
+        assert not any(149.5 <= m <= 150.5 for m in bin_mz_values), (
+            "Peak at mz=150 (60% presence) should be filtered out"
+        )
 
     def test_empty_bins_excluded(self, mock_spectra):
         """Bins with no peaks should not appear in the output."""
         spectra = mock_spectra(3, mz_base=100.0, mz_step=1.0, n_peaks=2)
-        bins_idx, bins_peaks, bins_mz = consensus._spectrum_binning(
+        _bins_idx, bins_peaks, _bins_mz = consensus._spectrum_binning(
             spectra, min_mz=50.0, max_mz=200.0, bin_size=1.0
         )
         # All returned bins should have actual data
@@ -62,9 +62,9 @@ class TestSpectrumBinning:
             assert len(peak_arr) > 0
 
 
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 # _outlier_rejection
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 
 
 class TestOutlierRejection:
@@ -77,7 +77,7 @@ class TestOutlierRejection:
         m1 = np.array([100.0, 100.1, 99.9, 100.0], dtype=np.float32)
         m2 = np.array([101.0, 101.1, 100.9, 101.0], dtype=np.float32)
         bins_mz = nb.typed.List([m1, m2])
-        out_idx, out_peaks, out_mz = consensus._outlier_rejection(
+        out_idx, _out_peaks, _out_mz = consensus._outlier_rejection(
             bins_indices, bins_peaks, bins_mz, 1.5, 1.5
         )
         assert len(out_idx) == 2
@@ -89,7 +89,7 @@ class TestOutlierRejection:
         mzs = np.array([100.0, 100.1, 99.9, 100.0], dtype=np.float32)
         bins_peaks = nb.typed.List([peaks])
         bins_mz = nb.typed.List([mzs])
-        out_idx, out_peaks, out_mz = consensus._outlier_rejection(
+        out_idx, out_peaks, _out_mz = consensus._outlier_rejection(
             bins_indices, bins_peaks, bins_mz, 1.5, 1.5
         )
         # The average should be closer to 0.5 (outlier 10.0 removed)
@@ -97,9 +97,9 @@ class TestOutlierRejection:
         assert out_peaks[0] < 1.0
 
 
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 # _sigma_clipping
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 
 
 class TestSigmaClipping:
@@ -107,7 +107,7 @@ class TestSigmaClipping:
         """Sigma clipping should converge and not loop infinitely."""
         intensities = np.array([1.0, 1.1, 0.9, 1.0, 100.0], dtype=np.float32)
         mzs = np.array([100.0, 100.1, 99.9, 100.0, 100.0], dtype=np.float32)
-        result_i, result_m = consensus._sigma_clipping(
+        result_i, _result_m = consensus._sigma_clipping(
             intensities, mzs, 1.5, 1.5
         )
         # The 100.0 outlier should be removed
@@ -118,15 +118,15 @@ class TestSigmaClipping:
         """When std=0, the loop should break without removing values."""
         intensities = np.array([0.5, 0.5, 0.5], dtype=np.float32)
         mzs = np.array([100.0, 100.0, 100.0], dtype=np.float32)
-        result_i, result_m = consensus._sigma_clipping(
+        result_i, _result_m = consensus._sigma_clipping(
             intensities, mzs, 1.5, 1.5
         )
         assert len(result_i) == 3
 
 
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 # _sigma_clip
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 
 
 class TestSigmaClip:
@@ -141,9 +141,9 @@ class TestSigmaClip:
         np.testing.assert_array_equal(mask, expected)
 
 
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 # _construct_average_spectrum
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 
 
 class TestConstructAverageSpectrum:
@@ -169,9 +169,9 @@ class TestConstructAverageSpectrum:
         assert cluster_id == 5
 
 
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 # _get_cluster_medoids
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 
 
 class TestGetClusterMedoids:
@@ -196,27 +196,27 @@ class TestGetClusterMedoids:
         labels = np.array([0, 0, 0], dtype=np.int32)
         rts = np.array([10.0, 20.0, 30.0], dtype=np.float32)
         order_map = np.array([0, 1, 2], dtype=np.int64)
-        # distances: (0,1)=0.1, (0,2)=0.5, (1,2)=0.2 => medoid is 1 (sum=0.3)
+        # Distances: (0,1)=0.1, (0,2)=0.5, (1,2)=0.2 -> medoid 1.
         pdist = np.array([0.1, 0.5, 0.2], dtype=np.float32)
         result = consensus._get_cluster_medoids(
             spectra, labels, rts, order_map, pdist
         )
         (
             precursor_mzs,
-            charges,
-            mzs,
-            intensities,
+            _charges,
+            _mzs,
+            _intensities,
             retention_times,
-            cluster_ids,
+            _cluster_ids,
         ) = result
         assert len(precursor_mzs) == 1
         # Spectrum 1 should be the medoid (lowest row sum: 0.1+0.2=0.3)
         assert retention_times[0] == 20.0
 
 
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 # _get_representative_spectra
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 
 
 class TestGetRepresentativeSpectra:
@@ -245,7 +245,7 @@ class TestGetRepresentativeSpectra:
             )
 
     def test_average_dispatch(self, mock_spectra):
-        """The 'average' method should dispatch to the averaging path."""
+        """The 'average' method dispatches to the averaging path."""
         spectra = mock_spectra(3, mz_base=100.0, mz_step=1.0, n_peaks=3)
         labels = np.array([0, 0, 0], dtype=np.int32)
         rts = np.array([10.0, 20.0, 30.0], dtype=np.float32)
@@ -265,14 +265,14 @@ class TestGetRepresentativeSpectra:
         assert len(result[0].mz) == len(result[0].intensity)
 
 
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 # _get_cluster_average
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 
 
 class TestGetClusterAverage:
     def test_single_cluster_averaged(self, mock_spectra):
-        """A cluster of 3 identical spectra averages into one spectrum."""
+        """Three identical spectra average into one spectrum."""
         spectra = mock_spectra(3, mz_base=100.0, mz_step=1.0, n_peaks=3)
         labels = np.array([0, 0, 0], dtype=np.int32)
         rts = np.array([10.0, 20.0, 30.0], dtype=np.float32)
@@ -290,20 +290,20 @@ class TestGetClusterAverage:
         )
         (
             precursor_mzs,
-            charges,
+            _charges,
             mzs,
-            intensities,
+            _intensities,
             retention_times,
             cluster_ids,
         ) = result
         assert len(precursor_mzs) == 1
-        # Averaged RT of identical-content spectra is the mean of the inputs.
+        # Averaged RT of identical spectra is the mean input RT.
         assert retention_times[0] == pytest.approx(20.0)
         assert cluster_ids[0] == 0
         assert len(mzs[0]) > 0
 
     def test_singleton_passthrough(self, mock_spectra):
-        """A singleton cluster returns the original spectrum unchanged."""
+        """A singleton cluster returns the input spectrum as-is."""
         spectra = mock_spectra(1, n_peaks=3)
         labels = np.array([0], dtype=np.int32)
         rts = np.array([42.0], dtype=np.float32)
@@ -321,20 +321,20 @@ class TestGetClusterAverage:
         )
         (
             precursor_mzs,
-            charges,
+            _charges,
             mzs,
-            intensities,
+            _intensities,
             retention_times,
-            cluster_ids,
+            _cluster_ids,
         ) = result
         assert len(precursor_mzs) == 1
         assert retention_times[0] == 42.0
         np.testing.assert_array_equal(mzs[0], spectra[0].mz)
 
 
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 # typed_list_to_numpy
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 
 
 class TestTypedListToNumpy:

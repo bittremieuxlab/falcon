@@ -1,8 +1,10 @@
-import pytest
+"""Tests for falcon.cluster.cluster."""
+
 import numba as nb
 import numpy as np
-import pandas as pd
-from falcon.cluster import cluster, distance_matrix
+import pytest
+
+from falcon.cluster import cluster
 from falcon.cluster.consensus import ConsensusTuple
 
 
@@ -24,7 +26,7 @@ class TestGetPrecursorMzSplits:
         assert splits == nb.typed.List([0, 2, 4])
 
     def test_get_precursor_mz_splits_single_split_ppm(self):
-        """Test the case where there is only one split with ppm tolerance."""
+        """Single split with ppm tolerance."""
         precursor_mzs = np.array([100.0, 100.002, 100.003, 100.005])
         splits = cluster._get_precursor_mz_splits(
             precursor_mzs, 50, "ppm", batch_size=100
@@ -32,7 +34,7 @@ class TestGetPrecursorMzSplits:
         assert splits == nb.typed.List([0, 4])
 
     def test_get_precursor_mz_splits_multiple_splits_ppm(self):
-        """Test the case where there are multiple splits with ppm tolerance."""
+        """Multiple splits with ppm tolerance."""
         precursor_mzs = np.array([100.0, 100.005, 101.5, 101.005])
         splits = cluster._get_precursor_mz_splits(
             precursor_mzs, 50, "ppm", batch_size=100
@@ -40,7 +42,7 @@ class TestGetPrecursorMzSplits:
         assert splits == nb.typed.List([0, 2, 4])
 
     def test_get_precursor_mz_splits_batch_size(self):
-        """Test the case where the batch size is smaller than the number of precursor m/z values."""
+        """Splitting when batch_size is smaller than the m/z count."""
         precursor_mzs = np.array([100.0, 100.2, 100.4, 100.5])
         splits = cluster._get_precursor_mz_splits(
             precursor_mzs, 0.5, "Da", batch_size=2
@@ -84,17 +86,17 @@ class TestLinkage:
         ).all()
 
     def test_linkage_two_elements(self):
-        """Two values produce a single merge at their absolute distance."""
+        """Two values merge once at their absolute distance."""
         values = np.array([100.0, 103.0])
         linkage_matrix = cluster._linkage(values, "Da")
         assert linkage_matrix.shape == (1, 4)
-        # Merge the two singleton clusters (indices 0 and 1) at distance 3.
+        # Merge singleton clusters 0 and 1 at distance 3.
         assert sorted(linkage_matrix[0, :2]) == [0.0, 1.0]
         assert linkage_matrix[0, 2] == pytest.approx(3.0)
         assert linkage_matrix[0, 3] == 2
 
     def test_linkage_ppm(self):
-        """ppm mode scales distances relative to the lower m/z of each pair."""
+        """ppm mode scales distances by each pair's lower m/z."""
         values = np.array([100.0, 100.001, 200.0])
         linkage_matrix = cluster._linkage(values, "ppm")
         # First merge joins the closest pair (100.0, 100.001): 10 ppm.
@@ -111,14 +113,14 @@ class TestLinkage:
         assert linkage_matrix[0, 2] == pytest.approx(1.0)
 
 
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 # _get_cluster_group_idx
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 
 
 class TestGetClusterGroupIdx:
     def test_with_noise(self):
-        """Noise points (-1) should be yielded as individual singletons."""
+        """Noise points (-1) are yielded as individual singletons."""
         clusters = np.array([-1, -1, 0, 0, 1, 1, 1], dtype=np.int32)
         groups = list(cluster._get_cluster_group_idx(clusters))
         # Two noise singletons, then two clusters
@@ -140,9 +142,9 @@ class TestGetClusterGroupIdx:
         assert groups == []
 
 
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 # _postprocess_cluster
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 
 
 class TestPostprocessCluster:
@@ -191,7 +193,7 @@ class TestPostprocessCluster:
         labels = np.array([0, 0, 0], dtype=np.int32)
         mzs = np.array([100.0, 200.0, 300.0], dtype=np.float64)
         rts = np.array([10.0, 20.0, 30.0], dtype=np.float64)
-        n = cluster._postprocess_cluster(
+        cluster._postprocess_cluster(
             labels,
             mzs,
             rts,
@@ -223,21 +225,21 @@ class TestPostprocessCluster:
         assert labels[0] == 5
 
     def test_rt_merge_no_spurious_collision(self):
-        """Combining the m/z and RT partitions must keep distinct groups apart.
+        """Combining m/z and RT partitions keeps distinct groups apart.
 
-        Regression test for the combined-label encoding. With a 4 (m/z) x 3
-        (RT) grid of well-separated groups, the correct result is 12 clusters
-        of 2 spectra each. A non-injective encoding (e.g. ``2*a + 3*b``) maps
-        the m/z/RT pairs (a=3, b=0) and (a=0, b=2) to the same value (6),
-        wrongly merging two groups into one and yielding only 11 clusters.
+        Regression test for combined-label encoding. A 4 (m/z) x 3 (RT)
+        grid of well-separated groups must yield 12 clusters of 2
+        spectra each. A non-injective encoding (e.g. ``2*a + 3*b``)
+        maps (a=3, b=0) and (a=0, b=2) to 6, wrongly merging two groups
+        into one and yielding only 11 clusters.
         """
-        mz_islands = [100.0, 200.0, 300.0, 400.0]  # gaps >> precursor_tol
+        mz_islands = [100.0, 200.0, 300.0, 400.0]  # >> precursor_tol
         rt_islands = [10.0, 50.0, 90.0]  # gaps >> rt_tol
         mzs, rts = [], []
         for base_mz in mz_islands:
             for base_rt in rt_islands:
-                # Two spectra per (m/z, RT) combination so every combined
-                # group survives the min_samples=2 filter.
+                # Two spectra per (m/z, RT) pair so each group meets
+                # the min_samples=2 threshold.
                 mzs.extend([base_mz, base_mz + 0.05])
                 rts.extend([base_rt, base_rt + 0.1])
         mzs = np.array(mzs, dtype=np.float64)
@@ -264,10 +266,10 @@ class TestPostprocessCluster:
     def test_rt_nan_spectra_not_split_by_rt(self):
         """Spectra with NaN RT must not be split by the RT filter.
 
-        Two m/z groups each contain one real-RT pair and one NaN-RT pair.
+        Two m/z groups each contain a real-RT pair and a NaN-RT pair.
         The NaN-RT spectra should stay together within their m/z group
-        (not be split away) and must not merge with the other m/z group.
-        Expected result: 4 clusters (2 m/z groups x 2 RT sub-groups each:
+        (not be split away) and must not merge with the other m/z
+        group. Expected: 4 clusters (2 m/z groups x 2 RT sub-groups:
         real-RT pair + NaN-RT pair).
         """
         mzs = np.array(
@@ -300,9 +302,9 @@ class TestPostprocessCluster:
         assert labels[2] != labels[4]
 
 
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 # cost_based_chunking
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 
 
 class TestCostBasedChunking:
@@ -329,7 +331,7 @@ class TestCostBasedChunking:
         assert chunks == []
 
     def test_more_workers_than_tasks(self):
-        """Empty chunks are dropped when there are more workers than tasks."""
+        """Empty chunks are dropped when workers exceed tasks."""
         splits = nb.typed.List([0, 10, 20])
         chunks = cluster.cost_based_chunking(splits, 5)
         # Only 2 tasks => at most 2 non-empty chunks.
@@ -338,7 +340,7 @@ class TestCostBasedChunking:
         assert len(all_tasks) == 2
 
     def test_largest_task_isolated(self):
-        """The most expensive task should not share a chunk with others."""
+        """The most expensive task stays isolated in its own chunk."""
         # One dominant interval (cost 100^2) and three small ones.
         splits = nb.typed.List([0, 100, 101, 102, 103])
         chunks = cluster.cost_based_chunking(splits, 2)
@@ -348,9 +350,9 @@ class TestCostBasedChunking:
         assert sizes == [1, 3]
 
 
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 # _offset_cluster_labels / _assign_global_cluster_labels
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 
 
 def _make_rep(mz_split, cluster_id):
@@ -368,8 +370,8 @@ def _make_rep(mz_split, cluster_id):
 
 class TestOffsetClusterLabels:
     def test_offsets_make_labels_globally_unique(self):
-        """Per-split local labels are shifted so labels never collide."""
-        # Split 0 has local labels {0, 1}; split 1 has local labels {0, 1}.
+        """Per-split local labels are shifted so they never collide."""
+        # Split 0 and split 1 both start with local labels {0, 1}.
         labels = np.array([0, 0, 1, 0, 1, 1], dtype=np.int32)
         splits = nb.typed.List([0, 3, 6])
         offsets = cluster._offset_cluster_labels(labels, splits)
@@ -388,7 +390,7 @@ class TestOffsetClusterLabels:
 
 class TestAssignGlobalClusterLabels:
     def test_reps_relabeled_per_split(self):
-        """Representative cluster_ids are offset to match the global labels."""
+        """Representative cluster_ids shift to match global labels."""
         labels = np.array([0, 0, 1, 0, 1, 1], dtype=np.int32)
         splits = nb.typed.List([0, 3, 6])
         reps = [
@@ -398,7 +400,7 @@ class TestAssignGlobalClusterLabels:
             _make_rep(mz_split=1, cluster_id=1),
         ]
         out = cluster._assign_global_cluster_labels(labels, reps, splits)
-        # Split 0 reps keep ids {0, 1}; split 1 reps shift by offset 2 => {2, 3}.
+        # Split 0 keeps {0, 1}; split 1 shifts by +2 => {2, 3}.
         assert sorted(int(s.cluster_id) for s in out) == [0, 1, 2, 3]
 
     def test_singleton_only_splits(self):
@@ -414,9 +416,9 @@ class TestAssignGlobalClusterLabels:
         assert sorted(int(s.cluster_id) for s in out) == [0, 1, 2]
 
 
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 # generate_clusters (end-to-end over a Lance dataset)
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 
 
 def _attach_labels(dataset, labels):
@@ -431,15 +433,16 @@ def _attach_labels(dataset, labels):
         ["precursor_mz", "retention_time", "identifier"]
     ).reset_index(drop=True)
     meta["cluster"] = np.asarray(labels)
-    return dict(zip(meta["identifier"], meta["cluster"]))
+    return dict(zip(meta["identifier"], meta["cluster"], strict=True))
 
 
 class TestGenerateClusters:
     def test_label_alignment_under_ties(self, lance_dataset, spectrum_row):
         """Labels bind to the correct spectra when sort keys fully tie.
-        Identifier serves as a final tie-breaker, so the order of spectra
-        with identical precursor m/z and RT is deterministic. This removes
-        the dependency on the underlying sorting algorithm's stability.
+
+        Identifier serves as a final tie-breaker, making the order of
+        spectra with identical precursor m/z and RT deterministic
+        regardless of sorting algorithm stability.
         """
         peaks_a = [100.0, 200.0, 300.0, 400.0, 500.0]
         peaks_b = [600.0, 700.0, 800.0, 900.0, 1000.0]
@@ -481,7 +484,7 @@ class TestGenerateClusters:
     def test_dissimilar_spectra_become_singletons(
         self, lance_dataset, spectrum_row
     ):
-        """Spectra with no shared peaks stay as distinct singleton clusters."""
+        """Spectra with no shared peaks stay singleton clusters."""
         rows = [
             spectrum_row(
                 "f:scan:1",
@@ -519,20 +522,20 @@ class TestGenerateClusters:
             "medoid",
             {},
         )
-        # All distinct => three singleton clusters, one representative each.
+        # All distinct => three singletons, one rep each.
         assert len(np.unique(np.asarray(labels))) == 3
         assert len(reps) == 3
 
     def test_isolated_precursor_mz_single_spectrum_split(
         self, lance_dataset, spectrum_row
     ):
-        """An m/z-isolated spectrum forms its own single-spectrum split."""
+        """An m/z-isolated spectrum gets a single-spectrum split."""
         peaks = [100.0, 200.0, 300.0, 400.0, 500.0]
         inten = [1.0, 0.8, 0.6, 0.4, 0.2]
         rows = [
             spectrum_row("f:scan:1", 100.0, peaks, inten, retention_time=10.0),
             spectrum_row("f:scan:2", 100.1, peaks, inten, retention_time=11.0),
-            # Far outside the 0.5 Da precursor tolerance => its own split.
+            # Outside 0.5 Da precursor tolerance => own split.
             spectrum_row("f:scan:3", 900.0, peaks, inten, retention_time=12.0),
         ]
         dataset = lance_dataset(rows)
@@ -554,11 +557,11 @@ class TestGenerateClusters:
         # Every spectrum is assigned a non-negative cluster label.
         assert (labels >= 0).all()
         by_id = _attach_labels(dataset, labels)
-        # The isolated spectrum cannot share a cluster with the close pair.
+        # Isolated spectrum cannot join the close pair's cluster.
         assert by_id["f:scan:3"] != by_id["f:scan:1"]
 
     def test_average_consensus_end_to_end(self, lance_dataset, spectrum_row):
-        """The 'average' consensus path produces representative spectra."""
+        """The 'average' consensus path builds representatives."""
         peaks = [100.0, 200.0, 300.0, 400.0, 500.0]
         inten = [1.0, 0.8, 0.6, 0.4, 0.2]
         rows = [
@@ -589,7 +592,7 @@ class TestGenerateClusters:
             "average",
             consensus_params,
         )
-        # Three identical-shaped spectra collapse to one averaged cluster.
+        # Three identical spectra collapse to one averaged cluster.
         assert len(np.unique(np.asarray(labels))) == 1
         assert len(reps) == 1
         assert len(reps[0].mz) > 0

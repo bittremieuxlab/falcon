@@ -1,3 +1,5 @@
+"""Tests for falcon.cluster.similarity."""
+
 import math
 
 import numpy as np
@@ -42,7 +44,7 @@ class TestSimilarity:
         assert matched_peaks == 3
 
     def test_cosine_fast_partial_overlap(self):
-        """Only the shared peaks contribute to the match count and score."""
+        """Only shared peaks contribute to match count and score."""
         inten = np.array([1.0, 1.0, 1.0], dtype=np.float32)
         inten = inten / np.linalg.norm(inten)
         spec1 = similarity.SpectrumTuple(

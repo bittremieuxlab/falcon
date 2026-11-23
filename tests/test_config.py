@@ -1,4 +1,4 @@
-"""Tests for falcon.config — P5: Configuration parsing and validation."""
+"""Tests for falcon.config."""
 
 import pytest
 
@@ -72,8 +72,7 @@ class TestConfigParse:
         assert cfg.rt_tol == 30.0
 
     def test_precursor_charge_buckets_default_none(self, tmp_path):
-        """Without --precursor_charge_buckets the value stays None so that
-        every distinct charge is clustered separately."""
+        """Default charge buckets stay None (each charge separate)."""
         dummy = tmp_path / "dummy.mgf"
         dummy.write_text("")
         cfg = Config()
@@ -81,7 +80,7 @@ class TestConfigParse:
         assert cfg.precursor_charge_buckets is None
 
     def test_precursor_charge_buckets_override(self, tmp_path):
-        """Explicit buckets are parsed and validated into sets/'other'."""
+        """Explicit buckets parse into charge sets and 'other'."""
         dummy = tmp_path / "dummy.mgf"
         dummy.write_text("")
         cfg = Config()
@@ -104,7 +103,7 @@ class TestConfigParse:
         ]
 
     def test_clustering_overrides(self, tmp_path):
-        """Linkage, fragment_tol, and consensus_method parse correctly."""
+        """Clustering options parse to the requested values."""
         dummy = tmp_path / "dummy.mgf"
         dummy.write_text("")
         cfg = Config()
@@ -154,7 +153,7 @@ class TestConfigParse:
         assert cfg.min_peaks == 9
 
     def test_cli_overrides_config_file(self, tmp_path):
-        """Command-line arguments take precedence over the config file."""
+        """CLI arguments take precedence over the config file."""
         dummy = tmp_path / "dummy.mgf"
         dummy.write_text("")
         cfg_file = tmp_path / "config.ini"

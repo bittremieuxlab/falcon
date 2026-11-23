@@ -1,7 +1,10 @@
+"""MGF spectrum reader and representative-spectrum writer."""
+
 import math
 import os
 import re
-from typing import Dict, IO, Iterable, List, Union
+from collections.abc import Iterable, Iterator
+from typing import IO, Any, cast
 
 import numba as nb
 import numpy as np
@@ -11,23 +14,27 @@ import spectrum_utils.spectrum as sus
 from ..cluster import cluster
 from . import reader_utils
 
+# Matches standard Universal Spectrum Identifiers (USIs).
 USI_PATTERN = re.compile(r"^mzspec:[^:\s]+:[^:\s]+:(scan:\d+|\d+)(:[^:\s]+)?$")
 
 
-def get_spectra(source: Union[IO, str]) -> Iterable[sus.MsmsSpectrum]:
+def get_spectra(source: IO[Any] | str) -> Iterator[sus.MsmsSpectrum]:
     """
-    Get the MS/MS spectra from the given MGF file.
+    Read MS/MS spectra from an MGF file or stream.
+
+    Preserves USI titles and ``<filename>:cluster:`` titles; otherwise
+    constructs an identifier from ``SCANS``/``SCAN`` or the 0-based
+    spectrum index.
 
     Parameters
     ----------
-    source : Union[IO, str]
-        The MGF source (file name or open file object) from which the spectra
-        are read.
+    source : IO[Any] | str
+        Path or open file object for the MGF source.
 
-    Returns
-    -------
-    Iterator[MsmsSpectrum]
-        An iterator over the spectra in the given file.
+    Yields
+    ------
+    MsmsSpectrum
+        Parsed MS/MS spectra; malformed entries are logged and skipped.
     """
     with pyteomics.mgf.MGF(source) as f_in:
         base = reader_utils.base_filename(source, f_in)
@@ -35,7 +42,7 @@ def get_spectra(source: Union[IO, str]) -> Iterable[sus.MsmsSpectrum]:
         for spectrum_i, spectrum_dict in enumerate(f_in):
             params = spectrum_dict.get("params", {})
 
-            # Prefer original filename from params if available
+            # Prefer embedded FILENAME param over the on-disk filename.
             filename = os.path.splitext(
                 os.path.basename(params.get("filename", base))
             )[0]
@@ -61,19 +68,21 @@ def get_spectra(source: Union[IO, str]) -> Iterable[sus.MsmsSpectrum]:
                 continue
 
 
-def _parse_spectrum(spectrum_dict: Dict) -> sus.MsmsSpectrum:
+def _parse_spectrum(spectrum_dict: dict[str, Any]) -> sus.MsmsSpectrum:
     """
-    Parse the Pyteomics cluster dict.
+    Parse a Pyteomics MGF spectrum dictionary into an ``MsmsSpectrum``.
 
     Parameters
     ----------
-    spectrum_dict : Dict
-        The Pyteomics cluster dict to be parsed.
+    spectrum_dict : dict[str, Any]
+        Pyteomics MGF entry containing ``params``, ``m/z array``, and
+        ``intensity array``.
 
     Returns
     -------
     MsmsSpectrum
-        The parsed cluster.
+        Parsed spectrum; missing charge is ``None`` and missing RT is
+        ``NaN``.
     """
     identifier = spectrum_dict["params"]["title"]
 
@@ -89,10 +98,11 @@ def _parse_spectrum(spectrum_dict: Dict) -> sus.MsmsSpectrum:
     else:
         precursor_charge = None
 
+    # spectrum_utils 0.3.5 types precursor_charge as int; None is valid.
     return sus.MsmsSpectrum(
         identifier,
         precursor_mz,
-        precursor_charge,
+        cast(int, precursor_charge),
         mz_array,
         intensity_array,
         None,
@@ -101,17 +111,17 @@ def _parse_spectrum(spectrum_dict: Dict) -> sus.MsmsSpectrum:
 
 
 def write_spectra(
-    filename: str, spectra: List[cluster.ConsensusTuple]
+    filename: str, spectra: Iterable[cluster.ConsensusTuple]
 ) -> None:
     """
-    Write the given spectra to an MGF file.
+    Write representative spectra to an MGF file.
 
     Parameters
     ----------
     filename : str
-        The MGF file name where the spectra will be written.
-    spectra : List[cluster.ConsensusTuple]
-        The representative spectra to be written to the MGF file.
+        Destination MGF file path.
+    spectra : Iterable[ConsensusTuple]
+        Representative spectra to serialize.
     """
     with open(filename, "w") as f_out:
         pyteomics.mgf.write(
@@ -122,23 +132,24 @@ def write_spectra(
 
 
 def _spectra_to_dicts(
-    spectra: List[cluster.ConsensusTuple],
-) -> Iterable[Dict]:
+    spectra: Iterable[cluster.ConsensusTuple],
+) -> Iterator[dict[str, Any]]:
     """
-    Convert MsmsSpectrum objects to Pyteomics MGF cluster dictionaries.
+    Convert representative spectra to Pyteomics MGF dictionaries.
 
     Parameters
     ----------
-    spectra : List[cluster.ConsensusTuple]
-        The spectra to be converted to Pyteomics MGF dictionaries.
+    spectra : Iterable[ConsensusTuple]
+        Representative spectra to convert.
 
-    Returns
-    -------
-    Iterable[Dict]
-        The given spectra as Pyteomics MGF dictionaries.
+    Yields
+    ------
+    dict[str, Any]
+        Pyteomics MGF dictionaries with intensities scaled to
+        ``[0, 1000]`` and NaN charge/RT fields omitted.
     """
     for i, spectrum in enumerate(spectra):
-        params = {
+        params: dict[str, Any] = {
             "title": f"falcon:cluster:{spectrum.cluster_id}",
             "scans": i + 1,
             "pepmass": float(spectrum.precursor_mz),
@@ -157,17 +168,18 @@ def _spectra_to_dicts(
 @nb.njit(cache=True, fastmath=True)
 def _scale_intensities(intensity: np.ndarray) -> np.ndarray:
     """
-    Scale the intensities to the range [0, 1000].
+    Rescale positive peak intensities so the base peak equals 1000.
 
     Parameters
     ----------
     intensity : np.ndarray
-        The intensity array to be scaled.
+        Float32 fragment peak intensities.
 
     Returns
     -------
     np.ndarray
-        The scaled intensities.
+        Rescaled intensities, or ``intensity`` unchanged if empty or
+        non-positive.
     """
     max_i = np.max(intensity) if intensity.size else np.float32(0.0)
     if max_i <= 0.0:

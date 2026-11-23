@@ -27,11 +27,16 @@ searching.** _Rapid Communications in Mass Spectrometry_, e9153 (2021).
 Installation
 ------------
 
-_falcon_ requires Python 3.8+ and is available on the Linux and OSX platforms.
+_falcon_ requires Python 3.11+ and is available on Linux and macOS.
 
-You can easily install _falcon_ with pip:
+You can install _falcon_ with pip or uv:
 
-    pip install falcon-ms
+```bash
+pip install falcon-ms
+```
+
+For development setup, testing, and contribution guidelines, see
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 Running _falcon_
 ----------------
@@ -130,7 +135,7 @@ How does it work?
 1. Input peak files (mzML, mzXML, or MGF) are read in parallel and preprocessed
 spectra are written to per-charge Lance columnar datasets stored in the working
 directory.
-2. Within each charge bucket, spectra are sorted by precursor _m_/_z_ and split into overlapping batches of at most
+2. Within each charge bucket, spectra are sorted by precursor _m_/_z_ and split into disjoint batches of at most
 `batch_size` spectra.
 3. For each batch a full pairwise cosine distance matrix is computed using a
 Numba-parallelized routine. Peak pairs with fewer than `min_matched_peaks`

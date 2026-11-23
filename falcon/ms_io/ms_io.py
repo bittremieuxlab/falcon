@@ -1,28 +1,35 @@
+"""Format-agnostic dispatch for reading and writing MS/MS peak files."""
+
 import os
-from typing import Iterable, Iterator
+from collections.abc import Iterable, Iterator
 
 from spectrum_utils.spectrum import MsmsSpectrum
 
-from . import mzxml_io
-from . import mgf_io
-from . import mzml_io
+from ..cluster.consensus import ConsensusTuple
+from . import mgf_io, mzml_io, mzxml_io
 
 
 def get_spectra(filename: str) -> Iterator[MsmsSpectrum]:
     """
-    Get the MS/MS spectra from the given file.
+    Read MS/MS spectra from a peak file based on its extension.
 
-    Supported file formats are MGF, MSP, mzML, mzXML.
+    Supported formats are MGF (``.mgf``), mzML (``.mzml``), and mzXML
+    (``.mzxml``), matched case-insensitively.
 
     Parameters
     ----------
     filename : str
-        The file name from which to read the spectra.
+        Path to the input peak file.
 
-    Returns
-    -------
-    Iterator[MsmsSpectrum]
-        An iterator over the spectra in the given file.
+    Yields
+    ------
+    MsmsSpectrum
+        Parsed MS/MS spectra from ``filename``.
+
+    Raises
+    ------
+    ValueError
+        If ``filename`` does not exist or has an unsupported extension.
     """
     if not os.path.isfile(filename):
         raise ValueError(f"Non-existing peak file {filename}")
@@ -37,29 +44,33 @@ def get_spectra(filename: str) -> Iterator[MsmsSpectrum]:
     else:
         raise ValueError(f'Unknown spectrum file type with extension "{ext}"')
 
-    for spec in spectrum_io.get_spectra(filename):
-        yield spec
+    yield from spectrum_io.get_spectra(filename)
 
 
-def write_spectra(filename: str, spectra: Iterable[MsmsSpectrum]) -> None:
+def write_spectra(filename: str, spectra: Iterable[ConsensusTuple]) -> None:
     """
-    Write the given spectra to a peak file.
+    Write representative spectra to a peak file.
 
-    Supported formats: MGF.
+    Only MGF (``.mgf``) output is supported.
 
     Parameters
     ----------
     filename : str
-        The file name where the spectra will be written.
-    spectra : Iterable[MsmsSpectrum]
-        The spectra to be written to the peak file.
+        Destination peak file path.
+    spectra : Iterable[ConsensusTuple]
+        Representative spectra to serialize.
+
+    Raises
+    ------
+    ValueError
+        If ``filename`` does not have a ``.mgf`` extension.
     """
     ext = os.path.splitext(filename.lower())[1]
     if ext == ".mgf":
         spectrum_io = mgf_io
     else:
         raise ValueError(
-            "Unsupported peak file format (supported formats: " "MGF)"
+            "Unsupported peak file format (supported formats: MGF)"
         )
 
     spectrum_io.write_spectra(filename, spectra)
