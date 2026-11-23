@@ -58,21 +58,21 @@ def main(args: str | list[str] | None = None) -> int:
     _log_config()
 
     rm_work_dir = _setup_work_dir()
-    # Abort if outputs already exist and --overwrite was not given.
-    if _validate_outputs():
+    try:
+        # Abort if outputs already exist and --overwrite was not given.
+        if _validate_outputs():
+            return 1
+        _warn_aggressive_outlier_cutoffs()
+
+        process_spectrum = _build_process_spectrum()
+        charge_buckets = _load_or_prepare_buckets(process_spectrum)
+        bucket_datasets, cluster_results = _run_clustering(charge_buckets)
+        _export_results(bucket_datasets, cluster_results)
+        return 0
+    finally:
+        if rm_work_dir and os.path.isdir(config.work_dir):
+            shutil.rmtree(config.work_dir)
         logging.shutdown()
-        return 1
-    _warn_aggressive_outlier_cutoffs()
-
-    process_spectrum = _build_process_spectrum()
-    charge_buckets = _load_or_prepare_buckets(process_spectrum)
-    bucket_datasets, cluster_results = _run_clustering(charge_buckets)
-    _export_results(bucket_datasets, cluster_results)
-
-    if rm_work_dir:
-        shutil.rmtree(config.work_dir)
-    logging.shutdown()
-    return 0
 
 
 # Config fields logged at debug level on startup. `precursor_tol` is
@@ -395,9 +395,20 @@ def _export_results(
             representatives.extend(rep_spectra)
 
     # Export cluster assignments and optional representative spectra.
-    clusters_df = pd.concat(clusters_all, ignore_index=True).sort_values(
-        ["identifier"], key=cast(Any, natsort.natsort_keygen())
-    )
+    if clusters_all:
+        clusters_df = pd.concat(clusters_all, ignore_index=True).sort_values(
+            ["identifier"], key=cast(Any, natsort.natsort_keygen())
+        )
+    else:
+        clusters_df = pd.DataFrame(
+            columns=[
+                "identifier",
+                "precursor_charge",
+                "precursor_mz",
+                "retention_time",
+                "cluster",
+            ]
+        )
     logger.info(
         "Export cluster assignments of %d spectra to %d unique "
         "clusters to output file %s",
@@ -405,9 +416,19 @@ def _export_results(
         clusters_df["cluster"].nunique(),
         f"{config.output_filename}.csv",
     )
+    errors: list[BaseException] = []
+
+    def _run_writer(target: Callable[..., Any], *args: Any) -> None:
+        try:
+            target(*args)
+        except BaseException as exc:
+            errors.append(exc)
+
     # Overlap CSV and MGF writes on background IO threads.
     write_csv_worker = threading.Thread(
-        target=_write_cluster_info, args=(clusters_df,), daemon=True
+        target=_run_writer,
+        args=(_write_cluster_info, clusters_df),
+        daemon=True,
     )
     write_csv_worker.start()
     if config.export_representatives:
@@ -417,13 +438,19 @@ def _export_results(
             f"{config.output_filename}.mgf",
         )
         write_mgf_worker = threading.Thread(
-            target=ms_io.write_spectra,
-            args=(f"{config.output_filename}.mgf", representatives),
+            target=_run_writer,
+            args=(
+                ms_io.write_spectra,
+                f"{config.output_filename}.mgf",
+                representatives,
+            ),
             daemon=True,
         )
         write_mgf_worker.start()
         write_mgf_worker.join()
     write_csv_worker.join()
+    if errors:
+        raise errors[0]
 
 
 if __name__ == "__main__":

@@ -140,4 +140,6 @@ exclude_lines = [
     "pragma: no cover",
     "if TYPE_CHECKING:",
     "if __name__ == .__main__.:",
+    # Numba-compiled kernels cannot be traced by coverage.py in JIT mode.
+    "@(nb|numba)\\.njit",
 ]

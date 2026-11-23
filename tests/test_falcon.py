@@ -1,448 +1,408 @@
-"""Tests for charge buckets, Lance I/O, and the falcon CLI."""
+"""Unit tests for falcon.falcon orchestration helpers."""
 
-import queue
-import threading
+import logging
+import os
 
-import lance
+import joblib
 import numpy as np
 import pandas as pd
-import pyarrow as pa
 import pytest
 
-import falcon
-from falcon.config import config as _global_config
-from falcon.falcon import main as falcon_main
-from falcon.spectra_io import (
-    _discover_auto_buckets,
-    _PerChargeLockRegistry,
-    _write_spectra_lance,
-    _write_to_dataset,
-    bucket_key_to_str,
-)
-
-# ----------------------------------------------------------------------
-# Fixtures
-# ----------------------------------------------------------------------
+from falcon import falcon as falcon_mod
+from falcon.cluster.consensus import ConsensusTuple
 
 
-@pytest.fixture
-def work_dir(tmp_path):
-    """Set config.work_dir to a temp directory for Lance writer tests.
-
-    Config.__getattr__ raises RuntimeError when uninitialized, so the
-    attribute is set directly in __dict__ to bypass that guard.
-    """
-    (tmp_path / "spectra").mkdir()
-    _global_config.__dict__["work_dir"] = str(tmp_path)
-    yield tmp_path
-    del _global_config.__dict__["work_dir"]
+def _parse_global(reset_global_config, args):
+    reset_global_config.parse(args)
+    return reset_global_config
 
 
 # ----------------------------------------------------------------------
-# Helpers
-# ----------------------------------------------------------------------
-
-SCHEMA = pa.schema(
-    [
-        pa.field("identifier", pa.string()),
-        pa.field("precursor_mz", pa.float32()),
-        pa.field("precursor_charge", pa.int8()),
-        pa.field("mz", pa.list_(pa.float32())),
-        pa.field("intensity", pa.list_(pa.float32())),
-        pa.field("retention_time", pa.float32()),
-    ]
-)
-
-
-def _make_spec(identifier, charge):
-    mz = np.array([100.0, 200.0, 300.0], dtype=np.float32)
-    intensity = np.array([0.5, 0.6, 0.7], dtype=np.float32)
-    intensity /= np.linalg.norm(intensity)
-    return {
-        "identifier": identifier,
-        "precursor_mz": np.float32(500.0),
-        "precursor_charge": charge,
-        "mz": mz,
-        "intensity": intensity,
-        "retention_time": np.float32(0.0),
-    }
-
-
-def _run_write_worker(
-    spectra,
-    charge_to_bucket,
-    catch_other_charges,
-    work_dir,
-    auto_bucket=False,
-):
-    """Push spectra through _write_spectra_lance and return row counts.
-
-    Requires the ``work_dir`` fixture to have set config.work_dir.
-    """
-    q = queue.Queue()
-    for spec in spectra:
-        q.put(spec)
-    q.put(None)  # sentinel
-
-    locks = _PerChargeLockRegistry()
-    _write_spectra_lance(
-        q, locks, SCHEMA, charge_to_bucket, catch_other_charges, auto_bucket
-    )
-
-    spectra_dir = work_dir / "spectra"
-    counts = {}
-    if spectra_dir.exists():
-        for p in spectra_dir.iterdir():
-            if p.suffix == ".lance":
-                counts[p.name] = lance.dataset(str(p)).count_rows()
-    return counts
-
-
-# ----------------------------------------------------------------------
-# bucket_key_to_str
+# Working directory setup and output validation
 # ----------------------------------------------------------------------
 
 
-class TestBucketKeyToStr:
-    def test_single_int_tuple(self):
-        assert bucket_key_to_str((1,)) == "_1"
+class TestSetupWorkDir:
+    def test_creates_temp_dir_when_work_dir_omitted(self, reset_global_config):
+        cfg = _parse_global(reset_global_config, ["in.mgf", "out"])
+        rm_work_dir = falcon_mod._setup_work_dir()
+        try:
+            assert rm_work_dir is True
+            assert os.path.isdir(cfg.work_dir)
+            assert os.path.isdir(os.path.join(cfg.work_dir, "spectra"))
+        finally:
+            os.rmdir(os.path.join(cfg.work_dir, "spectra"))
+            os.rmdir(cfg.work_dir)
 
-    def test_multi_int_tuple(self):
-        assert bucket_key_to_str((1, 2)) == "_1_2"
-
-    def test_tuple_with_unknown_str(self):
-        assert bucket_key_to_str((3, "unknown")) == "_3_unknown"
-
-    def test_string_other(self):
-        assert bucket_key_to_str("other") == "_other"
-
-    def test_string_unknown(self):
-        assert bucket_key_to_str("unknown") == "_unknown"
-
-    def test_set_sorted_numerically(self):
-        # Sets are unordered; the function must sort them
-        assert bucket_key_to_str({2, 1}) == "_1_2"
-
-    def test_set_with_unknown_sorts_after_ints(self):
-        # str sorts after int: 3 then "unknown"
-        assert bucket_key_to_str({"unknown", 3}) == "_3_unknown"
-
-    def test_invalid_type_raises(self):
-        with pytest.raises(TypeError):
-            bucket_key_to_str(42)
-
-
-# ----------------------------------------------------------------------
-# _write_to_dataset
-# ----------------------------------------------------------------------
-
-
-class TestWriteToDataset:
-    def test_creates_dataset_at_correct_path(self, work_dir):
-        lock = threading.Lock()
-        _write_to_dataset(
-            [_make_spec("s1", 2)], (2,), lock, SCHEMA, str(work_dir)
+    def test_explicit_work_dir_new_and_existing_warns(
+        self, tmp_path, reset_global_config, caplog
+    ):
+        wd = tmp_path / "work"
+        _parse_global(
+            reset_global_config, ["in.mgf", "out", "--work_dir", str(wd)]
         )
-        assert (work_dir / "spectra" / "spectra_charge_2.lance").exists()
+        assert falcon_mod._setup_work_dir() is False
+        assert (wd / "spectra").is_dir()
 
-    def test_returns_correct_row_count(self, work_dir):
-        lock = threading.Lock()
-        rows = [_make_spec(f"s{i}", 2) for i in range(5)]
-        count = _write_to_dataset(rows, (2,), lock, SCHEMA, str(work_dir))
-        assert count == 5
-
-    def test_appends_to_existing_dataset(self, work_dir):
-        lock = threading.Lock()
-        _write_to_dataset(
-            [_make_spec("s1", 2)], (2,), lock, SCHEMA, str(work_dir)
-        )
-        _write_to_dataset(
-            [_make_spec("s2", 2)], (2,), lock, SCHEMA, str(work_dir)
-        )
-        ds = lance.dataset(
-            str(work_dir / "spectra" / "spectra_charge_2.lance")
-        )
-        assert ds.count_rows() == 2
+        # Re-running against an existing work_dir logs a warning.
+        with caplog.at_level(logging.WARNING, logger="falcon"):
+            assert falcon_mod._setup_work_dir() is False
+        assert any("already exists" in r.message for r in caplog.records)
 
 
-# ----------------------------------------------------------------------
-# Charge routing via _write_spectra_lance
-# ----------------------------------------------------------------------
-
-
-class TestChargeRouting:
-    def test_single_charge_bucket(self, work_dir):
-        charge_to_bucket = {1: (1,)}
-        counts = _run_write_worker(
-            [_make_spec("s1", 1), _make_spec("s2", 1)],
-            charge_to_bucket,
-            catch_other_charges=False,
-            work_dir=work_dir,
-        )
-        assert counts == {"spectra_charge_1.lance": 2}
-
-    def test_multiple_single_charge_buckets(self, work_dir):
-        charge_to_bucket = {1: (1,), 2: (2,)}
-        spectra = [_make_spec("a", 1), _make_spec("b", 2), _make_spec("c", 1)]
-        counts = _run_write_worker(
-            spectra,
-            charge_to_bucket,
-            catch_other_charges=False,
-            work_dir=work_dir,
-        )
-        assert counts["spectra_charge_1.lance"] == 2
-        assert counts["spectra_charge_2.lance"] == 1
-
-    def test_multi_charge_bucket_groups_charges_together(self, work_dir):
-        # Charges 1 and 2 share a single bucket keyed (1, 2)
-        charge_to_bucket = {1: (1, 2), 2: (1, 2)}
-        spectra = [_make_spec("a", 1), _make_spec("b", 2)]
-        counts = _run_write_worker(
-            spectra,
-            charge_to_bucket,
-            catch_other_charges=False,
-            work_dir=work_dir,
-        )
-        assert counts == {"spectra_charge_1_2.lance": 2}
-
-    def test_unknown_charge_routed_to_unknown_bucket(self, work_dir):
-        charge_to_bucket = {"unknown": ("unknown",)}
-        spectra = [_make_spec("u1", None)]
-        counts = _run_write_worker(
-            spectra,
-            charge_to_bucket,
-            catch_other_charges=False,
-            work_dir=work_dir,
-        )
-        assert counts == {"spectra_charge_unknown.lance": 1}
-
-    def test_unmapped_charge_goes_to_other_when_enabled(self, work_dir):
-        charge_to_bucket = {1: (1,)}  # charge 3 has no explicit bucket
-        spectra = [_make_spec("x", 3)]
-        counts = _run_write_worker(
-            spectra,
-            charge_to_bucket,
-            catch_other_charges=True,
-            work_dir=work_dir,
-        )
-        assert counts == {"spectra_charge_other.lance": 1}
-
-    def test_unmapped_charge_dropped_when_other_disabled(self, work_dir):
-        charge_to_bucket = {1: (1,)}
-        spectra = [_make_spec("x", 3)]
-        counts = _run_write_worker(
-            spectra,
-            charge_to_bucket,
-            catch_other_charges=False,
-            work_dir=work_dir,
-        )
-        assert counts == {}
-
-    def test_mixed_routing(self, work_dir):
-        charge_to_bucket = {1: (1,), 2: (2,), "unknown": ("unknown",)}
-        spectra = [
-            _make_spec("a", 1),
-            _make_spec("b", 2),
-            _make_spec("c", None),  # unknown charge
-            _make_spec("d", 5),  # not in any bucket
-        ]
-        counts = _run_write_worker(
-            spectra,
-            charge_to_bucket,
-            catch_other_charges=True,
-            work_dir=work_dir,
-        )
-        assert counts["spectra_charge_1.lance"] == 1
-        assert counts["spectra_charge_2.lance"] == 1
-        assert counts["spectra_charge_unknown.lance"] == 1
-        assert counts["spectra_charge_other.lance"] == 1
-
-
-# ----------------------------------------------------------------------
-# Auto-bucket mode: every distinct charge clustered separately
-# ----------------------------------------------------------------------
-
-
-class TestAutoBucketRouting:
-    def test_each_charge_gets_own_bucket(self, work_dir):
-        spectra = [
-            _make_spec("a", 1),
-            _make_spec("b", 2),
-            _make_spec("c", 1),
-            _make_spec("d", 3),
-        ]
-        counts = _run_write_worker(
-            spectra,
-            charge_to_bucket={},
-            catch_other_charges=False,
-            work_dir=work_dir,
-            auto_bucket=True,
-        )
-        assert counts == {
-            "spectra_charge_1.lance": 2,
-            "spectra_charge_2.lance": 1,
-            "spectra_charge_3.lance": 1,
-        }
-
-    def test_missing_charge_clustered_separately(self, work_dir):
-        spectra = [_make_spec("a", 2), _make_spec("u", None)]
-        counts = _run_write_worker(
-            spectra,
-            charge_to_bucket={},
-            catch_other_charges=False,
-            work_dir=work_dir,
-            auto_bucket=True,
-        )
-        assert counts == {
-            "spectra_charge_2.lance": 1,
-            "spectra_charge_unknown.lance": 1,
-        }
-
-    def test_no_charge_is_dropped(self, work_dir):
-        # Charges that would drop without 'other' are still kept.
-        spectra = [_make_spec("x", 7), _make_spec("y", 13)]
-        counts = _run_write_worker(
-            spectra,
-            charge_to_bucket={},
-            catch_other_charges=False,
-            work_dir=work_dir,
-            auto_bucket=True,
-        )
-        assert counts == {
-            "spectra_charge_7.lance": 1,
-            "spectra_charge_13.lance": 1,
-        }
-
-
-# ----------------------------------------------------------------------
-# _discover_auto_buckets
-# ----------------------------------------------------------------------
-
-
-class TestDiscoverAutoBuckets:
-    def test_discovers_and_sorts_buckets(self, work_dir):
-        spectra = [
-            _make_spec("a", 3),
-            _make_spec("b", 1),
-            _make_spec("c", None),
-            _make_spec("d", 2),
-        ]
-        _run_write_worker(
-            spectra,
-            charge_to_bucket={},
-            catch_other_charges=False,
-            work_dir=work_dir,
-            auto_bucket=True,
-        )
-        spectra_dir = str(work_dir / "spectra")
-        # Numeric charges sorted ascending, "unknown" last.
-        assert _discover_auto_buckets(spectra_dir) == [
-            (1,),
-            (2,),
-            (3,),
-            ("unknown",),
-        ]
-
-
-# ----------------------------------------------------------------------
-# Package metadata & end-to-end CLI
-# ----------------------------------------------------------------------
-
-
-def test_version_is_non_empty_string():
-    assert isinstance(falcon.__version__, str)
-    assert falcon.__version__
-
-
-@pytest.fixture
-def reset_global_config():
-    """Restore global config state after CLI runs."""
-    prev_namespace = _global_config._namespace
-    yield
-    _global_config._namespace = prev_namespace
-    _global_config.__dict__.pop("work_dir", None)
-
-
-def _write_sample_mgf(path):
-    """Write a minimal MGF with two matching spectra and an outlier."""
-    peaks_a = "\n".join(
-        f"{mz:.1f} {inten:.1f}"
-        for mz, inten in [
-            (150.0, 100.0),
-            (250.0, 200.0),
-            (350.0, 150.0),
-            (450.0, 300.0),
-            (550.0, 250.0),
-            (650.0, 120.0),
-        ]
-    )
-    peaks_b = "\n".join(
-        f"{mz:.1f} {inten:.1f}"
-        for mz, inten in [
-            (180.0, 100.0),
-            (280.0, 200.0),
-            (380.0, 150.0),
-            (480.0, 300.0),
-            (580.0, 250.0),
-            (680.0, 120.0),
-        ]
-    )
-    path.write_text(
-        f"BEGIN IONS\n"
-        f"SCANS=1\n"
-        f"PEPMASS=500.0\n"
-        f"CHARGE=2+\n"
-        f"RTINSECONDS=10.0\n"
-        f"{peaks_a}\n"
-        f"END IONS\n"
-        f"BEGIN IONS\n"
-        f"SCANS=2\n"
-        f"PEPMASS=500.0\n"
-        f"CHARGE=2+\n"
-        f"RTINSECONDS=11.0\n"
-        f"{peaks_a}\n"
-        f"END IONS\n"
-        f"BEGIN IONS\n"
-        f"SCANS=3\n"
-        f"PEPMASS=600.0\n"
-        f"CHARGE=2+\n"
-        f"RTINSECONDS=20.0\n"
-        f"{peaks_b}\n"
-        f"END IONS\n"
-    )
-
-
-class TestMainCLI:
-    def test_end_to_end_clustering_and_overwrite(
+class TestValidateOutputs:
+    def test_allows_run_when_outputs_do_not_exist(
         self, tmp_path, reset_global_config
     ):
-        mgf_path = tmp_path / "sample.mgf"
-        _write_sample_mgf(mgf_path)
-        out_prefix = tmp_path / "results"
-
-        rc = falcon_main(
-            [str(mgf_path), str(out_prefix), "--export_representatives"]
+        _parse_global(
+            reset_global_config, ["in.mgf", str(tmp_path / "results")]
         )
-        assert rc == 0
+        assert falcon_mod._validate_outputs() is False
 
-        csv_path = tmp_path / "results.csv"
-        mgf_out_path = tmp_path / "results.mgf"
-        assert csv_path.is_file()
-        assert mgf_out_path.is_file()
+    @pytest.mark.parametrize("existing_ext", ["csv", "mgf"])
+    def test_aborts_without_overwrite_preserving_existing_file(
+        self, tmp_path, reset_global_config, existing_ext
+    ):
+        prefix = tmp_path / "results"
+        existing = tmp_path / f"results.{existing_ext}"
+        existing.write_text("keep")
+        _parse_global(reset_global_config, ["in.mgf", str(prefix)])
 
-        df = pd.read_csv(csv_path, comment="#").set_index("identifier")
-        assert len(df) == 3
-        c1 = df.loc["sample:scan:1", "cluster"]
-        c2 = df.loc["sample:scan:2", "cluster"]
-        c3 = df.loc["sample:scan:3", "cluster"]
-        assert c1 == c2
-        assert c1 != c3
-        assert mgf_out_path.read_text().count("BEGIN IONS") == 2
+        assert falcon_mod._validate_outputs() is True
+        assert existing.read_text() == "keep"
 
-        # Re-running without --overwrite must abort with status 1.
-        assert falcon_main([str(mgf_path), str(out_prefix)]) == 1
-
-        # Re-running with --overwrite must succeed cleanly.
-        assert (
-            falcon_main([str(mgf_path), str(out_prefix), "--overwrite"]) == 0
+    def test_removes_both_csv_and_mgf_when_overwrite_enabled(
+        self, tmp_path, reset_global_config
+    ):
+        prefix = tmp_path / "results"
+        csv_file = tmp_path / "results.csv"
+        mgf_file = tmp_path / "results.mgf"
+        csv_file.write_text("old csv")
+        mgf_file.write_text("old mgf")
+        _parse_global(
+            reset_global_config, ["in.mgf", str(prefix), "--overwrite"]
         )
+
+        assert falcon_mod._validate_outputs() is False
+        assert not csv_file.exists()
+        assert not mgf_file.exists()
+
+
+class TestWarnAggressiveOutlierCutoffs:
+    def test_warns_only_for_average_when_both_cutoffs_below_one(
+        self, reset_global_config, caplog
+    ):
+        _parse_global(
+            reset_global_config,
+            [
+                "in.mgf",
+                "out",
+                "--consensus_method",
+                "average",
+                "--outlier_cutoff_lower",
+                "0.5",
+                "--outlier_cutoff_upper",
+                "0.8",
+            ],
+        )
+        with caplog.at_level(logging.WARNING, logger="falcon"):
+            falcon_mod._warn_aggressive_outlier_cutoffs()
+        assert any("less than 1" in r.message for r in caplog.records)
+
+    @pytest.mark.parametrize(
+        "extra_args",
+        [
+            [
+                "--consensus_method",
+                "medoid",
+                "--outlier_cutoff_lower",
+                "0.5",
+                "--outlier_cutoff_upper",
+                "0.5",
+            ],
+            [
+                "--consensus_method",
+                "average",
+                "--outlier_cutoff_lower",
+                "0.5",
+                "--outlier_cutoff_upper",
+                "1.0",
+            ],
+        ],
+    )
+    def test_no_warning_outside_aggressive_average_regime(
+        self, reset_global_config, caplog, extra_args
+    ):
+        _parse_global(reset_global_config, ["in.mgf", "out", *extra_args])
+        with caplog.at_level(logging.WARNING, logger="falcon"):
+            falcon_mod._warn_aggressive_outlier_cutoffs()
+        assert caplog.records == []
+
+
+class TestBuildProcessSpectrum:
+    def test_maps_scaling_off_to_none_and_applies_get_dim_bounds(
+        self, reset_global_config
+    ):
+        _parse_global(
+            reset_global_config,
+            ["in.mgf", "out", "--scaling", "off", "--min_mz", "101"],
+        )
+        proc = falcon_mod._build_process_spectrum()
+        assert proc.keywords["scaling"] is None
+        assert proc.keywords["mz_min"] <= 101.0
+
+        _parse_global(
+            reset_global_config, ["in.mgf", "out", "--scaling", "root"]
+        )
+        proc_root = falcon_mod._build_process_spectrum()
+        assert proc_root.keywords["scaling"] == "root"
+
+
+# ----------------------------------------------------------------------
+# Bucket cache reuse, mismatch, and overwrite clearing
+# ----------------------------------------------------------------------
+
+
+class TestLoadOrPrepareBuckets:
+    def test_reuses_matching_cache_without_repreparing(
+        self, tmp_path, reset_global_config, monkeypatch
+    ):
+        spectra_dir = tmp_path / "spectra"
+        spectra_dir.mkdir()
+        joblib.dump(
+            {"config": [{1}, {2}], "buckets": [{1}, {2}]},
+            spectra_dir / "charges.joblib",
+        )
+        _parse_global(
+            reset_global_config,
+            [
+                "in.mgf",
+                "out",
+                "--work_dir",
+                str(tmp_path),
+                "--precursor_charge_buckets",
+                "[1]",
+                "[2]",
+            ],
+        )
+
+        def _fail(*_args, **_kwargs):
+            raise AssertionError("_prepare_spectra should not be called")
+
+        monkeypatch.setattr(falcon_mod, "_prepare_spectra", _fail)
+        assert falcon_mod._load_or_prepare_buckets(lambda s: None) == [
+            {1},
+            {2},
+        ]
+
+    @pytest.mark.parametrize(
+        "cached_payload",
+        [
+            # Mismatched config vs None.
+            {"config": [{1}], "buckets": [{1}]},
+            # Legacy list cache without config key.
+            [(1,), (2,)],
+        ],
+    )
+    def test_mismatched_or_legacy_cache_raises_value_error(
+        self, tmp_path, reset_global_config, cached_payload
+    ):
+        spectra_dir = tmp_path / "spectra"
+        spectra_dir.mkdir()
+        joblib.dump(cached_payload, spectra_dir / "charges.joblib")
+        _parse_global(
+            reset_global_config,
+            ["in.mgf", "out", "--work_dir", str(tmp_path)],
+        )
+        with pytest.raises(ValueError, match="Cached charge buckets"):
+            falcon_mod._load_or_prepare_buckets(lambda s: None)
+
+    def test_overwrite_clears_cached_directories_and_files(
+        self, tmp_path, reset_global_config, monkeypatch
+    ):
+        spectra_dir = tmp_path / "spectra"
+        stale_dir = spectra_dir / "spectra_charge_99.lance"
+        stale_dir.mkdir(parents=True)
+        (stale_dir / "data").write_text("stale")
+        (spectra_dir / "charges.joblib").write_text("stale")
+
+        _parse_global(
+            reset_global_config,
+            ["in.mgf", "out", "--work_dir", str(tmp_path), "--overwrite"],
+        )
+        monkeypatch.setattr(
+            falcon_mod, "_prepare_spectra", lambda _proc, _buckets: [(2,)]
+        )
+
+        buckets = falcon_mod._load_or_prepare_buckets(lambda s: None)
+        assert buckets == [(2,)]
+        assert not stale_dir.exists()
+        saved = joblib.load(spectra_dir / "charges.joblib")
+        assert saved == {"config": None, "buckets": [(2,)]}
+
+
+# ----------------------------------------------------------------------
+# _run_clustering and _export_results
+# ----------------------------------------------------------------------
+
+
+class TestRunClusteringAndExportResults:
+    def test_run_clustering_passes_average_params_and_skips_empty_buckets(
+        self,
+        tmp_path,
+        reset_global_config,
+        lance_dataset,
+        spectrum_row,
+        monkeypatch,
+    ):
+        spectra_dir = tmp_path / "spectra"
+        spectra_dir.mkdir()
+        # Create an empty bucket (charge 1) and a populated one (2).
+        lance_dataset([], name="spectra/spectra_charge_1.lance")
+        lance_dataset(
+            [spectrum_row("s:1", 500.0, [100.0, 200.0], [1.0, 1.0], 2, 10.0)],
+            name="spectra/spectra_charge_2.lance",
+        )
+        _parse_global(
+            reset_global_config,
+            [
+                "in.mgf",
+                "out",
+                "--work_dir",
+                str(tmp_path),
+                "--consensus_method",
+                "average",
+                "--fragment_tol",
+                "0.05",
+                "--outlier_cutoff_lower",
+                "2.0",
+                "--outlier_cutoff_upper",
+                "2.5",
+            ],
+        )
+
+        captured = {}
+
+        def _fake_multi(datasets, *args):
+            captured["datasets"] = datasets
+            captured["consensus_params"] = args[-1]
+            return [(np.array([0], dtype=np.int32), [])]
+
+        monkeypatch.setattr(
+            falcon_mod.cluster, "generate_clusters_multi", _fake_multi
+        )
+
+        datasets, results = falcon_mod._run_clustering([(1,), (2,)])
+        assert len(datasets) == 1
+        assert datasets[0].count_rows() == 1
+        assert len(results) == 1
+        assert captured["consensus_params"] == {
+            "min_mz": 101.0,
+            "max_mz": 1500.0,
+            "bin_size": pytest.approx(0.1),
+            "outlier_cutoff_lower": 2.0,
+            "outlier_cutoff_upper": 2.5,
+        }
+
+    def test_export_results_offsets_buckets_and_natural_sorts_identifiers(
+        self, tmp_path, reset_global_config, lance_dataset, spectrum_row
+    ):
+        ds1 = lance_dataset(
+            [
+                spectrum_row(
+                    "run:scan:10", 500.0, [100.0, 200.0], [1.0, 1.0], 2, 10.0
+                ),
+                spectrum_row(
+                    "run:scan:2", 500.0, [100.0, 200.0], [1.0, 1.0], 2, 10.0
+                ),
+            ],
+            charge=2,
+        )
+        ds2 = lance_dataset(
+            [
+                spectrum_row(
+                    "run:scan:1", 600.0, [150.0, 250.0], [1.0, 1.0], 3, 20.0
+                )
+            ],
+            charge=3,
+        )
+        rep1 = ConsensusTuple(
+            np.float32(500.0),
+            np.int32(2),
+            np.array([100.0, 200.0], np.float32),
+            np.array([0.7, 0.7], np.float32),
+            np.float32(10.0),
+            np.int32(0),
+            np.int32(0),
+        )
+        rep2 = ConsensusTuple(
+            np.float32(600.0),
+            np.int32(3),
+            np.array([150.0, 250.0], np.float32),
+            np.array([0.7, 0.7], np.float32),
+            np.float32(20.0),
+            np.int32(0),
+            np.int32(0),
+        )
+        out_prefix = tmp_path / "out"
+        _parse_global(
+            reset_global_config,
+            ["in.mgf", str(out_prefix), "--export_representatives"],
+        )
+
+        falcon_mod._export_results(
+            [ds1, ds2],
+            [
+                (np.array([0, 0], dtype=np.int32), [rep1]),
+                (np.array([0], dtype=np.int32), [rep2]),
+            ],
+        )
+
+        df = pd.read_csv(f"{out_prefix}.csv", comment="#")
+        # Natural sort puts scan:1, scan:2, scan:10 (not lex order).
+        assert list(df["identifier"]) == [
+            "run:scan:1",
+            "run:scan:2",
+            "run:scan:10",
+        ]
+        by_id = df.set_index("identifier")["cluster"].to_dict()
+        assert by_id["run:scan:2"] == by_id["run:scan:10"] == 0
+        assert by_id["run:scan:1"] == 1
+        mgf_text = (tmp_path / "out.mgf").read_text()
+        assert "TITLE=falcon:cluster:0" in mgf_text
+        assert "TITLE=falcon:cluster:1" in mgf_text
+
+    def test_export_results_empty_inputs_writes_empty_csv_and_mgf(
+        self, tmp_path, reset_global_config
+    ):
+        out_prefix = tmp_path / "empty_out"
+        _parse_global(
+            reset_global_config,
+            ["in.mgf", str(out_prefix), "--export_representatives"],
+        )
+        falcon_mod._export_results([], [])
+        df = pd.read_csv(f"{out_prefix}.csv", comment="#")
+        assert len(df) == 0
+        assert list(df.columns) == [
+            "identifier",
+            "precursor_charge",
+            "precursor_mz",
+            "retention_time",
+            "cluster",
+        ]
+        assert (tmp_path / "empty_out.mgf").is_file()
+
+    def test_export_results_propagates_writer_thread_exceptions(
+        self, tmp_path, reset_global_config, lance_dataset, spectrum_row
+    ):
+        ds = lance_dataset(
+            [spectrum_row("s:1", 500.0, [100.0, 200.0], [1.0, 1.0], 2, 10.0)],
+            charge=2,
+        )
+        bad_prefix = tmp_path / "nonexistent_dir" / "out"
+        _parse_global(reset_global_config, ["in.mgf", str(bad_prefix)])
+
+        with pytest.raises(FileNotFoundError):
+            falcon_mod._export_results(
+                [ds], [(np.array([0], dtype=np.int32), [])]
+            )

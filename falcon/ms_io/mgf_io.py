@@ -61,7 +61,7 @@ def get_spectra(source: IO[Any] | str) -> Iterator[sus.MsmsSpectrum]:
 
             try:
                 yield _parse_spectrum(spectrum_dict)
-            except (ValueError, KeyError) as e:
+            except (ValueError, KeyError, TypeError, IndexError) as e:
                 reader_utils.log_skipped_spectrum(
                     source, params.get("title"), e
                 )
@@ -154,9 +154,13 @@ def _spectra_to_dicts(
             "scans": i + 1,
             "pepmass": float(spectrum.precursor_mz),
         }
-        if not math.isnan(float(spectrum.precursor_charge)):
+        if spectrum.precursor_charge is not None and not math.isnan(
+            float(spectrum.precursor_charge)
+        ):
             params["charge"] = int(spectrum.precursor_charge)
-        if not math.isnan(float(spectrum.retention_time)):
+        if spectrum.retention_time is not None and not math.isnan(
+            float(spectrum.retention_time)
+        ):
             params["rtinseconds"] = float(spectrum.retention_time)
         yield {
             "params": params,

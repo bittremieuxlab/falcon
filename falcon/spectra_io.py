@@ -65,6 +65,10 @@ def _prepare_spectra(
     input_filenames = [
         fn for pattern in config.input_filenames for fn in glob.glob(pattern)
     ]
+    if not input_filenames:
+        raise FileNotFoundError(
+            f"No input peak files matched: {config.input_filenames}"
+        )
     logger.info(
         "Reading spectra from %d peak file(s)...", len(input_filenames)
     )
@@ -95,6 +99,10 @@ def _prepare_spectra(
     if charge_buckets is not None:
         for bucket in charge_buckets:
             if bucket == "other":
+                if catch_other_charges:
+                    raise ValueError(
+                        "Charge bucket 'other' appears more than once"
+                    )
                 catch_other_charges = True
                 continue  # Unmatched charges are routed later.
             for charge in bucket:
@@ -201,7 +209,9 @@ def _discover_auto_buckets(
 
 
 def _create_lance_dataset(
-    charge_bucket: BucketKey, schema: pa.Schema
+    charge_bucket: BucketKey,
+    schema: pa.Schema,
+    work_dir: str | None = None,
 ) -> lance.LanceDataset:
     """
     Create an empty Lance dataset for a charge bucket.
@@ -212,14 +222,18 @@ def _create_lance_dataset(
         Charge bucket key identifying the dataset path.
     schema : pa.Schema
         PyArrow schema of the Lance table.
+    work_dir : str | None, default=None
+        Working directory containing the ``spectra`` staging folder.
+        Defaults to ``config.work_dir`` when ``None``.
 
     Returns
     -------
     lance.LanceDataset
         The newly created empty Lance dataset.
     """
+    base_dir = config.work_dir if work_dir is None else work_dir
     lance_path = os.path.join(
-        config.work_dir,
+        base_dir,
         "spectra",
         f"spectra_charge{bucket_key_to_str(charge_bucket)}.lance",
     )
@@ -412,7 +426,7 @@ def _write_to_dataset(
     )
     with lock:
         if not os.path.exists(path):
-            _create_lance_dataset(charge_bucket, schema)
+            _create_lance_dataset(charge_bucket, schema, work_dir)
         lance.write_dataset(new_rows, path, mode="append")
     return len(new_rows)
 

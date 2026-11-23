@@ -38,6 +38,8 @@ def compute_condensed_distance_matrix(
         ``n * (n - 1) // 2``.
     """
     n = len(spec_tuples)
+    if n < 2:
+        return np.empty(0, dtype=np.float32)
     with tempfile.NamedTemporaryFile(
         suffix=".npy", delete=False
     ) as pdist_file:

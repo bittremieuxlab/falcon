@@ -44,7 +44,8 @@ def _check_spectrum_valid(
         otherwise.
     """
     return (
-        len(spectrum_mz) >= min_peaks
+        len(spectrum_mz) > 0
+        and len(spectrum_mz) >= min_peaks
         and spectrum_mz[-1] - spectrum_mz[0] >= min_mz_range
     )
 
@@ -145,7 +146,10 @@ def process_spectrum(
         if not _check_spectrum_valid(spectrum.mz, min_peaks, min_mz_range):
             return None
 
-    spectrum = spectrum.scale_intensity(scaling, max_rank=max_peaks_used)
+    if max_peaks_used is not None:
+        spectrum = spectrum.scale_intensity(scaling, max_rank=max_peaks_used)
+    else:
+        spectrum = spectrum.scale_intensity(scaling)
     intensity = _norm_intensity(spectrum.intensity)
 
     return {
