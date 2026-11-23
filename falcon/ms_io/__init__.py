@@ -2,22 +2,29 @@
 
 from __future__ import annotations
 
-import os
-from collections.abc import Iterable, Iterator
+import importlib
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
-from spectrum_utils.spectrum import MsmsSpectrum
+if TYPE_CHECKING:
+    import os
+    from collections.abc import Iterable, Iterator
 
-from ..types import ConsensusTuple
-from . import mgf_io, mzml_io, mzxml_io
+    from spectrum_utils.spectrum import MsmsSpectrum
 
-_READERS = {
-    ".mgf": mgf_io,
-    ".mzml": mzml_io,
-    ".mzxml": mzxml_io,
-}
+    from ..types import ConsensusTuple
+    from . import mgf_io, mzml_io, mzxml_io
+
+_LAZY_SUBMODULES = frozenset({"mgf_io", "mzml_io", "mzxml_io"})
 
 __all__ = ["get_spectra", "mgf_io", "mzml_io", "mzxml_io", "write_spectra"]
+
+
+def __getattr__(name: str) -> Any:
+    """Lazily load format-specific reader/writer submodules."""
+    if name in _LAZY_SUBMODULES:
+        return importlib.import_module(f".{name}", __name__)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def get_spectra(filename: str | os.PathLike[str]) -> Iterator[MsmsSpectrum]:
@@ -32,26 +39,36 @@ def get_spectra(filename: str | os.PathLike[str]) -> Iterator[MsmsSpectrum]:
     filename : str | os.PathLike[str]
         Path to the input peak file.
 
-    Yields
-    ------
-    MsmsSpectrum
-        Parsed MS/MS spectra from ``filename``.
+    Returns
+    -------
+    Iterator[MsmsSpectrum]
+        Lazy iterator over parsed MS/MS spectra from ``filename``.
 
     Raises
     ------
+    FileNotFoundError
+        If ``filename`` does not exist or is not a regular file.
     ValueError
-        If ``filename`` does not exist or has an unsupported extension.
+        If ``filename`` has an unsupported extension.
     """
     path = Path(filename)
     if not path.is_file():
-        raise ValueError(f"Non-existing peak file {filename}")
+        raise FileNotFoundError(f"Non-existing peak file {filename}")
 
     ext = path.suffix.lower()
-    reader = _READERS.get(ext)
-    if reader is None:
-        raise ValueError(f'Unknown spectrum file type with extension "{ext}"')
+    if ext == ".mgf":
+        from . import mgf_io
 
-    yield from reader.get_spectra(path)
+        return mgf_io.get_spectra(path)
+    if ext == ".mzml":
+        from . import mzml_io
+
+        return mzml_io.get_spectra(path)
+    if ext == ".mzxml":
+        from . import mzxml_io
+
+        return mzxml_io.get_spectra(path)
+    raise ValueError(f'Unknown spectrum file type with extension "{ext}"')
 
 
 def write_spectra(
@@ -79,5 +96,7 @@ def write_spectra(
         raise ValueError(
             "Unsupported peak file format (supported formats: MGF)"
         )
+
+    from . import mgf_io
 
     mgf_io.write_spectra(path, spectra)

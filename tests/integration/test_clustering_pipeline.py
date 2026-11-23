@@ -4,14 +4,14 @@ import math
 import tempfile
 
 import numpy as np
+import pytest
 
 from falcon.cluster import generate_clusters, generate_clusters_multi
-from falcon.config import (
-    AverageConsensusConfig,
-    ClusteringConfig,
-    PrecursorTolerance,
-)
-from falcon.staging import CANONICAL_SORT_COLUMNS
+from falcon.config import AverageConsensusConfig, MedoidConsensusConfig
+from falcon.dataset import CANONICAL_SORT_COLUMNS
+from falcon.types import ClusterResult
+
+pytestmark = pytest.mark.integration
 
 
 def _attach_labels(dataset, labels):
@@ -24,19 +24,9 @@ def _attach_labels(dataset, labels):
     return dict(zip(meta["identifier"], meta["cluster"], strict=True))
 
 
-def _da_clustering(**overrides) -> ClusteringConfig:
-    defaults = {
-        "precursor_tol": PrecursorTolerance(mass=0.5, mode="Da"),
-        "fragment_tol": 0.05,
-        "distance_threshold": 0.1,
-    }
-    defaults.update(overrides)
-    return ClusteringConfig(**defaults)
-
-
 class TestClusteringPipelineIntegration:
     def test_label_alignment_under_sort_key_ties_and_isolated_split(
-        self, lance_dataset, spectrum_row
+        self, lance_dataset, spectrum_row, da_clustering_factory
     ):
         peaks_a = [100.0, 200.0, 300.0, 400.0, 500.0]
         peaks_b = [600.0, 700.0, 800.0, 900.0, 1000.0]
@@ -49,11 +39,19 @@ class TestClusteringPipelineIntegration:
             spectrum_row("f:scan:ISO", 900.0, peaks_a, inten, 2, 10.0),
         ]
         dataset = lance_dataset(rows)
-        labels, reps = generate_clusters(dataset, _da_clustering())
-        labels_arr = np.asarray(labels)
-        assert (labels_arr >= 0).all()
+        res = generate_clusters(
+            dataset, da_clustering_factory(), bucket_label="2"
+        )
+        assert isinstance(res, ClusterResult)
+        labels, reps = res
+        assert res.labels is labels
+        assert res.representatives is reps
+        assert labels.dtype == np.int32
+        assert (labels >= 0).all()
         assert len(reps) == 3
-        by_id = _attach_labels(dataset, labels_arr)
+        assert [int(r.cluster_id) for r in reps] == [0, 1, 2]
+
+        by_id = _attach_labels(dataset, labels)
         assert by_id["f:scan:A1"] == by_id["f:scan:A2"]
         assert by_id["f:scan:B1"] == by_id["f:scan:B2"]
         assert (
@@ -62,14 +60,18 @@ class TestClusteringPipelineIntegration:
         )
 
         # Skipping representatives returns bit-identical labels and [].
-        labels_no_rep, reps_empty = generate_clusters(
-            dataset, _da_clustering(), compute_representatives=False
+        res_no_rep = generate_clusters(
+            dataset,
+            da_clustering_factory(),
+            compute_representatives=False,
         )
-        np.testing.assert_array_equal(labels_no_rep, labels_arr)
+        assert isinstance(res_no_rep, ClusterResult)
+        labels_no_rep, reps_empty = res_no_rep
+        np.testing.assert_array_equal(labels_no_rep, labels)
         assert reps_empty == []
 
     def test_dissimilar_spectra_become_singletons(
-        self, lance_dataset, spectrum_row
+        self, lance_dataset, spectrum_row, da_clustering_factory
     ):
         rows = [
             spectrum_row(
@@ -98,12 +100,20 @@ class TestClusteringPipelineIntegration:
             ),
         ]
         dataset = lance_dataset(rows)
-        labels, reps = generate_clusters(dataset, _da_clustering())
-        assert len(np.unique(np.asarray(labels))) == 3
+        res = generate_clusters(dataset, da_clustering_factory())
+        assert isinstance(res, ClusterResult)
+        labels, reps = res
+        assert len(np.unique(labels)) == 3
         assert len(reps) == 3
+        assert [int(r.cluster_id) for r in reps] == [0, 1, 2]
 
     def test_giant_tiled_path_matches_normal_path_and_cleans_memmaps(
-        self, lance_dataset, spectrum_row, tmp_path, monkeypatch
+        self,
+        lance_dataset,
+        spectrum_row,
+        da_clustering_factory,
+        tmp_path,
+        monkeypatch,
     ):
         peaks_a = [150.0, 250.0, 350.0, 450.0, 550.0]
         peaks_b = [180.0, 280.0, 380.0, 480.0, 580.0]
@@ -124,21 +134,29 @@ class TestClusteringPipelineIntegration:
         temp_sub.mkdir()
         monkeypatch.setattr(tempfile, "tempdir", str(temp_sub))
 
-        for consensus_cfg in (None, AverageConsensusConfig()):
-            labels_giant, reps_giant = generate_clusters(
+        for consensus_cfg in (
+            None,
+            MedoidConsensusConfig(),
+            AverageConsensusConfig(),
+        ):
+            res_giant = generate_clusters(
                 dataset,
-                _da_clustering(batch_size=8),
+                da_clustering_factory(batch_size=8),
                 consensus_cfg,
                 min_mz=100.0,
                 max_mz=700.0,
             )
-            labels_normal, reps_normal = generate_clusters(
+            res_normal = generate_clusters(
                 dataset,
-                _da_clustering(batch_size=100),
+                da_clustering_factory(batch_size=100),
                 consensus_cfg,
                 min_mz=100.0,
                 max_mz=700.0,
             )
+            assert isinstance(res_giant, ClusterResult)
+            assert isinstance(res_normal, ClusterResult)
+            labels_giant, reps_giant = res_giant
+            labels_normal, reps_normal = res_normal
             np.testing.assert_array_equal(labels_giant, labels_normal)
             assert len(reps_giant) == len(reps_normal) == 3
             for r_g, r_n in zip(reps_giant, reps_normal, strict=True):
@@ -148,7 +166,7 @@ class TestClusteringPipelineIntegration:
         assert list(temp_sub.glob("*.npy")) == []
 
     def test_multi_bucket_rt_filtering_and_unknown_charge_average(
-        self, lance_dataset, spectrum_row
+        self, lance_dataset, spectrum_row, da_clustering_factory
     ):
         peaks = [100.0, 200.0, 300.0, 400.0, 500.0]
         inten = [1.0, 0.8, 0.6, 0.4, 0.2]
@@ -182,14 +200,15 @@ class TestClusteringPipelineIntegration:
         )
         results = generate_clusters_multi(
             [ds_ch2, ds_unk],
-            _da_clustering(rt_tol=5.0),
+            da_clustering_factory(rt_tol=5.0),
             AverageConsensusConfig(),
             min_mz=100.0,
             max_mz=600.0,
         )
         assert len(results) == 2
+        assert all(isinstance(res, ClusterResult) for res in results)
 
-        by_id_ch2 = _attach_labels(ds_ch2, results[0][0])
+        by_id_ch2 = _attach_labels(ds_ch2, results[0].labels)
         assert by_id_ch2["c2:e1"] == by_id_ch2["c2:e2"]
         assert by_id_ch2["c2:l1"] == by_id_ch2["c2:l2"]
         assert by_id_ch2["c2:n1"] == by_id_ch2["c2:n2"]
@@ -197,15 +216,19 @@ class TestClusteringPipelineIntegration:
             len({by_id_ch2["c2:e1"], by_id_ch2["c2:l1"], by_id_ch2["c2:n1"]})
             == 3
         )
+        assert len(results[0].representatives) == 3
 
         labels_unk, reps_unk = results[1]
-        assert len(np.unique(np.asarray(labels_unk))) == 1
+        assert len(np.unique(labels_unk)) == 1
         assert len(reps_unk) == 1
         assert math.isnan(reps_unk[0].precursor_charge)
         assert len(reps_unk[0].mz) == 5
 
-    def test_empty_dataset_returns_empty_labels_and_reps(self, lance_dataset):
+    def test_empty_dataset_returns_empty_labels_and_reps(
+        self, lance_dataset, da_clustering_factory
+    ):
         ds = lance_dataset([], charge=2)
-        labels, reps = generate_clusters(ds, _da_clustering())
-        assert len(labels) == 0
-        assert reps == []
+        res = generate_clusters(ds, da_clustering_factory())
+        assert isinstance(res, ClusterResult)
+        assert len(res.labels) == 0
+        assert res.representatives == []

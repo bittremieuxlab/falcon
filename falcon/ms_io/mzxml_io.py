@@ -3,17 +3,26 @@
 from __future__ import annotations
 
 import logging
-import os
-from collections.abc import Iterator
-from typing import IO, Any
+from typing import IO, TYPE_CHECKING, Any
 
 import pyteomics.mzxml
-import spectrum_utils.spectrum as sus
-from lxml.etree import LxmlError
 
 from . import reader_utils
 
-logger = logging.getLogger("falcon")
+if TYPE_CHECKING:
+    import os
+    from collections.abc import Iterator
+
+    import spectrum_utils.spectrum as sus
+
+logger = logging.getLogger(__name__)
+
+__all__ = ["get_spectra"]
+
+
+def _extract_scan_nr(spectrum_dict: dict[str, Any]) -> str:
+    """Extract the integer scan number from an mzXML spectrum dict."""
+    return str(int(spectrum_dict["id"]))
 
 
 def get_spectra(
@@ -33,28 +42,19 @@ def get_spectra(
         Parsed MS/MS spectra with ``<stem>:scan:<number>`` identifiers;
         malformed spectra are logged and skipped.
     """
-    mzxml_source: IO[Any] | str = (
-        os.fspath(source) if isinstance(source, os.PathLike) else source
+    yield from reader_utils.iter_xml_spectra(
+        source,
+        pyteomics.mzxml.MzXML,
+        "msLevel",
+        _extract_scan_nr,
+        _parse_spectrum,
+        logger,
     )
-    with pyteomics.mzxml.MzXML(mzxml_source) as f_in:
-        filename = reader_utils.base_filename(source, f_in)
-        try:
-            for spectrum_dict in f_in:
-                try:
-                    if int(spectrum_dict.get("msLevel", -1)) <= 1:
-                        continue
-                    scan_nr = int(spectrum_dict["id"])
-                    spectrum_dict["id"] = f"{filename}:scan:{scan_nr}"
-                    yield _parse_spectrum(spectrum_dict)
-                except reader_utils.PARSE_EXCEPTIONS as exc:
-                    reader_utils.log_skipped_spectrum(
-                        source, spectrum_dict.get("id"), exc
-                    )
-        except LxmlError as exc:
-            logger.warning("Failed to read file %s: %s", source, exc)
 
 
-def _parse_spectrum(spectrum_dict: dict[str, Any]) -> sus.MsmsSpectrum:
+def _parse_spectrum(
+    spectrum_dict: dict[str, Any], identifier: str
+) -> sus.MsmsSpectrum:
     """
     Parse a Pyteomics mzXML spectrum dict into an ``MsmsSpectrum``.
 
@@ -65,13 +65,14 @@ def _parse_spectrum(spectrum_dict: dict[str, Any]) -> sus.MsmsSpectrum:
     ----------
     spectrum_dict : dict[str, Any]
         Pyteomics mzXML spectrum entry.
+    identifier : str
+        USI-style spectrum identifier assigned to the parsed spectrum.
 
     Returns
     -------
     MsmsSpectrum
         Parsed spectrum; missing charge is ``None``.
     """
-    spectrum_id = spectrum_dict["id"]
     mz_array = spectrum_dict["m/z array"]
     intensity_array = spectrum_dict["intensity array"]
     retention_time = spectrum_dict.get("retentionTime", float("nan"))
@@ -85,7 +86,7 @@ def _parse_spectrum(spectrum_dict: dict[str, Any]) -> sus.MsmsSpectrum:
     )
 
     return reader_utils.build_msms_spectrum(
-        spectrum_id,
+        identifier,
         precursor_mz,
         precursor_charge,
         mz_array,

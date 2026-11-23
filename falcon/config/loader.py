@@ -4,17 +4,29 @@ from __future__ import annotations
 
 import copy
 import tomllib
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ..utils import resolve_path
 from .models import ConfigError, FalconConfig, FalconSettings
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+__all__ = [
+    "load_config",
+    "load_settings",
+    "load_toml_file",
+    "merge_config_dicts",
+]
 
 
 def merge_config_dicts(
     base: Mapping[str, Any],
     override: Mapping[str, Any],
+    *,
+    _top_level: bool = True,
 ) -> dict[str, Any]:
     """
     Recursively merge two config mappings without mutating inputs.
@@ -22,8 +34,8 @@ def merge_config_dicts(
     Each leaf value is deep-copied at most once. Lists and scalar values
     replace lower-layer entries atomically. When ``override`` switches
     ``consensus.method`` to a different discriminated variant than
-    ``base``, stale variant-specific keys from ``base["consensus"]`` are
-    discarded.
+    ``base`` at the top level, stale variant-specific keys from
+    ``base["consensus"]`` are discarded.
 
     Parameters
     ----------
@@ -31,6 +43,9 @@ def merge_config_dicts(
         Lower-precedence configuration mapping.
     override : Mapping[str, Any]
         Higher-precedence sparse override mapping.
+    _top_level : bool, default=True
+        Internal flag restricting consensus variant resets to the top
+        level of the configuration dictionary.
 
     Returns
     -------
@@ -45,14 +60,17 @@ def merge_config_dicts(
         val = override[key]
         if isinstance(existing, Mapping) and isinstance(val, Mapping):
             if (
-                key == "consensus"
+                _top_level
+                and key == "consensus"
                 and "method" in val
                 and "method" in existing
                 and val["method"] != existing["method"]
             ):
                 merged[key] = copy.deepcopy(dict(val))
             else:
-                merged[key] = merge_config_dicts(existing, val)
+                merged[key] = merge_config_dicts(
+                    existing, val, _top_level=False
+                )
         else:
             merged[key] = copy.deepcopy(val)
     for key, val in override.items():
@@ -163,20 +181,22 @@ def load_toml_file(
             f"Invalid TOML syntax in {path}{origin}: {exc}"
         ) from exc
 
+    if "extends" not in data:
+        return data
+
+    extends_entries = _parse_extends_entries(data.pop("extends"), path)
+    next_stack = (*_stack, resolved)
     merged: dict[str, Any] = {}
-    if "extends" in data:
-        extends_entries = _parse_extends_entries(data.pop("extends"), path)
-        next_stack = (*_stack, resolved)
-        for entry in extends_entries:
-            parent_path = Path(entry)
-            if not parent_path.is_absolute():
-                parent_path = path.parent / parent_path
-            parent_data = load_toml_file(
-                parent_path,
-                _stack=next_stack,
-                _referenced_by=path,
-            )
-            merged = merge_config_dicts(merged, parent_data)
+    for entry in extends_entries:
+        parent_path = Path(entry)
+        if not parent_path.is_absolute():
+            parent_path = path.parent / parent_path
+        parent_data = load_toml_file(
+            parent_path,
+            _stack=next_stack,
+            _referenced_by=path,
+        )
+        merged = merge_config_dicts(merged, parent_data)
 
     return merge_config_dicts(merged, data)
 

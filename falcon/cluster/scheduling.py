@@ -5,17 +5,23 @@ from __future__ import annotations
 import heapq
 import logging
 import math
-from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
-import lance
 import numba as nb
 import numba.typed
 import numpy as np
 
-from ..staging import CANONICAL_SORT_COLUMNS
+from ..dataset import CANONICAL_SORT_COLUMNS, read_canonical_metadata
 
-logger = logging.getLogger("falcon")
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    import lance
+
+    from ..config.models import ClusteringConfig
+
+logger = logging.getLogger(__name__)
 
 # Number of cost-balanced m/z-split chunks to create per CPU worker.
 # Having several times more tasks than workers lets joblib load-balance
@@ -26,6 +32,20 @@ CHUNKS_PER_WORKER = 8
 # worker_count tiles, never finer than this pair budget so each tile
 # amortizes its Lance read over enough cosine distance work.
 MIN_PAIRS_PER_TILE = 4_000_000
+
+__all__ = [
+    "CHUNKS_PER_WORKER",
+    "MIN_PAIRS_PER_TILE",
+    "ChunkTask",
+    "GiantInterval",
+    "IntervalSpec",
+    "TileTask",
+    "cost_based_chunking",
+    "interval_row_bounds",
+    "precursor_mz_splits",
+    "prepare_bucket_chunks",
+    "tile_threshold",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,42 +192,40 @@ def precursor_mz_splits(
 
 
 def cost_based_chunking(
-    tasks: Sequence[int], num_chunks: int
-) -> list[list[tuple[int, tuple[int, int]]]]:
+    intervals: Sequence[IntervalSpec], num_chunks: int
+) -> list[list[IntervalSpec]]:
     """
     Distribute interval tasks across chunks by quadratic cost.
 
     Uses greedy longest-processing-time-first (LPT) scheduling with a
-    min-heap where each interval's estimated cost is ``length ** 2``.
+    min-heap where each interval's estimated cost is ``n_spectra ** 2``.
 
     Parameters
     ----------
-    tasks : Sequence[int]
-        Sorted split-point indices defining contiguous intervals.
+    intervals : Sequence[IntervalSpec]
+        Intervals to distribute across worker chunks.
     num_chunks : int
         Maximum number of chunks to produce.
 
     Returns
     -------
-    list[list[tuple[int, tuple[int, int]]]]
-        Non-empty chunks of ``(task_index, (start, stop))`` entries.
+    list[list[IntervalSpec]]
+        Non-empty chunks of ``IntervalSpec`` objects.
     """
-    indexed = [
-        ((tasks[i + 1] - tasks[i]) ** 2, i, (tasks[i], tasks[i + 1]))
-        for i in range(len(tasks) - 1)
-    ]
-    indexed.sort(key=lambda item: item[0], reverse=True)
+    if num_chunks < 1:
+        raise ValueError(f"num_chunks must be positive, got {num_chunks}")
+    if not intervals:
+        return []
 
-    chunks: list[list[tuple[int, tuple[int, int]]]] = [
-        [] for _ in range(num_chunks)
-    ]
+    ordered = sorted(intervals, key=lambda spec: spec.cost, reverse=True)
+    chunks: list[list[IntervalSpec]] = [[] for _ in range(num_chunks)]
     heap: list[tuple[int, int]] = [(0, idx) for idx in range(num_chunks)]
     heapq.heapify(heap)
 
-    for cost, index, interval in indexed:
+    for spec in ordered:
         current_cost, chunk_idx = heapq.heappop(heap)
-        chunks[chunk_idx].append((index, interval))
-        heapq.heappush(heap, (current_cost + cost, chunk_idx))
+        chunks[chunk_idx].append(spec)
+        heapq.heappush(heap, (current_cost + spec.cost, chunk_idx))
 
     return [chunk for chunk in chunks if chunk]
 
@@ -247,14 +265,15 @@ def interval_row_bounds(n: int, n_tiles: int) -> list[tuple[int, int]]:
 def prepare_bucket_chunks(
     dataset: lance.LanceDataset,
     bucket_label: str,
-    precursor_tol_mass: float,
-    precursor_tol_mode: str,
-    batch_size: int,
+    clustering: ClusteringConfig,
     num_chunks: int,
     threshold: int,
 ) -> tuple[int, nb.typed.List, list[list[IntervalSpec]], list[IntervalSpec]]:
     """
     Load one bucket's metadata and partition it into m/z-split tasks.
+
+    Separates giant intervals before running LPT chunking so giant
+    costs never skew the load balance of normal-interval chunks.
 
     Parameters
     ----------
@@ -262,12 +281,9 @@ def prepare_bucket_chunks(
         Staged per-charge Lance dataset.
     bucket_label : str
         Human-readable charge label for logging.
-    precursor_tol_mass : float
-        Maximum precursor m/z gap before starting a new split.
-    precursor_tol_mode : {"Da", "ppm"}
-        Unit of ``precursor_tol_mass``.
-    batch_size : int
-        Maximum spectra per interval.
+    clustering : ClusteringConfig
+        Validated clustering configuration controlling precursor m/z
+        splitting and maximum interval size.
     num_chunks : int
         Target number of cost-balanced chunks for normal intervals.
     threshold : int
@@ -279,35 +295,29 @@ def prepare_bucket_chunks(
     tuple
         ``(n_spectra, splits, normal_chunks, giant_specs)``.
     """
-    data = (
-        dataset.to_table(columns=list(CANONICAL_SORT_COLUMNS))
-        .to_pandas()
-        .reset_index()
-        .sort_values(list(CANONICAL_SORT_COLUMNS))
+    data = read_canonical_metadata(
+        dataset, CANONICAL_SORT_COLUMNS, with_row_index=True
     )
     n = data.shape[0]
     logger.info("Cluster %d spectra with charge %s", n, bucket_label)
     idx = data["index"].to_numpy()
     mzs = data["precursor_mz"].to_numpy()
     splits = precursor_mz_splits(
-        mzs, precursor_tol_mass, precursor_tol_mode, batch_size
+        mzs,
+        clustering.precursor_tol.mass,
+        clustering.precursor_tol.mode,
+        clustering.batch_size,
     )
-    chunks = cost_based_chunking(splits, num_chunks)
 
-    normal_chunks: list[list[IntervalSpec]] = []
-    giant_specs: list[IntervalSpec] = []
-    for chunk in chunks:
-        chunk_specs: list[IntervalSpec] = []
-        for task_id, (interval_start, interval_stop) in chunk:
-            spec = IntervalSpec(
-                task_id=task_id,
-                row_ids=idx[interval_start:interval_stop].tolist(),
-                precursor_mzs=mzs[interval_start:interval_stop],
-            )
-            if spec.n_spectra >= threshold:
-                giant_specs.append(spec)
-            else:
-                chunk_specs.append(spec)
-        if chunk_specs:
-            normal_chunks.append(chunk_specs)
+    all_specs = [
+        IntervalSpec(
+            task_id=task_id,
+            row_ids=idx[splits[task_id] : splits[task_id + 1]].tolist(),
+            precursor_mzs=mzs[splits[task_id] : splits[task_id + 1]],
+        )
+        for task_id in range(len(splits) - 1)
+    ]
+    normal_specs = [spec for spec in all_specs if spec.n_spectra < threshold]
+    giant_specs = [spec for spec in all_specs if spec.n_spectra >= threshold]
+    normal_chunks = cost_based_chunking(normal_specs, num_chunks)
     return n, splits, normal_chunks, giant_specs

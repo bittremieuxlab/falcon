@@ -1,17 +1,17 @@
 """Unit tests for falcon.pipeline orchestration."""
 
 import logging
-import os
 
 import numpy as np
 import pytest
+from conftest import TOY_PEAKS_5
 
 from falcon import pipeline
 from falcon.config import (
     AverageConsensusConfig,
-    ClusteringConfig,
     MedoidConsensusConfig,
 )
+from falcon.types import ClusterResult
 
 
 class TestSetupWorkDir:
@@ -105,7 +105,7 @@ class TestRunClusteringAndPipeline:
             captured["clustering"] = clustering
             captured["consensus"] = consensus
             captured["kwargs"] = kwargs
-            return [(np.array([0], dtype=np.int32), [])]
+            return [ClusterResult(np.array([0], dtype=np.int32), [])]
 
         monkeypatch.setattr(pipeline, "generate_clusters_multi", _fake_multi)
 
@@ -125,19 +125,17 @@ class TestRunClusteringAndPipeline:
         }
 
     def test_programmatic_run_does_not_shutdown_logging(
-        self, tmp_path, mgf_writer, monkeypatch, config_factory
+        self,
+        tmp_path,
+        mgf_block,
+        mgf_writer,
+        monkeypatch,
+        config_factory,
+        track_mkdtemp,
     ):
-        format_mgf_spectrum, write_mgf = mgf_writer
-        peaks = [
-            (150.0, 100.0),
-            (250.0, 200.0),
-            (350.0, 150.0),
-            (450.0, 300.0),
-            (550.0, 250.0),
-        ]
-        mgf = write_mgf(
+        mgf = mgf_writer(
             tmp_path / "prog.mgf",
-            [format_mgf_spectrum(peaks, 500.0, charge=2, scan=1, rt=10.0)],
+            [mgf_block(TOY_PEAKS_5, 500.0, charge=2, scan=1, rt=10.0)],
         )
         shutdown_called = False
 
@@ -149,31 +147,52 @@ class TestRunClusteringAndPipeline:
         cfg = config_factory(
             input_filenames=[str(mgf)],
             output_filename=tmp_path / "prog_out",
-            clustering=ClusteringConfig(distance_threshold=0.1).model_dump(),
         )
         assert pipeline.run(cfg) == 0
         assert shutdown_called is False
         assert (tmp_path / "prog_out.csv").is_file()
+        assert len(track_mkdtemp) == 1
+        assert not track_mkdtemp[0].exists()
+
+    def test_run_returns_1_when_output_exists_without_overwrite(
+        self, tmp_path, config_factory, track_mkdtemp
+    ):
+        existing_csv = tmp_path / "existing.csv"
+        existing_csv.write_text("keep", encoding="utf-8")
+        cfg = config_factory(output_filename=tmp_path / "existing")
+
+        assert pipeline.run(cfg) == 1
+        assert existing_csv.read_text(encoding="utf-8") == "keep"
+        assert len(track_mkdtemp) == 1
+        assert not track_mkdtemp[0].exists()
+
+    def test_run_preserves_explicit_work_dir(
+        self, tmp_path, mgf_block, mgf_writer, config_factory
+    ):
+        mgf = mgf_writer(
+            tmp_path / "explicit.mgf",
+            [mgf_block(TOY_PEAKS_5, 500.0, charge=2, scan=1, rt=10.0)],
+        )
+        explicit_wd = tmp_path / "work"
+        cfg = config_factory(
+            input_filenames=[str(mgf)],
+            output_filename=tmp_path / "explicit_out",
+            io={"work_dir": str(explicit_wd)},
+        )
+        assert pipeline.run(cfg) == 0
+        assert explicit_wd.is_dir()
+        assert (tmp_path / "explicit_out.csv").is_file()
 
     def test_run_cleans_up_temp_work_dir_if_logging_raises(
-        self, tmp_path, monkeypatch, config_factory
+        self, tmp_path, monkeypatch, config_factory, track_mkdtemp
     ):
-        created: list[str] = []
-        orig_mkdtemp = pipeline.tempfile.mkdtemp
-
-        def _track(*args, **kwargs):
-            d = orig_mkdtemp(*args, **kwargs)
-            created.append(d)
-            return d
-
         def _boom(*_args, **_kwargs):
             raise RuntimeError("log handler boom")
 
-        monkeypatch.setattr(pipeline.tempfile, "mkdtemp", _track)
         monkeypatch.setattr(pipeline, "_log_config", _boom)
 
         cfg = config_factory(output_filename=tmp_path / "out")
         with pytest.raises(RuntimeError, match="log handler boom"):
             pipeline.run(cfg)
-        assert len(created) == 1
-        assert not os.path.exists(created[0])
+        assert len(track_mkdtemp) == 1
+        assert not track_mkdtemp[0].exists()

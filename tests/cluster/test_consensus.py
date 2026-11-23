@@ -1,6 +1,7 @@
 """Unit tests for falcon.cluster.consensus."""
 
 import math
+from typing import Any
 
 import numpy as np
 import pytest
@@ -58,8 +59,8 @@ class TestClusterMedoids:
         rts = np.array([30.0, 10.0, 20.0], dtype=np.float32)
         order_map = np.array([2, 0, 1], dtype=np.int64)
 
-        reps = consensus.get_representative_spectra(
-            specs, labels, rts, order_map, MedoidConsensusConfig(), pdist=pdist
+        reps = consensus.get_cluster_medoids(
+            specs, labels, rts, order_map, pdist
         )
         assert len(reps) == 1
         assert reps[0].precursor_mz == pytest.approx(502.0)
@@ -68,7 +69,9 @@ class TestClusterMedoids:
         assert reps[0].retention_time == pytest.approx(30.0)
         assert reps[0].cluster_id == 0
 
-    def test_singleton_and_pair_select_first_member(self, spec_factory):
+    def test_singleton_pair_and_empty_select_expected_medoids(
+        self, spec_factory
+    ):
         specs = [
             spec_factory([100.0], [1.0], precursor_mz=400.0),
             spec_factory([200.0], [1.0], precursor_mz=500.0),
@@ -79,12 +82,21 @@ class TestClusterMedoids:
         rts = np.array([1.0, 2.0, 3.0], dtype=np.float32)
         order_map = np.array([0, 1, 2], dtype=np.int64)
 
-        reps = consensus.get_representative_spectra(
-            specs, labels, rts, order_map, MedoidConsensusConfig(), pdist=pdist
+        reps = consensus.get_cluster_medoids(
+            specs, labels, rts, order_map, pdist
         )
         assert [r.cluster_id for r in reps] == [0, 1]
         assert [float(r.precursor_mz) for r in reps] == [400.0, 500.0]
         assert [float(r.retention_time) for r in reps] == [1.0, 2.0]
+
+        empty = consensus.get_cluster_medoids(
+            [],
+            np.empty(0, dtype=np.int32),
+            np.empty(0, dtype=np.float32),
+            np.empty(0, dtype=np.int64),
+            np.empty(0, dtype=np.float32),
+        )
+        assert empty == []
 
 
 class TestBinClusterPeaks:
@@ -114,7 +126,9 @@ class TestBinClusterPeaks:
         np.testing.assert_allclose(sorted_mz[starts[0] : stops[0]], 100.05)
         np.testing.assert_allclose(sorted_int[starts[0] : stops[0]], 0.5)
 
-    def test_out_of_range_and_empty_inputs_ignored(self, spec_factory):
+    def test_out_of_range_disjoint_and_empty_inputs_ignored(
+        self, spec_factory
+    ):
         n_bins, start_dim, _ = mz_bin_bounds(100.0, 200.0, 1.0)
         s1 = spec_factory(
             [50.0, 150.0, 250.0], [1.0, 0.5, 1.0], normalize=False
@@ -151,15 +165,33 @@ class TestBinClusterPeaks:
             )
             == 0
         )
+        d1 = spec_factory([120.0], [1.0], normalize=False)
+        d2 = spec_factory([180.0], [1.0], normalize=False)
+        assert (
+            len(
+                consensus.bin_cluster_peaks([d1, d2], start_dim, n_bins, 1.0)[
+                    2
+                ]
+            )
+            == 0
+        )
 
 
 class TestSigmaClipping:
-    def test_rejects_high_outlier_and_stops_at_zero_std_or_size_two(self):
+    def test_rejects_high_outlier_and_stops_on_convergence_zero_std_or_pair(
+        self,
+    ):
         intensities = np.array([1.0, 1.0, 1.0, 1.0, 100.0], dtype=np.float32)
         mzs = np.array([100.0, 100.1, 100.2, 100.3, 100.4], dtype=np.float32)
         kept_i, kept_m = consensus.sigma_clip(intensities, mzs, 1.5, 1.5)
         np.testing.assert_allclose(kept_i, [1.0, 1.0, 1.0, 1.0])
         np.testing.assert_allclose(kept_m, [100.0, 100.1, 100.2, 100.3])
+
+        tight_i = np.array([1.0, 1.1, 1.2], dtype=np.float32)
+        tight_m = np.array([100.0, 100.1, 100.2], dtype=np.float32)
+        out_ti, out_tm = consensus.sigma_clip(tight_i, tight_m, 2.0, 2.0)
+        np.testing.assert_array_equal(out_ti, tight_i)
+        np.testing.assert_array_equal(out_tm, tight_m)
 
         const_i = np.array([5.0, 5.0, 5.0], dtype=np.float32)
         const_m = np.array([100.0, 100.1, 100.2], dtype=np.float32)
@@ -178,23 +210,22 @@ class TestSigmaClipping:
         s2 = spec_factory([100.0, 200.0], [2.0, 5.0], normalize=False)
         s3 = spec_factory([100.0, 200.0], [10.0, 5.0], normalize=False)
         s4 = spec_factory([100.0, 200.0], [11.0, 5.0], normalize=False)
-        reps = consensus.get_representative_spectra(
+        reps = consensus.get_cluster_averages(
             [s1, s2, s3, s4],
             np.array([0, 0, 0, 0], dtype=np.int32),
             np.array([10.0, 11.0, 12.0, 13.0], dtype=np.float32),
             np.array([0, 1, 2, 3], dtype=np.int64),
-            AverageConsensusConfig(
-                outlier_cutoff_lower=0.01, outlier_cutoff_upper=0.01
-            ),
             min_mz=50.0,
             max_mz=300.0,
             fragment_tol=0.5,
+            outlier_cutoff_lower=0.01,
+            outlier_cutoff_upper=0.01,
         )
         np.testing.assert_allclose(reps[0].mz, [200.0])
         np.testing.assert_allclose(reps[0].intensity, [5.0])
 
 
-class TestRepresentativeDispatch:
+class TestClusterAveragesAndDispatch:
     def test_average_multi_cluster_and_singleton_with_nan_rt_and_none_charge(
         self, spec_factory
     ):
@@ -211,12 +242,11 @@ class TestRepresentativeDispatch:
             charge=None,
             normalize=False,
         )
-        reps = consensus.get_representative_spectra(
+        reps = consensus.get_cluster_averages(
             [s0, s1, s2],
             np.array([0, 0, 1], dtype=np.int32),
             np.array([10.0, np.nan, 42.0], dtype=np.float32),
             np.array([0, 1, 2], dtype=np.int64),
-            AverageConsensusConfig(),
             min_mz=50.0,
             max_mz=300.0,
             fragment_tol=0.5,
@@ -239,12 +269,11 @@ class TestRepresentativeDispatch:
     ):
         s1 = spec_factory([101.01, 200.0], [0.5, 0.8], normalize=False)
         s2 = spec_factory([101.02, 200.0], [0.5, 0.8], normalize=False)
-        reps = consensus.get_representative_spectra(
+        reps = consensus.get_cluster_averages(
             [s1, s2],
             np.array([0, 0], dtype=np.int32),
             np.array([10.0, 20.0], dtype=np.float32),
             np.array([0, 1], dtype=np.int64),
-            AverageConsensusConfig(),
             min_mz=101.03,
             max_mz=300.0,
             fragment_tol=0.05,
@@ -255,12 +284,11 @@ class TestRepresentativeDispatch:
     def test_average_with_no_surviving_bins_and_nan_charge(self, spec_factory):
         s1 = spec_factory([100.0], [1.0], charge=np.nan)
         s2 = spec_factory([200.0], [1.0], charge=np.nan)
-        reps = consensus.get_representative_spectra(
+        reps = consensus.get_cluster_averages(
             [s1, s2],
             np.array([0, 0], dtype=np.int32),
             np.array([10.0, 20.0], dtype=np.float32),
             np.array([0, 1], dtype=np.int64),
-            AverageConsensusConfig(),
             min_mz=50.0,
             max_mz=300.0,
             fragment_tol=0.5,
@@ -270,27 +298,76 @@ class TestRepresentativeDispatch:
         assert len(reps[0].mz) == 0
         assert len(reps[0].intensity) == 0
 
-    def test_missing_required_kwargs_or_invalid_config_raises(
-        self, mock_spectra
+    def test_average_empty_labels_returns_empty_list(self):
+        reps = consensus.get_cluster_averages(
+            [],
+            np.empty(0, dtype=np.int32),
+            np.empty(0, dtype=np.float32),
+            np.empty(0, dtype=np.int64),
+            min_mz=50.0,
+            max_mz=300.0,
+            fragment_tol=0.5,
+        )
+        assert reps == []
+
+    def test_get_representative_spectra_dispatches_and_rejects_unknown(
+        self, spec_factory
     ):
-        specs = mock_spectra(2)
+        s0 = spec_factory(
+            [100.0, 200.0], [0.4, 0.6], precursor_mz=500.0, normalize=False
+        )
+        s1 = spec_factory(
+            [100.2, 200.2], [0.6, 0.8], precursor_mz=500.4, normalize=False
+        )
+        specs = [s0, s1]
         labels = np.array([0, 0], dtype=np.int32)
         rts = np.array([10.0, 20.0], dtype=np.float32)
         order = np.array([0, 1], dtype=np.int64)
+        pdist = np.array([0.05], dtype=np.float32)
 
-        with pytest.raises(ValueError, match="pdist is required"):
-            consensus.get_representative_spectra(
-                specs, labels, rts, order, MedoidConsensusConfig()
-            )
-        with pytest.raises(ValueError, match="min_mz"):
-            consensus.get_representative_spectra(
-                specs, labels, rts, order, AverageConsensusConfig()
-            )
+        medoid_reps = consensus.get_representative_spectra(
+            specs,
+            labels,
+            rts,
+            order,
+            MedoidConsensusConfig(),
+            pdist=pdist,
+            min_mz=50.0,
+            max_mz=300.0,
+            fragment_tol=0.5,
+        )
+        assert len(medoid_reps) == 1
+        assert float(medoid_reps[0].precursor_mz) == pytest.approx(500.0)
+
+        avg_reps = consensus.get_representative_spectra(
+            specs,
+            labels,
+            rts,
+            order,
+            AverageConsensusConfig(
+                outlier_cutoff_lower=1.5, outlier_cutoff_upper=1.5
+            ),
+            pdist=pdist,
+            min_mz=50.0,
+            max_mz=300.0,
+            fragment_tol=0.5,
+        )
+        assert len(avg_reps) == 1
+        assert float(avg_reps[0].precursor_mz) == pytest.approx(
+            500.2, abs=1e-4
+        )
+        np.testing.assert_allclose(avg_reps[0].mz, [100.1, 200.1], atol=1e-4)
+
+        invalid_cfg: Any = "invalid"
         with pytest.raises(ValueError, match="Unsupported consensus"):
             consensus.get_representative_spectra(
                 specs,
                 labels,
                 rts,
                 order,
-                "invalid",  # type: ignore[arg-type]
+                invalid_cfg,
+                pdist=pdist,
+                min_mz=50.0,
+                max_mz=300.0,
+                fragment_tol=0.5,
             )

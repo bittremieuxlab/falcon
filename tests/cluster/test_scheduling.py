@@ -3,10 +3,20 @@
 import itertools
 
 import numba as nb
+import numba.typed
 import numpy as np
 import pytest
 
 from falcon.cluster import scheduling
+
+
+def _make_spec(task_id: int, n: int) -> scheduling.IntervalSpec:
+    """Create a synthetic IntervalSpec with ``n`` spectra."""
+    return scheduling.IntervalSpec(
+        task_id=task_id,
+        row_ids=list(range(n)),
+        precursor_mzs=np.full(n, 500.0 + task_id, dtype=np.float32),
+    )
 
 
 class TestTileThreshold:
@@ -113,33 +123,163 @@ class TestIntervalRowBounds:
 
 class TestCostBasedChunking:
     def test_lpt_balancing_and_task_preservation(self):
-        splits = nb.typed.List([0, 100, 300, 500, 600])
-        chunks = scheduling.cost_based_chunking(splits, 2)
+        specs = [
+            _make_spec(0, 100),
+            _make_spec(1, 200),
+            _make_spec(2, 200),
+            _make_spec(3, 100),
+        ]
+        chunks = scheduling.cost_based_chunking(specs, 2)
         assert len(chunks) == 2
-        assigned = sorted(t for chunk in chunks for t in chunk)
-        assert assigned == [
-            (0, (0, 100)),
-            (1, (100, 300)),
-            (2, (300, 500)),
-            (3, (500, 600)),
-        ]
-        costs = [
-            sum((stop - start) ** 2 for _, (start, stop) in c) for c in chunks
-        ]
+        assigned = sorted(
+            (spec.task_id, spec.n_spectra)
+            for chunk in chunks
+            for spec in chunk
+        )
+        assert assigned == [(0, 100), (1, 200), (2, 200), (3, 100)]
+        costs = [sum(spec.cost for spec in chunk) for chunk in chunks]
         assert costs == [50_000, 50_000]
 
     def test_dominant_task_isolated(self):
-        splits = nb.typed.List([0, 100, 101, 102, 103])
-        chunks = scheduling.cost_based_chunking(splits, 2)
-        assert sorted(len(c) for c in chunks) == [1, 3]
+        specs = [
+            _make_spec(0, 100),
+            _make_spec(1, 1),
+            _make_spec(2, 1),
+            _make_spec(3, 1),
+        ]
+        chunks = scheduling.cost_based_chunking(specs, 2)
+        assert sorted(len(chunk) for chunk in chunks) == [1, 3]
 
-    def test_edge_cases_empty_single_worker_and_excess_workers(self):
-        assert scheduling.cost_based_chunking(nb.typed.List([0]), 4) == []
-        assert (
-            len(scheduling.cost_based_chunking(nb.typed.List([0, 10, 20]), 1))
-            == 1
+    def test_edge_cases_empty_single_excess_and_invalid_num_chunks(self):
+        assert scheduling.cost_based_chunking([], 4) == []
+        two_specs = [_make_spec(0, 10), _make_spec(1, 10)]
+        assert len(scheduling.cost_based_chunking(two_specs, 1)) == 1
+        assert len(scheduling.cost_based_chunking(two_specs, 5)) == 2
+
+        for invalid in (0, -2):
+            with pytest.raises(
+                ValueError, match="num_chunks must be positive"
+            ):
+                scheduling.cost_based_chunking(two_specs, invalid)
+
+
+class TestPrepareBucketChunks:
+    def test_canonical_order_and_exact_giant_threshold_separation(
+        self, lance_dataset, spectrum_row, da_clustering_factory
+    ):
+        peaks = [100.0, 200.0, 300.0]
+        inten = [1.0, 0.8, 0.6]
+        # Insert out of canonical order so row_ids must remap cleanly.
+        rows = [
+            spectrum_row("s:g2", 700.02, peaks, inten, 2, 12.0),
+            spectrum_row("s:n1", 500.00, peaks, inten, 2, 10.0),
+            spectrum_row("s:g0", 700.00, peaks, inten, 2, 10.0),
+            spectrum_row("s:n2", 500.01, peaks, inten, 2, 11.0),
+            spectrum_row("s:g1", 700.01, peaks, inten, 2, 11.0),
+        ]
+        ds = lance_dataset(rows)
+        n, splits, normal_chunks, giant_specs = (
+            scheduling.prepare_bucket_chunks(
+                ds,
+                "2",
+                da_clustering_factory(batch_size=10),
+                num_chunks=4,
+                threshold=3,
+            )
         )
-        assert (
-            len(scheduling.cost_based_chunking(nb.typed.List([0, 10, 20]), 5))
-            == 2
+        assert n == 5
+        assert list(splits) == [0, 2, 5]
+        assert len(normal_chunks) == 1
+        assert len(normal_chunks[0]) == 1
+        assert normal_chunks[0][0].n_spectra == 2
+        assert len(giant_specs) == 1
+        assert giant_specs[0].n_spectra == 3
+
+        # Taking by row_ids must yield rows in canonical order.
+        giant_ids = (
+            ds.take(indices=giant_specs[0].row_ids, columns=["identifier"])
+            .to_pandas()["identifier"]
+            .tolist()
         )
+        assert giant_ids == ["s:g0", "s:g1", "s:g2"]
+
+    def test_giant_interval_does_not_skew_normal_chunk_lpt_balance(
+        self, lance_dataset, spectrum_row, da_clustering_factory
+    ):
+        peaks = [100.0, 200.0, 300.0]
+        inten = [1.0, 0.8, 0.6]
+        rows = []
+        # 1 giant interval (10 spectra, cost 100) at m/z ~100 Da.
+        for i in range(10):
+            rows.append(
+                spectrum_row(
+                    f"g:{i}", 100.0 + 0.01 * i, peaks, inten, 2, float(i)
+                )
+            )
+        # 4 normal intervals (4 spectra each, cost 16 each; sum 64 < 100).
+        for group_idx, base_mz in enumerate((200.0, 300.0, 400.0, 500.0)):
+            for i in range(4):
+                rows.append(
+                    spectrum_row(
+                        f"n:{group_idx}:{i}",
+                        base_mz + 0.01 * i,
+                        peaks,
+                        inten,
+                        2,
+                        float(i),
+                    )
+                )
+        ds = lance_dataset(rows)
+
+        n, splits, normal_chunks, giant_specs = (
+            scheduling.prepare_bucket_chunks(
+                ds,
+                "2",
+                da_clustering_factory(batch_size=20),
+                num_chunks=2,
+                threshold=8,
+            )
+        )
+        assert n == 26
+        assert list(splits) == [0, 10, 14, 18, 22, 26]
+        assert len(giant_specs) == 1
+        assert giant_specs[0].n_spectra == 10
+        assert len(normal_chunks) == 2
+        assert [len(chunk) for chunk in normal_chunks] == [2, 2]
+        assert [sum(s.cost for s in chunk) for chunk in normal_chunks] == [
+            32,
+            32,
+        ]
+
+    def test_empty_and_all_giant_buckets(
+        self, lance_dataset, spectrum_row, da_clustering_factory
+    ):
+        clust = da_clustering_factory(batch_size=10)
+        ds_empty = lance_dataset([], name="empty.lance")
+        n_empty, splits_empty, chunks_empty, giants_empty = (
+            scheduling.prepare_bucket_chunks(
+                ds_empty, "2", clust, num_chunks=2, threshold=4
+            )
+        )
+        assert n_empty == 0
+        assert list(splits_empty) == [0]
+        assert chunks_empty == []
+        assert giants_empty == []
+
+        peaks = [100.0, 200.0, 300.0]
+        inten = [1.0, 0.8, 0.6]
+        ds_giant = lance_dataset(
+            [
+                spectrum_row(f"g:{i}", 500.0 + 0.01 * i, peaks, inten, 2, i)
+                for i in range(4)
+            ],
+            name="giant.lance",
+        )
+        n_g, splits_g, chunks_g, giants_g = scheduling.prepare_bucket_chunks(
+            ds_giant, "2", clust, num_chunks=2, threshold=4
+        )
+        assert n_g == 4
+        assert list(splits_g) == [0, 4]
+        assert chunks_g == []
+        assert len(giants_g) == 1
+        assert giants_g[0].n_spectra == 4

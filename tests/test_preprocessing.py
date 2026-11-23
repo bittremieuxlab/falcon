@@ -1,10 +1,10 @@
-"""Unit tests for falcon.cluster.spectrum."""
+"""Unit tests for falcon.preprocessing."""
 
 import numpy as np
 import pytest
 import spectrum_utils.spectrum as sus
 
-from falcon.cluster import spectrum
+from falcon import preprocessing
 
 
 def _make_msms(
@@ -28,22 +28,22 @@ def _make_msms(
 class TestCheckSpectrumValid:
     def test_valid_and_exact_boundaries(self):
         mz = np.array([100.0, 150.0, 200.0, 250.0, 350.0], dtype=np.float32)
-        assert spectrum._check_spectrum_valid(
+        assert preprocessing._check_spectrum_valid(
             mz, min_peaks=5, min_mz_range=250.0
         )
-        assert not spectrum._check_spectrum_valid(
+        assert not preprocessing._check_spectrum_valid(
             mz, min_peaks=6, min_mz_range=250.0
         )
-        assert not spectrum._check_spectrum_valid(
+        assert not preprocessing._check_spectrum_valid(
             mz, min_peaks=5, min_mz_range=250.1
         )
 
     def test_single_peak_with_zero_range_allowed(self):
         mz = np.array([300.0], dtype=np.float32)
-        assert spectrum._check_spectrum_valid(
+        assert preprocessing._check_spectrum_valid(
             mz, min_peaks=1, min_mz_range=0.0
         )
-        assert not spectrum._check_spectrum_valid(
+        assert not preprocessing._check_spectrum_valid(
             mz, min_peaks=1, min_mz_range=0.1
         )
 
@@ -53,7 +53,7 @@ class TestCheckSpectrumValid:
     )
     def test_empty_spectrum_always_invalid(self, min_peaks, min_mz_range):
         empty = np.array([], dtype=np.float32)
-        assert not spectrum._check_spectrum_valid(
+        assert not preprocessing._check_spectrum_valid(
             empty, min_peaks=min_peaks, min_mz_range=min_mz_range
         )
 
@@ -61,13 +61,15 @@ class TestCheckSpectrumValid:
 class TestNormIntensity:
     def test_exact_unit_norm_and_dtype(self):
         intensity = np.array([3.0, 4.0], dtype=np.float32)
-        normed = spectrum._norm_intensity(intensity)
+        normed = preprocessing._norm_intensity(intensity)
         assert normed.dtype == np.float32
         np.testing.assert_allclose(normed, [0.6, 0.8], rtol=1e-6)
         assert np.linalg.norm(normed) == pytest.approx(1.0, abs=1e-6)
 
     def test_single_peak_normalizes_to_one(self):
-        normed = spectrum._norm_intensity(np.array([42.0], dtype=np.float32))
+        normed = preprocessing._norm_intensity(
+            np.array([42.0], dtype=np.float32)
+        )
         np.testing.assert_allclose(normed, [1.0], rtol=1e-6)
 
 
@@ -80,12 +82,12 @@ class TestProcessSpectrum:
         raw_intensities = spec.intensity.copy()
         expected = raw_intensities / np.linalg.norm(raw_intensities)
 
-        result = spectrum.process_spectrum(
+        result = preprocessing.process_spectrum(
             spec,
             min_peaks=5,
             min_mz_range=250.0,
-            mz_min=100.0,
-            mz_max=1500.0,
+            min_mz=100.0,
+            max_mz=1500.0,
         )
         assert result is not None
         assert result["identifier"] == "test:scan:1"
@@ -104,22 +106,22 @@ class TestProcessSpectrum:
             intensity=[100.0, 200.0, 50.0, 300.0, 150.0],
         )
         assert (
-            spectrum.process_spectrum(
+            preprocessing.process_spectrum(
                 few,
                 min_peaks=5,
                 min_mz_range=10.0,
-                mz_min=100.0,
-                mz_max=1500.0,
+                min_mz=100.0,
+                max_mz=1500.0,
             )
             is None
         )
         assert (
-            spectrum.process_spectrum(
+            preprocessing.process_spectrum(
                 narrow,
                 min_peaks=3,
                 min_mz_range=250.0,
-                mz_min=100.0,
-                mz_max=1500.0,
+                min_mz=100.0,
+                max_mz=1500.0,
             )
             is None
         )
@@ -129,12 +131,12 @@ class TestProcessSpectrum:
             mz=[50.0, 100.0, 200.0, 300.0, 400.0, 500.0, 600.0],
             intensity=[10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0],
         )
-        result = spectrum.process_spectrum(
+        result = preprocessing.process_spectrum(
             spec,
             min_peaks=5,
             min_mz_range=300.0,
-            mz_min=100.0,
-            mz_max=500.0,
+            min_mz=100.0,
+            max_mz=500.0,
         )
         assert result is not None
         np.testing.assert_allclose(
@@ -148,13 +150,13 @@ class TestProcessSpectrum:
             precursor_mz=500.0,
             precursor_charge=2,
         )
-        result = spectrum.process_spectrum(
+        result = preprocessing.process_spectrum(
             spec,
             min_peaks=4,
             min_mz_range=250.0,
-            mz_min=100.0,
-            mz_max=1500.0,
-            remove_precursor_tolerance=1.5,
+            min_mz=100.0,
+            max_mz=1500.0,
+            remove_precursor_tol=1.5,
         )
         assert result is not None
         np.testing.assert_allclose(
@@ -169,11 +171,11 @@ class TestProcessSpectrum:
             precursor_charge=1,
         )
         assert (
-            spectrum.process_spectrum(
+            preprocessing.process_spectrum(
                 spec,
                 min_peaks=4,
                 min_mz_range=250.0,
-                remove_precursor_tolerance=1.5,
+                remove_precursor_tol=1.5,
             )
             is None
         )
@@ -185,11 +187,11 @@ class TestProcessSpectrum:
             precursor_mz=500.0,
             precursor_charge=None,
         )
-        result = spectrum.process_spectrum(
+        result = preprocessing.process_spectrum(
             spec,
             min_peaks=5,
             min_mz_range=250.0,
-            remove_precursor_tolerance=1.5,
+            remove_precursor_tol=1.5,
         )
         assert result is not None
         assert result["precursor_charge"] is None
@@ -202,11 +204,11 @@ class TestProcessSpectrum:
             precursor_charge=None,
         )
         assert (
-            spectrum.process_spectrum(
+            preprocessing.process_spectrum(
                 spec_reject,
                 min_peaks=4,
                 min_mz_range=250.0,
-                remove_precursor_tolerance=1.5,
+                remove_precursor_tol=1.5,
             )
             is None
         )
@@ -217,7 +219,7 @@ class TestProcessSpectrum:
             mz=[110.0, 200.0, 300.0, 400.0, 450.0, 480.0],
             intensity=[1000.0, 5.0, 800.0, 900.0, 700.0, 600.0],
         )
-        result = spectrum.process_spectrum(
+        result = preprocessing.process_spectrum(
             spec,
             min_peaks=3,
             min_mz_range=50.0,
@@ -227,13 +229,13 @@ class TestProcessSpectrum:
         assert result is not None
         np.testing.assert_allclose(result["mz"], [110.0, 300.0, 400.0, 450.0])
 
-    def test_intensity_filter_rejection_and_all_zero_intensities(self):
+    def test_intensity_filter_rejection_and_all_zero_with_min_intensity(self):
         spec = _make_msms(
             mz=[100.0, 200.0, 300.0, 400.0, 500.0],
             intensity=[1000.0, 1.0, 1.0, 1.0, 900.0],
         )
         assert (
-            spectrum.process_spectrum(
+            preprocessing.process_spectrum(
                 spec,
                 min_peaks=4,
                 min_mz_range=100.0,
@@ -247,11 +249,38 @@ class TestProcessSpectrum:
             intensity=[0.0, 0.0, 0.0, 0.0, 0.0],
         )
         assert (
-            spectrum.process_spectrum(
+            preprocessing.process_spectrum(
                 all_zero,
                 min_peaks=5,
                 min_mz_range=100.0,
                 min_intensity=0.01,
+            )
+            is None
+        )
+
+    @pytest.mark.parametrize(
+        "bad_intensities",
+        [
+            [0.0, 0.0, 0.0, 0.0, 0.0],
+            [-1.0, -2.0, -3.0, -4.0, -5.0],
+            [10.0, np.nan, 20.0, 30.0, 40.0],
+            [10.0, np.inf, 20.0, 30.0, 40.0],
+            [10.0, -np.inf, 20.0, 30.0, 40.0],
+        ],
+    )
+    def test_non_finite_and_non_positive_intensities_return_none(
+        self, bad_intensities
+    ):
+        spec = _make_msms(
+            mz=[100.0, 200.0, 300.0, 400.0, 500.0],
+            intensity=bad_intensities,
+        )
+        assert (
+            preprocessing.process_spectrum(
+                spec,
+                min_peaks=5,
+                min_mz_range=100.0,
+                scaling="off",
             )
             is None
         )
@@ -261,7 +290,7 @@ class TestProcessSpectrum:
             mz=[100.0, 200.0, 300.0, 400.0, 500.0],
             intensity=[10.0, 50.0, 20.0, 40.0, 30.0],
         )
-        result = spectrum.process_spectrum(
+        result = preprocessing.process_spectrum(
             spec,
             min_peaks=3,
             min_mz_range=100.0,
@@ -274,6 +303,16 @@ class TestProcessSpectrum:
     @pytest.mark.parametrize(
         ("scaling", "max_peaks_used", "raw_expected"),
         [
+            (
+                "off",
+                None,
+                np.array([1.0, 4.0, 9.0, 16.0, 25.0], np.float32),
+            ),
+            (
+                None,
+                None,
+                np.array([1.0, 4.0, 9.0, 16.0, 25.0], np.float32),
+            ),
             (
                 "root",
                 None,
@@ -305,7 +344,7 @@ class TestProcessSpectrum:
             mz=[100.0, 200.0, 300.0, 400.0, 500.0],
             intensity=[1.0, 4.0, 9.0, 16.0, 25.0],
         )
-        result = spectrum.process_spectrum(
+        result = preprocessing.process_spectrum(
             spec,
             min_peaks=5,
             min_mz_range=250.0,
@@ -318,17 +357,70 @@ class TestProcessSpectrum:
 
 
 class TestBuildProcessSpectrum:
-    def test_maps_scaling_off_to_none_and_applies_bin_bounds(
+    def test_aligns_mz_bounds_outward_to_fragment_tol_grid(
         self, config_factory
     ):
-        cfg_off = config_factory(
-            preprocessing={"scaling": "off", "min_mz": 101.03}
+        # min_mz=101.03, max_mz=1500.0, fragment_tol=0.05 -> aligned to
+        # [101.0, 1500.05].
+        cfg = config_factory(
+            preprocessing={
+                "min_mz": 101.03,
+                "max_mz": 1500.0,
+                "min_peaks": 3,
+                "min_mz_range": 100.0,
+                "min_intensity": 0.0,
+                "scaling": "off",
+            },
+            clustering={"fragment_tol": 0.05},
         )
-        proc = spectrum.build_process_spectrum(cfg_off)
-        assert proc.keywords["scaling"] is None
-        assert proc.keywords["mz_min"] <= 101.03
-        assert proc.keywords["mz_max"] > 1500.0
+        proc = preprocessing.build_process_spectrum(cfg)
 
-        cfg_root = config_factory(preprocessing={"scaling": "root"})
-        proc_root = spectrum.build_process_spectrum(cfg_root)
-        assert proc_root.keywords["scaling"] == "root"
+        spec = _make_msms(
+            mz=[100.99, 101.01, 300.0, 700.0, 1500.04, 1500.10],
+            intensity=[10.0, 20.0, 30.0, 40.0, 50.0, 60.0],
+            precursor_mz=600.0,
+        )
+        result = proc(spec)
+        assert result is not None
+        np.testing.assert_allclose(
+            result["mz"], [101.01, 300.0, 700.0, 1500.04]
+        )
+
+    def test_applies_configured_scaling_and_filters(self, config_factory):
+        raw_mz = [150.0, 250.0, 350.0, 450.0, 550.0]
+        raw_int = np.array([1.0, 4.0, 9.0, 16.0, 25.0], dtype=np.float32)
+
+        cfg_off = config_factory(
+            preprocessing={
+                "scaling": "off",
+                "min_intensity": 0.0,
+                "remove_precursor_tol": None,
+            }
+        )
+        cfg_root = config_factory(
+            preprocessing={
+                "scaling": "root",
+                "min_intensity": 0.0,
+                "remove_precursor_tol": None,
+            }
+        )
+
+        res_off = preprocessing.build_process_spectrum(cfg_off)(
+            _make_msms(mz=raw_mz, intensity=raw_int)
+        )
+        res_root = preprocessing.build_process_spectrum(cfg_root)(
+            _make_msms(mz=raw_mz, intensity=raw_int)
+        )
+        assert res_off is not None
+        assert res_root is not None
+        np.testing.assert_allclose(
+            res_off["intensity"],
+            raw_int / np.linalg.norm(raw_int),
+            rtol=1e-5,
+        )
+        sqrt_int = np.sqrt(raw_int)
+        np.testing.assert_allclose(
+            res_root["intensity"],
+            sqrt_int / np.linalg.norm(sqrt_int),
+            rtol=1e-5,
+        )

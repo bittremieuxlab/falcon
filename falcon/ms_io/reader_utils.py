@@ -1,8 +1,8 @@
 """Shared helpers for the per-format MS/MS peak-file readers.
 
-These helpers live in a leaf module that imports none of the format
-readers so readers can share identifier, construction, and logging logic
-without circular imports.
+These helpers live in a leaf module that imports only stdlib at module
+load time so readers can share source normalization, identifier,
+construction, and logging logic without circular or eager heavy imports.
 """
 
 from __future__ import annotations
@@ -10,15 +10,47 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
-from typing import IO, Any, cast
+from typing import IO, TYPE_CHECKING, Any, cast
 
-import numpy as np
-import spectrum_utils.spectrum as sus
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterator
 
-logger = logging.getLogger("falcon")
+    import numpy as np
+    import spectrum_utils.spectrum as sus
+
+logger = logging.getLogger(__name__)
 
 # Per-spectrum parsing exceptions recovered by skipping the entry.
 PARSE_EXCEPTIONS = (ValueError, KeyError, TypeError, IndexError)
+
+__all__ = [
+    "PARSE_EXCEPTIONS",
+    "base_filename",
+    "build_msms_spectrum",
+    "iter_xml_spectra",
+    "log_skipped_spectrum",
+    "normalize_source",
+]
+
+
+def normalize_source(
+    source: IO[Any] | str | os.PathLike[str],
+) -> IO[Any] | str:
+    """
+    Convert ``os.PathLike`` inputs to ``str`` for Pyteomics readers.
+
+    Parameters
+    ----------
+    source : IO[Any] | str | os.PathLike[str]
+        Peak file path or open file object.
+
+    Returns
+    -------
+    IO[Any] | str
+        String path if ``source`` is ``os.PathLike``, otherwise
+        ``source`` unchanged.
+    """
+    return os.fspath(source) if isinstance(source, os.PathLike) else source
 
 
 def base_filename(
@@ -91,10 +123,12 @@ def build_msms_spectrum(
     MsmsSpectrum
         Constructed ``spectrum_utils`` spectrum object.
     """
+    import spectrum_utils.spectrum as sus
+
     return sus.MsmsSpectrum(
         identifier,
         precursor_mz,
-        cast(int, precursor_charge),
+        cast("int", precursor_charge),
         mz,
         intensity,
         None,
@@ -124,3 +158,63 @@ def log_skipped_spectrum(
     logger.debug(
         "Skipping unparsable spectrum %s in %s: %s", identifier, source, exc
     )
+
+
+def iter_xml_spectra(
+    source: IO[Any] | str | os.PathLike[str],
+    reader_cls: type[Any],
+    ms_level_key: str,
+    extract_scan_nr: Callable[[dict[str, Any]], str | None],
+    parse_spectrum: Callable[[dict[str, Any], str], sus.MsmsSpectrum],
+    log: logging.Logger,
+) -> Iterator[sus.MsmsSpectrum]:
+    """
+    Iterate MS/MS spectra (MS level > 1) from a Pyteomics XML reader.
+
+    Shared driver for mzML and mzXML readers. Normalizes ``source``,
+    filters out MS1 spectra, builds ``<stem>:scan:<number>`` identifiers
+    without mutating the Pyteomics spectrum dictionaries, logs and skips
+    unparsable spectra, and warns on XML parse errors.
+
+    Parameters
+    ----------
+    source : IO[Any] | str | os.PathLike[str]
+        Path or open file object for the XML peak source.
+    reader_cls : type[Any]
+        Pyteomics XML reader class (e.g. ``MzML`` or ``MzXML``).
+    ms_level_key : str
+        Dictionary key holding the MS level (``"ms level"`` for mzML,
+        ``"msLevel"`` for mzXML).
+    extract_scan_nr : Callable[[dict[str, Any]], str | None]
+        Callback extracting the scan number string from a spectrum dict,
+        or returning ``None`` to skip the spectrum.
+    parse_spectrum : Callable[[dict[str, Any], str], sus.MsmsSpectrum]
+        Callback converting ``(spectrum_dict, identifier)`` into an
+        ``MsmsSpectrum``.
+    log : logging.Logger
+        Caller logger used to warn on whole-file XML read failures.
+
+    Yields
+    ------
+    MsmsSpectrum
+        Parsed MS/MS spectra from ``source``.
+    """
+    from lxml.etree import LxmlError
+
+    xml_source = normalize_source(source)
+    with reader_cls(xml_source) as f_in:
+        filename = base_filename(source, f_in)
+        try:
+            for spectrum_dict in f_in:
+                try:
+                    if int(spectrum_dict.get(ms_level_key, -1)) <= 1:
+                        continue
+                    scan_nr = extract_scan_nr(spectrum_dict)
+                    if scan_nr is None:
+                        continue
+                    identifier = f"{filename}:scan:{scan_nr}"
+                    yield parse_spectrum(spectrum_dict, identifier)
+                except PARSE_EXCEPTIONS as exc:
+                    log_skipped_spectrum(source, spectrum_dict.get("id"), exc)
+        except LxmlError as exc:
+            log.warning("Failed to read file %s: %s", source, exc)

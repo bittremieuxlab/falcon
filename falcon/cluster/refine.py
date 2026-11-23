@@ -6,6 +6,38 @@ import numba as nb
 import numpy as np
 import scipy.cluster.hierarchy as sch
 
+__all__ = ["cut_linkage", "linkage_1d", "postprocess_cluster"]
+
+
+def cut_linkage(linkage_matrix: np.ndarray, threshold: float) -> np.ndarray:
+    """
+    Cut a hierarchical linkage tree into 0-based int32 cluster labels.
+
+    Parameters
+    ----------
+    linkage_matrix : np.ndarray
+        SciPy-compatible ``(n - 1, 4)`` hierarchical linkage matrix.
+    threshold : float
+        Maximum distance threshold for flat cluster formation.
+
+    Returns
+    -------
+    np.ndarray
+        Zero-based int32 flat cluster assignment array of length ``n``.
+    """
+    return (sch.fcluster(linkage_matrix, threshold, "distance") - 1).astype(
+        np.int32
+    )
+
+
+def _assign_singletons(cluster_labels: np.ndarray, start_label: int) -> int:
+    """Fill ``cluster_labels`` with contiguous singleton IDs."""
+    n_points = cluster_labels.shape[0]
+    cluster_labels[:] = np.arange(
+        start_label, start_label + n_points, dtype=np.int32
+    )
+    return n_points
+
 
 @nb.njit(cache=True, fastmath=True)
 def linkage_1d(values: np.ndarray, tol_mode: str | None = None) -> np.ndarray:
@@ -103,17 +135,11 @@ def postprocess_cluster(
     """
     n_points = cluster_labels.shape[0]
     if n_points < min_samples:
-        cluster_labels[:] = np.arange(
-            start_label, start_label + n_points, dtype=np.int32
-        )
-        return n_points
+        return _assign_singletons(cluster_labels, start_label)
 
-    # Split on full precursor m/z span via 1D complete linkage
-    # (shift SciPy 1-based flat cluster IDs to 0-based).
+    # Split on full precursor m/z span via 1D complete linkage.
     mz_linkage = linkage_1d(cluster_mzs, precursor_tol_mode)
-    assignments = (
-        sch.fcluster(mz_linkage, precursor_tol_mass, "distance") - 1
-    ).astype(np.int32)
+    assignments = cut_linkage(mz_linkage, precursor_tol_mass)
 
     # Optionally intersect with an RT partition. Known-RT spectra
     # undergo 1D RT linkage; NaN-RT spectra receive a dedicated RT code
@@ -121,17 +147,19 @@ def postprocess_cluster(
     if rt_tol is not None:
         nan_mask = np.isnan(cluster_rts)
         if not nan_mask.all():
-            valid_rts = cluster_rts[~nan_mask]
+            valid_mask = ~nan_mask
+            valid_rts = cluster_rts[valid_mask]
             rt_labels = np.zeros(n_points, dtype=np.int32)
             if len(valid_rts) >= 2:
-                rt_labels[~nan_mask] = (
-                    sch.fcluster(linkage_1d(valid_rts), rt_tol, "distance") - 1
-                ).astype(np.int32)
-            n_rt = int(rt_labels[~nan_mask].max()) + 1
+                valid_rt_labels = cut_linkage(linkage_1d(valid_rts), rt_tol)
+                rt_labels[valid_mask] = valid_rt_labels
+                n_rt = int(valid_rt_labels.max()) + 1
+            else:
+                n_rt = 1
             rt_labels[nan_mask] = n_rt
             # Injective mixed-radix encoding of (m/z, RT) pairs.
             assignments = np.unique(
-                assignments * (n_rt + 1) + rt_labels,
+                assignments.astype(np.int64) * (n_rt + 1) + rt_labels,
                 return_inverse=True,
             )[1].astype(np.int32)
 
@@ -142,10 +170,7 @@ def postprocess_cluster(
         return 1
 
     if n_groups == n_points:
-        cluster_labels[:] = np.arange(
-            start_label, start_label + n_points, dtype=np.int32
-        )
-        return n_points
+        return _assign_singletons(cluster_labels, start_label)
 
     remap = np.full(n_groups, -1, dtype=np.int32)
     n_clusters = 0

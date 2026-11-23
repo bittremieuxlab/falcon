@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 import logging
-import os
-from collections.abc import Iterator
-from typing import IO, Any
+from typing import IO, TYPE_CHECKING, Any
 
 import pyteomics.mzml
-import spectrum_utils.spectrum as sus
-from lxml.etree import LxmlError
 
 from . import reader_utils
 
-logger = logging.getLogger("falcon")
+if TYPE_CHECKING:
+    import os
+    from collections.abc import Iterator
+
+    import spectrum_utils.spectrum as sus
+
+logger = logging.getLogger(__name__)
+
+__all__ = ["get_spectra"]
 
 
 def get_spectra(
@@ -33,38 +37,33 @@ def get_spectra(
         Parsed MS/MS spectra with ``<stem>:scan:<number>`` identifiers;
         spectra lacking ``scan=`` or failing to parse are skipped.
     """
-    mzml_source: IO[Any] | str = (
-        os.fspath(source) if isinstance(source, os.PathLike) else source
+
+    def _extract_scan_nr(spectrum_dict: dict[str, Any]) -> str | None:
+        raw_id = spectrum_dict["id"]
+        scan_idx = raw_id.find("scan=")
+        if scan_idx == -1:
+            logger.warning(
+                "Skipping spectrum with unrecognized id "
+                "(no 'scan=' field) in %s: %s",
+                source,
+                raw_id,
+            )
+            return None
+        return raw_id[scan_idx + 5 :]
+
+    yield from reader_utils.iter_xml_spectra(
+        source,
+        pyteomics.mzml.MzML,
+        "ms level",
+        _extract_scan_nr,
+        _parse_spectrum,
+        logger,
     )
-    with pyteomics.mzml.MzML(mzml_source) as f_in:
-        filename = reader_utils.base_filename(source, f_in)
-        try:
-            for spectrum_dict in f_in:
-                try:
-                    if int(spectrum_dict.get("ms level", -1)) <= 1:
-                        continue
-                    raw_id = spectrum_dict["id"]
-                    scan_idx = raw_id.find("scan=")
-                    if scan_idx == -1:
-                        logger.warning(
-                            "Skipping spectrum with unrecognized id "
-                            "(no 'scan=' field) in %s: %s",
-                            source,
-                            raw_id,
-                        )
-                        continue
-                    scan_nr = raw_id[scan_idx + 5 :]
-                    spectrum_dict["id"] = f"{filename}:scan:{scan_nr}"
-                    yield _parse_spectrum(spectrum_dict)
-                except reader_utils.PARSE_EXCEPTIONS as exc:
-                    reader_utils.log_skipped_spectrum(
-                        source, spectrum_dict.get("id"), exc
-                    )
-        except LxmlError as exc:
-            logger.warning("Failed to read file %s: %s", source, exc)
 
 
-def _parse_spectrum(spectrum_dict: dict[str, Any]) -> sus.MsmsSpectrum:
+def _parse_spectrum(
+    spectrum_dict: dict[str, Any], identifier: str
+) -> sus.MsmsSpectrum:
     """
     Parse a Pyteomics mzML spectrum dictionary into an ``MsmsSpectrum``.
 
@@ -75,13 +74,14 @@ def _parse_spectrum(spectrum_dict: dict[str, Any]) -> sus.MsmsSpectrum:
     ----------
     spectrum_dict : dict[str, Any]
         Pyteomics mzML spectrum entry.
+    identifier : str
+        USI-style spectrum identifier assigned to the parsed spectrum.
 
     Returns
     -------
     MsmsSpectrum
         Parsed spectrum; missing RT is stored as ``NaN``.
     """
-    spectrum_id = spectrum_dict["id"]
     mz_array = spectrum_dict["m/z array"]
     intensity_array = spectrum_dict["intensity array"]
     retention_time = spectrum_dict["scanList"]["scan"][0].get(
@@ -99,7 +99,7 @@ def _parse_spectrum(spectrum_dict: dict[str, Any]) -> sus.MsmsSpectrum:
         precursor_charge = None
 
     return reader_utils.build_msms_spectrum(
-        spectrum_id,
+        identifier,
         precursor_mz,
         precursor_charge,
         mz_array,

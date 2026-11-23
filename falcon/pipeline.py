@@ -5,33 +5,33 @@ from __future__ import annotations
 import logging
 import shutil
 import tempfile
-from collections.abc import Sequence
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import lance
 
 from .cluster import generate_clusters_multi
-from .cluster.spectrum import build_process_spectrum
-from .config.models import (
-    AverageConsensusConfig,
-    ConsensusConfig,
-    FalconConfig,
-)
-from .export import ClusterResult, export_results, validate_outputs
-from .staging import (
-    bucket_dataset_path,
-    format_bucket_label,
-    load_or_stage_buckets,
-    spectra_dir,
-)
-from .types import ChargeBucket
+from .config.models import AverageConsensusConfig
+from .config.serialize import format_metadata_lines
+from .dataset import bucket_dataset_path, format_bucket_label, spectra_dir
+from .export import export_results, prepare_outputs
+from .preprocessing import build_process_spectrum
+from .staging import load_or_stage_buckets
 
-logger = logging.getLogger("falcon")
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from .config.models import ConsensusConfig, FalconConfig
+    from .types import ChargeBucket, ClusterResult
+
+logger = logging.getLogger(__name__)
+
+__all__ = ["run"]
 
 
 def _log_config(config: FalconConfig, work_dir: Path) -> None:
     """Log the Falcon version and active configuration settings."""
-    metadata_lines = config.to_metadata_lines(work_dir=work_dir)
+    metadata_lines = format_metadata_lines(config, work_dir=work_dir)
     logger.info("%s", metadata_lines[0])
     for line in metadata_lines[1:]:
         logger.debug("%s", line)
@@ -109,7 +109,7 @@ def _run_clustering(
     -------
     tuple[list[lance.LanceDataset], list[ClusterResult]]
         Non-empty per-bucket Lance datasets and their positionally
-        aligned ``(labels, representative_spectra)`` clustering results.
+        aligned ``ClusterResult`` clustering results.
     """
     bucket_datasets: list[lance.LanceDataset] = []
     bucket_labels: list[str] = []
@@ -154,7 +154,7 @@ def run(config: FalconConfig) -> int:
     work_dir, rm_work_dir = _setup_work_dir(config.io.work_dir)
     try:
         _log_config(config, work_dir)
-        if validate_outputs(config.io):
+        if not prepare_outputs(config.io):
             return 1
         _warn_aggressive_outlier_cutoffs(config.consensus)
 

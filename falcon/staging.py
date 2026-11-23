@@ -1,14 +1,14 @@
-"""Input discovery, parallel Lance staging, and cache provenance.
+"""Input discovery, charge routing, Lance staging, and cache provenance.
 
-This module is the single owner of Falcon's staged Lance layout:
-schema, canonical sort order, bucket dataset naming/labels, concurrent
-Lance writes, and ``staging_cache.json`` manifest validation.
+This module owns input peak-file expansion, precursor charge routing,
+parallel spectrum reading and concurrent Lance writes, and
+``staging_cache.json`` manifest validation. Shared Lance schemas and
+bucket naming conventions live in :mod:`falcon.dataset`.
 """
 
 from __future__ import annotations
 
 import collections
-import glob
 import json
 import logging
 import os
@@ -16,66 +16,40 @@ import queue
 import shutil
 import tempfile
 import threading
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import joblib
 import lance
 import pyarrow as pa
-import spectrum_utils.spectrum as sus
 
-from . import __version__, ms_io
-from .config.models import FalconConfig
-from .types import (
-    ChargeBucket,
-    ChargeValue,
-    ProcessedSpectrum,
-    charge_sort_key,
-    parse_charge_buckets,
+from . import __version__
+from .dataset import (
+    BUCKET_PREFIX,
+    BUCKET_SUFFIX,
+    SPECTRUM_SCHEMA,
+    bucket_dataset_name,
+    bucket_dataset_path,
+    spectra_dir,
 )
+from .types import charge_sort_key, parse_charge_bucket_list
+from .utils import effective_n_workers, expand_input_globs
 
-logger = logging.getLogger("falcon")
+if TYPE_CHECKING:
+    from collections.abc import Callable, Sequence
+
+    import spectrum_utils.spectrum as sus
+
+    from .config.models import FalconConfig
+    from .types import ChargeBucket, ChargeValue, ProcessedSpectrum
+
+logger = logging.getLogger(__name__)
 
 STAGING_CACHE_SCHEMA_VERSION = 1
 STAGING_CACHE_FILENAME = "staging_cache.json"
-SPECTRA_SUBDIR = "spectra"
 
-_BUCKET_PREFIX = "spectra_charge_"
-_BUCKET_SUFFIX = ".lance"
 _CACHE_HINT = "rerun with --overwrite or a different --work-dir."
-
-# Canonical ordering shared across staging, clustering, and export so
-# positional cluster labels always bind to the exact same spectra.
-CANONICAL_SORT_COLUMNS: tuple[str, ...] = (
-    "precursor_mz",
-    "retention_time",
-    "identifier",
-)
-METADATA_COLUMNS: tuple[str, ...] = (
-    "identifier",
-    "precursor_charge",
-    "precursor_mz",
-    "retention_time",
-)
-INTERVAL_COLUMNS: tuple[str, ...] = (
-    "identifier",
-    "precursor_mz",
-    "precursor_charge",
-    "retention_time",
-    "mz",
-    "intensity",
-)
-SPECTRUM_SCHEMA = pa.schema(
-    [
-        pa.field("identifier", pa.string()),
-        pa.field("precursor_mz", pa.float32()),
-        pa.field("precursor_charge", pa.int8()),
-        pa.field("mz", pa.list_(pa.float32())),
-        pa.field("intensity", pa.list_(pa.float32())),
-        pa.field("retention_time", pa.float32()),
-    ]
-)
 
 # Flush a bucket's buffered spectra to its Lance dataset once this many
 # rows accumulate, bounding per-bucket memory during staging.
@@ -84,67 +58,18 @@ _LANCE_WRITE_BATCH_SIZE = 10_000
 # writer threads, bounding peak memory during preprocessing.
 _MAX_SPECTRA_IN_MEMORY = 1_000_000
 
-
-def spectra_dir(work_dir: Path) -> Path:
-    """Return the ``spectra`` staging directory under ``work_dir``."""
-    return work_dir / SPECTRA_SUBDIR
-
-
-def bucket_key_to_str(
-    bucket_key: ChargeBucket | set[ChargeValue] | str,
-) -> str:
-    """
-    Convert a charge bucket key to a deterministic filename suffix.
-
-    Parameters
-    ----------
-    bucket_key : ChargeBucket | set[ChargeValue] | str
-        Charge bucket key as a tuple/set of charges or sentinel string.
-
-    Returns
-    -------
-    str
-        Filename suffix starting with ``"_"``.
-
-    Examples
-    --------
-    >>> bucket_key_to_str((1, 2))
-    '_1_2'
-    >>> bucket_key_to_str((3, "unknown"))
-    '_3_unknown'
-    >>> bucket_key_to_str("other")
-    '_other'
-    """
-    if isinstance(bucket_key, set):
-        bucket_key = tuple(sorted(bucket_key, key=charge_sort_key))
-    if isinstance(bucket_key, tuple):
-        return "_" + "_".join(str(part) for part in bucket_key)
-    if isinstance(bucket_key, str):
-        return "_" + bucket_key
-    raise TypeError(f"Unsupported bucket key type: {type(bucket_key)}")
-
-
-def bucket_dataset_name(bucket: ChargeBucket) -> str:
-    """Return the on-disk Lance directory name for ``bucket``."""
-    return f"spectra_charge{bucket_key_to_str(bucket)}{_BUCKET_SUFFIX}"
-
-
-def bucket_dataset_path(work_dir: Path, bucket: ChargeBucket) -> Path:
-    """Return the full staged Lance dataset path for ``bucket``."""
-    return spectra_dir(work_dir) / bucket_dataset_name(bucket)
-
-
-def format_bucket_label(bucket: ChargeBucket) -> str:
-    """
-    Format a charge bucket key as a readable label for log messages.
-
-    For example, ``(2,)`` becomes ``"2"``, ``(1, 2)`` becomes
-    ``"1, 2"``, ``("unknown",)`` becomes ``"unknown"``, and ``"other"``
-    becomes ``"other"``.
-    """
-    if isinstance(bucket, str):
-        return bucket
-    return ", ".join(str(part) for part in bucket)
+__all__ = [
+    "STAGING_CACHE_FILENAME",
+    "STAGING_CACHE_SCHEMA_VERSION",
+    "ChargeRouter",
+    "build_staging_manifest",
+    "deserialize_cached_buckets",
+    "diff_staging_manifests",
+    "load_or_stage_buckets",
+    "resolve_input_files",
+    "serialize_cached_buckets",
+    "stage_spectra",
+]
 
 
 def resolve_input_files(patterns: Sequence[str]) -> list[Path]:
@@ -170,9 +95,7 @@ def resolve_input_files(patterns: Sequence[str]) -> list[Path]:
     FileNotFoundError
         If no files match any supplied pattern.
     """
-    resolved = [
-        Path(fn) for pattern in patterns for fn in sorted(glob.glob(pattern))
-    ]
+    resolved = expand_input_globs(patterns)
     if not resolved:
         raise FileNotFoundError(
             f"No input peak files matched: {list(patterns)}"
@@ -235,10 +158,7 @@ def deserialize_cached_buckets(raw_buckets: Any) -> list[ChargeBucket]:
         raise ValueError("Cached staging manifest has invalid 'buckets' field")
     if len(raw_buckets) == 0:
         return []
-    parsed = parse_charge_buckets(raw_buckets)
-    if parsed is None:
-        raise ValueError("Cached staging manifest has invalid 'buckets' field")
-    return list(parsed)
+    return list(parse_charge_bucket_list(raw_buckets))
 
 
 def build_staging_manifest(
@@ -355,7 +275,7 @@ def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
 def _has_unverified_staging_files(target_dir: Path) -> bool:
     """Return True if ``target_dir`` has unmanifested cache files."""
     return any(
-        entry.name == "charges.joblib" or entry.name.endswith(_BUCKET_SUFFIX)
+        entry.name == "charges.joblib" or entry.name.endswith(BUCKET_SUFFIX)
         for entry in target_dir.iterdir()
     )
 
@@ -364,8 +284,8 @@ def _staged_dataset_names(target_dir: Path) -> set[str] | None:
     """Return staged ``spectra_charge_*.lance`` dir names, or None."""
     names: set[str] = set()
     for entry in target_dir.iterdir():
-        if entry.name.startswith(_BUCKET_PREFIX) and entry.name.endswith(
-            _BUCKET_SUFFIX
+        if entry.name.startswith(BUCKET_PREFIX) and entry.name.endswith(
+            BUCKET_SUFFIX
         ):
             if not entry.is_dir():
                 return None
@@ -453,6 +373,7 @@ def load_or_stage_buckets(
     resolved_inputs = resolve_input_files(config.io.input_filenames)
     expected_manifest = build_staging_manifest(config, resolved_inputs)
     target_dir = spectra_dir(work_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
     cache_path = target_dir / STAGING_CACHE_FILENAME
 
     if config.io.overwrite:
@@ -482,8 +403,83 @@ def load_or_stage_buckets(
 
 
 # ----------------------------------------------------------------------
-# Parallel spectrum reading and concurrent Lance dataset staging
+# Charge routing, parallel spectrum reading, and concurrent Lance writes
 # ----------------------------------------------------------------------
+
+
+class ChargeRouter:
+    """
+    Route raw spectrum charges to canonical ``ChargeBucket`` keys.
+
+    Supports automatic per-charge bucketing (``charge_buckets=None``)
+    and explicit non-overlapping charge groupings with optional
+    ``"other"`` fallback.
+
+    Parameters
+    ----------
+    charge_buckets : Sequence[Any] | None
+        Explicit charge groupings or ``None`` for auto mode.
+
+    Raises
+    ------
+    ValueError
+        If ``charge_buckets`` is non-``None`` and invalid.
+    """
+
+    def __init__(self, charge_buckets: Sequence[Any] | None) -> None:
+        if charge_buckets is None:
+            self._canonical_buckets: tuple[ChargeBucket, ...] | None = None
+            self._charge_to_bucket: dict[
+                ChargeValue, tuple[ChargeValue, ...]
+            ] = {}
+            self._catch_other = False
+            return
+
+        canonical = parse_charge_bucket_list(list(charge_buckets))
+        charge_to_bucket: dict[ChargeValue, tuple[ChargeValue, ...]] = {}
+        catch_other = False
+        for bucket in canonical:
+            if bucket == "other":
+                catch_other = True
+                continue
+            for charge in bucket:
+                charge_to_bucket[charge] = bucket
+        self._canonical_buckets = canonical
+        self._charge_to_bucket = charge_to_bucket
+        self._catch_other = catch_other
+
+    @property
+    def auto(self) -> bool:
+        """Return ``True`` when routing in automatic per-charge mode."""
+        return self._canonical_buckets is None
+
+    @property
+    def canonical_buckets(self) -> tuple[ChargeBucket, ...] | None:
+        """Return explicit buckets, or ``None`` in auto mode."""
+        return self._canonical_buckets
+
+    def route(self, raw_charge: int | None) -> ChargeBucket | None:
+        """
+        Map a raw precursor charge to its target ``ChargeBucket``.
+
+        Parameters
+        ----------
+        raw_charge : int | None
+            Precursor charge state, or ``None`` when unknown.
+
+        Returns
+        -------
+        ChargeBucket | None
+            Target charge bucket key, or ``None`` if the spectrum should
+            be dropped.
+        """
+        charge: ChargeValue = "unknown" if raw_charge is None else raw_charge
+        if self._canonical_buckets is None:
+            return (charge,)
+        bucket = self._charge_to_bucket.get(charge)
+        if bucket is not None:
+            return bucket
+        return "other" if self._catch_other else None
 
 
 class _PerChargeLockRegistry:
@@ -503,28 +499,45 @@ class _PerChargeLockRegistry:
             return lock
 
 
-def _build_charge_routing(
-    charge_buckets: Sequence[Any] | None,
-) -> tuple[
-    bool,
-    tuple[ChargeBucket, ...] | None,
-    dict[ChargeValue, tuple[ChargeValue, ...]],
-    bool,
-]:
-    """Validate charge buckets and build the per-charge routing map."""
-    if charge_buckets is None:
-        return True, None, {}, False
-    canonical = parse_charge_buckets(list(charge_buckets))
-    assert canonical is not None  # noqa: S101
-    charge_to_bucket: dict[ChargeValue, tuple[ChargeValue, ...]] = {}
-    catch_other_charges = False
-    for bucket in canonical:
-        if bucket == "other":
-            catch_other_charges = True
+def _enqueue_spectrum(
+    spectra_queue: queue.Queue[ProcessedSpectrum | None],
+    spec: ProcessedSpectrum | None,
+    stop_event: threading.Event,
+) -> bool:
+    """Enqueue ``spec`` unless ``stop_event`` is set."""
+    while not stop_event.is_set():
+        try:
+            spectra_queue.put(spec, timeout=0.1)
+            return True
+        except queue.Full:
             continue
-        for charge in bucket:
-            charge_to_bucket[charge] = bucket
-    return False, canonical, charge_to_bucket, catch_other_charges
+    return False
+
+
+def _auto_bucket_sort_key(bucket: ChargeBucket) -> tuple[bool, int | str]:
+    """Sort auto-mode singleton charge buckets deterministically."""
+    if isinstance(bucket, tuple):
+        return charge_sort_key(bucket[0])
+    return (True, bucket)
+
+
+def _collect_valid_buckets(
+    router: ChargeRouter,
+    written_counts: Mapping[ChargeBucket, int],
+) -> list[ChargeBucket]:
+    """Return non-empty staged buckets in deterministic order."""
+    if router.canonical_buckets is None:
+        return sorted(
+            (b for b, count in written_counts.items() if count > 0),
+            key=_auto_bucket_sort_key,
+        )
+    valid: list[ChargeBucket] = []
+    for bucket in router.canonical_buckets:
+        if written_counts.get(bucket, 0) > 0:
+            valid.append(bucket)
+        else:
+            logger.debug("No spectra for bucket %s, skipping", bucket)
+    return valid
 
 
 def stage_spectra(
@@ -558,36 +571,35 @@ def stage_spectra(
     if not resolved_files:
         raise FileNotFoundError("No input peak files supplied")
 
+    router = ChargeRouter(charge_buckets)
     work_path = Path(work_dir)
+    spectra_dir(work_path).mkdir(parents=True, exist_ok=True)
     logger.info("Reading spectra from %d peak file(s)...", len(resolved_files))
-    effective_cpus = max(1, int(joblib.effective_n_jobs(-1)))
-    max_file_workers = min(len(resolved_files), effective_cpus)
-
-    auto_bucket, canonical_buckets, charge_to_bucket, catch_other_charges = (
-        _build_charge_routing(charge_buckets)
-    )
+    max_file_workers = min(len(resolved_files), effective_n_workers())
 
     spectra_queue: queue.Queue[ProcessedSpectrum | None] = queue.Queue(
         maxsize=_MAX_SPECTRA_IN_MEMORY
     )
     lance_locks = _PerChargeLockRegistry()
     stop_event = threading.Event()
+    written_counts: dict[ChargeBucket, int] = collections.defaultdict(int)
     writer_errors: list[BaseException] = []
-    error_lock = threading.Lock()
+    state_lock = threading.Lock()
 
     def _writer_loop() -> None:
         try:
-            _write_spectra_lance(
+            local_counts = _write_spectra_lance(
                 spectra_queue,
                 lance_locks,
-                charge_to_bucket,
-                catch_other_charges,
-                auto_bucket,
+                router,
                 work_path,
                 stop_event,
             )
+            with state_lock:
+                for bucket, count in local_counts.items():
+                    written_counts[bucket] += count
         except BaseException as exc:
-            with error_lock:
+            with state_lock:
                 writer_errors.append(exc)
             stop_event.set()
 
@@ -601,52 +613,34 @@ def stage_spectra(
     low_quality_counter = 0
     try:
         for file_spectra, lqc in joblib.Parallel(
-            n_jobs=max_file_workers, return_as="generator_unordered"
+            n_jobs=max_file_workers,
+            backend="loky",
+            return_as="generator_unordered",
         )(
             joblib.delayed(_read_spectra)(file, process_spectrum)
             for file in resolved_files
         ):
             low_quality_counter += lqc
-            for spec in file_spectra:
-                while not stop_event.is_set():
-                    try:
-                        spectra_queue.put(spec, timeout=0.1)
-                        break
-                    except queue.Full:
-                        continue
-                if stop_event.is_set():
-                    break
-            if stop_event.is_set():
+            if stop_event.is_set() or not all(
+                _enqueue_spectrum(spectra_queue, spec, stop_event)
+                for spec in file_spectra
+            ):
                 break
     except BaseException:
         stop_event.set()
         raise
     finally:
-        if not stop_event.is_set():
-            for _ in writers:
-                spectra_queue.put(None)
+        for _ in writers:
+            if not _enqueue_spectrum(spectra_queue, None, stop_event):
+                break
         for writer in writers:
             writer.join()
 
     if writer_errors:
         raise writer_errors[0]
 
-    target_dir = spectra_dir(work_path)
-    candidate_buckets: Sequence[ChargeBucket] = (
-        _discover_auto_buckets(target_dir)
-        if canonical_buckets is None
-        else canonical_buckets
-    )
-    n_spectra = 0
-    valid_buckets: list[ChargeBucket] = []
-    for bucket in candidate_buckets:
-        dataset_path = target_dir / bucket_dataset_name(bucket)
-        try:
-            dataset = lance.dataset(str(dataset_path))
-            n_spectra += dataset.count_rows()
-            valid_buckets.append(bucket)
-        except (ValueError, FileNotFoundError):
-            logger.debug("No spectra for bucket %s, skipping", bucket)
+    n_spectra = sum(written_counts.values())
+    valid_buckets = _collect_valid_buckets(router, written_counts)
     logger.info(
         "Read %d spectra from %d peak file(s)",
         n_spectra,
@@ -656,38 +650,16 @@ def stage_spectra(
     return valid_buckets
 
 
-def _discover_auto_buckets(
-    lance_dir: str | os.PathLike[str],
-) -> list[tuple[ChargeValue, ...]]:
-    """
-    Discover singleton per-charge buckets created in auto mode.
-
-    Returns buckets sorted deterministically (numeric charges ascending,
-    then ``"unknown"``).
-    """
-    buckets: list[tuple[ChargeValue, ...]] = []
-    for entry in Path(lance_dir).iterdir():
-        name = entry.name
-        if not (
-            name.startswith(_BUCKET_PREFIX) and name.endswith(_BUCKET_SUFFIX)
-        ):
-            continue
-        key = name[len(_BUCKET_PREFIX) : -len(_BUCKET_SUFFIX)]
-        bucket: tuple[ChargeValue, ...] = (
-            ("unknown",) if key == "unknown" else (int(key),)
-        )
-        buckets.append(bucket)
-    return sorted(buckets, key=lambda b: charge_sort_key(b[0]))
-
-
 def _read_spectra(
-    filename: str | os.PathLike[str],
+    filename: Path,
     process_spectrum: Callable[[sus.MsmsSpectrum], ProcessedSpectrum | None],
 ) -> tuple[list[ProcessedSpectrum], int]:
     """Read and preprocess all spectra from a single peak file."""
+    from . import ms_io
+
     low_quality_counter = 0
     spectra: list[ProcessedSpectrum] = []
-    abs_path = Path(filename).resolve()
+    abs_path = filename.resolve()
     for spec in ms_io.get_spectra(abs_path):
         processed = process_spectrum(spec)
         if processed is None:
@@ -700,27 +672,30 @@ def _read_spectra(
 def _write_spectra_lance(
     spectra_queue: queue.Queue[ProcessedSpectrum | None],
     lance_locks: _PerChargeLockRegistry,
-    charge_to_bucket: Mapping[ChargeValue, tuple[ChargeValue, ...]],
-    catch_other_charges: bool,
-    auto_bucket: bool,
+    router: ChargeRouter,
     work_dir: Path,
     stop_event: threading.Event | None = None,
-) -> None:
+) -> dict[ChargeBucket, int]:
     """Drain preprocessed spectra from ``spectra_queue`` into Lance."""
     spec_to_write: dict[ChargeBucket, list[ProcessedSpectrum]] = (
         collections.defaultdict(list)
     )
+    written_counts: dict[ChargeBucket, int] = collections.defaultdict(int)
 
     def _flush(key: ChargeBucket) -> None:
         batch = spec_to_write[key]
         if not batch:
             return
-        _write_to_dataset(batch, key, lance_locks.get(key), work_dir)
+        n_written = _write_to_dataset(
+            batch, key, lance_locks.get(key), work_dir
+        )
+        if n_written > 0:
+            written_counts[key] += n_written
         batch.clear()
 
     while True:
         if stop_event is not None and stop_event.is_set():
-            return
+            return dict(written_counts)
         try:
             spec = spectra_queue.get(timeout=0.1)
         except queue.Empty:
@@ -728,18 +703,9 @@ def _write_spectra_lance(
         if spec is None:
             for key in list(spec_to_write):
                 _flush(key)
-            return
+            return dict(written_counts)
 
-        raw_charge = spec["precursor_charge"]
-        charge: ChargeValue = "unknown" if raw_charge is None else raw_charge
-
-        bucket_key: ChargeBucket | None
-        if auto_bucket:
-            bucket_key = (charge,)
-        else:
-            bucket_key = charge_to_bucket.get(charge) or (
-                "other" if catch_other_charges else None
-            )
+        bucket_key = router.route(spec["precursor_charge"])
         if bucket_key is not None:
             spec_to_write[bucket_key].append(spec)
             if len(spec_to_write[bucket_key]) >= _LANCE_WRITE_BATCH_SIZE:
@@ -750,11 +716,11 @@ def _write_to_dataset(
     spec_to_write: Sequence[Mapping[str, Any]],
     charge_bucket: ChargeBucket,
     lock: threading.Lock,
-    work_dir: str | os.PathLike[str],
+    work_dir: Path,
 ) -> int:
     """Create or append a batch of preprocessed spectra to Lance."""
     new_rows = pa.Table.from_pylist(spec_to_write, SPECTRUM_SCHEMA)
-    path = bucket_dataset_path(Path(work_dir), charge_bucket)
+    path = bucket_dataset_path(work_dir, charge_bucket)
     with lock:
         if not path.exists():
             logger.debug("Creating lance dataset at %s", path)

@@ -7,50 +7,61 @@ import gc
 import logging
 import os
 import time
-from collections import defaultdict
-from collections.abc import Iterator, Sequence
+from dataclasses import dataclass, field
 from functools import partial
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import fastcluster
 import joblib
-import lance
 import numpy as np
-import pandas as pd
-import scipy.cluster.hierarchy as sch
 
 from ..config.models import (
-    ClusteringConfig,
-    ConsensusConfig,
+    DEFAULT_MAX_MZ,
+    DEFAULT_MIN_MZ,
     MedoidConsensusConfig,
 )
-from ..staging import CANONICAL_SORT_COLUMNS, INTERVAL_COLUMNS
-from ..types import ConsensusTuple, SpectrumTuple, make_consensus_tuple
-from ..utils import format_hms
+from ..dataset import (
+    CANONICAL_SORT_COLUMNS,
+    INTERVAL_COLUMNS,
+    bucket_label_from_uri,
+)
+from ..types import (
+    ClusterResult,
+    ConsensusTuple,
+    SpectrumTuple,
+    offset_cluster_result,
+)
+from ..utils import effective_n_workers, format_hms
 from .consensus import get_representative_spectra, iter_cluster_groups
 from .distance import (
     compute_condensed_distance_matrix,
     fill_condensed_rows,
     open_shared_condensed,
 )
-from .refine import postprocess_cluster
+from .refine import cut_linkage, postprocess_cluster
 from .scheduling import (
     CHUNKS_PER_WORKER,
     MIN_PAIRS_PER_TILE,
     ChunkTask,
     GiantInterval,
-    IntervalSpec,
     TileTask,
     interval_row_bounds,
     prepare_bucket_chunks,
     tile_threshold,
 )
 
-logger = logging.getLogger("falcon")
+if TYPE_CHECKING:
+    from collections.abc import Iterator, Sequence
 
-IntervalResult = tuple[list[ConsensusTuple], np.ndarray]
-TaggedIntervalResult = tuple[int, IntervalResult]
-ClusterResult = tuple[np.ndarray, list[ConsensusTuple]]
+    import lance
+    import pandas as pd
+
+    from ..config.models import ClusteringConfig, ConsensusConfig
+    from .scheduling import IntervalSpec
+
+logger = logging.getLogger(__name__)
+
+TaggedIntervalResult = tuple[int, ClusterResult]
 
 # Minimum spectra a refined cluster needs to keep a shared label;
 # smaller groups become individually labeled singletons.
@@ -60,15 +71,37 @@ _MIN_CLUSTER_SAMPLES = 2
 # smaller intervals do not allocate enough to justify GC overhead.
 _GC_COLLECT_MIN_SPECTRA = 2**11
 
+__all__ = [
+    "ClusteringOptions",
+    "TaggedIntervalResult",
+    "cluster_chunk",
+    "cluster_mz_interval",
+    "finalize_bucket",
+    "generate_clusters",
+    "generate_clusters_multi",
+    "interval_spectrum_tuples",
+]
 
-def _default_bucket_label(dataset: lance.LanceDataset, index: int) -> str:
-    """Fallback charge label derived from dataset URI when omitted."""
-    uri = dataset.uri
-    if "spectra_charge_" in uri:
-        return (
-            uri.split("spectra_charge_")[-1].split(".")[0].replace("_", ", ")
-        )
-    return str(index)
+
+@dataclass(frozen=True, slots=True)
+class ClusteringOptions:
+    """Bundled clustering, consensus, and m/z-range options."""
+
+    clustering: ClusteringConfig
+    consensus: ConsensusConfig = field(default_factory=MedoidConsensusConfig)
+    min_mz: float = DEFAULT_MIN_MZ
+    max_mz: float = DEFAULT_MAX_MZ
+    compute_representatives: bool = True
+
+
+def _parallel_pool() -> joblib.Parallel:
+    """Create the shared loky pool returning unordered task results."""
+    return joblib.Parallel(
+        n_jobs=-1,
+        backend="loky",
+        verbose=0,
+        return_as="generator_unordered",
+    )
 
 
 def interval_spectrum_tuples(
@@ -112,15 +145,11 @@ def interval_spectrum_tuples(
 def cluster_mz_interval(
     spectra: pd.DataFrame,
     precursor_mzs: np.ndarray,
-    clustering: ClusteringConfig,
-    consensus: ConsensusConfig,
+    options: ClusteringOptions,
     *,
-    min_mz: float = 101.0,
-    max_mz: float = 1500.0,
     pdist: np.ndarray | None = None,
-    compute_representatives: bool = True,
     already_sorted: bool = False,
-) -> IntervalResult:
+) -> ClusterResult:
     """
     Cluster spectra within one precursor m/z interval.
 
@@ -130,66 +159,51 @@ def cluster_mz_interval(
         Pre-fetched interval spectra containing ``INTERVAL_COLUMNS``.
     precursor_mzs : np.ndarray
         Precursor m/z values aligned with canonical order.
-    clustering : ClusteringConfig
-        Validated clustering parameters.
-    consensus : ConsensusConfig
-        Validated consensus parameters.
-    min_mz : float, default=101.0
-        Lower fragment m/z bound (used for average consensus).
-    max_mz : float, default=1500.0
-        Upper fragment m/z bound (used for average consensus).
+    options : ClusteringOptions
+        Bundled clustering, consensus, and representative options.
     pdist : np.ndarray | None, default=None
         Optional precomputed condensed distance matrix (tiled giant
         path) indexed identically to ``interval_spectrum_tuples``.
-    compute_representatives : bool, default=True
-        Whether to compute representative spectra. When ``False``,
-        returns an empty list and avoids representative work and the
-        second label sort.
     already_sorted : bool, default=False
         Whether ``spectra`` is already in canonical order.
 
     Returns
     -------
-    IntervalResult
-        Representative spectra (or empty list) and int32 cluster labels
-        aligned to the interval's canonical input order.
+    ClusterResult
+        Int32 cluster labels aligned to canonical input order and
+        representative spectra ordered by ascending cluster ID (or an
+        empty list when ``options.compute_representatives`` is False).
     """
     spec_tuples, rts_orig = interval_spectrum_tuples(
         spectra, already_sorted=already_sorted
     )
     n_spectra = len(spec_tuples)
+    if n_spectra == 0:
+        return ClusterResult(np.empty(0, dtype=np.int32), [])
     if n_spectra == 1:
         labels_single = np.zeros(1, dtype=np.int32)
         reps = (
             [
-                make_consensus_tuple(
-                    precursor_mz=spec_tuples[0].precursor_mz,
-                    precursor_charge=spec_tuples[0].precursor_charge,
-                    mz=spec_tuples[0].mz,
-                    intensity=spec_tuples[0].intensity,
-                    retention_time=float(rts_orig[0]),
-                    cluster_id=0,
+                ConsensusTuple.from_spectrum(
+                    spec_tuples[0], float(rts_orig[0]), 0
                 )
             ]
-            if compute_representatives
+            if options.compute_representatives
             else []
         )
-        return reps, labels_single
+        return ClusterResult(labels_single, reps)
 
+    clustering = options.clustering
     if pdist is None:
         pdist = compute_condensed_distance_matrix(
             spec_tuples,
             clustering.fragment_tol,
             clustering.min_matched_peaks,
         )
-    labels = (
-        sch.fcluster(
-            fastcluster.linkage(pdist, clustering.linkage),
-            clustering.distance_threshold,
-            "distance",
-        )
-        - 1
-    ).astype(np.int32)
+    labels = cut_linkage(
+        fastcluster.linkage(pdist, clustering.linkage),
+        clustering.distance_threshold,
+    )
 
     # Group initial labels for precursor m/z and optional RT refinement.
     label_order = np.argsort(labels)
@@ -212,7 +226,7 @@ def cluster_mz_interval(
         current_label += n_clusters
 
     cluster_labels = np.empty(n_spectra, dtype=np.int32)
-    if not compute_representatives:
+    if not options.compute_representatives:
         cluster_labels[label_order] = labels
         rep_spectra: list[ConsensusTuple] = []
     elif current_label < n_spectra:
@@ -225,45 +239,40 @@ def cluster_mz_interval(
             labels,
             rts_ref,
             order_map,
-            consensus,
+            options.consensus,
             pdist=pdist,
-            min_mz=min_mz,
-            max_mz=max_mz,
+            min_mz=options.min_mz,
+            max_mz=options.max_mz,
             fragment_tol=clustering.fragment_tol,
         )
         cluster_labels[order_map] = labels
     else:
-        # Every spectrum ended up as its own singleton.
+        # Every spectrum ended up as its own singleton; labels in
+        # label_order are already 0..n_spectra-1, so iterating pos emits
+        # representatives strictly ordered by ascending cluster_id.
         cluster_labels[label_order] = labels
         rep_spectra = [
-            make_consensus_tuple(
-                precursor_mz=spec.precursor_mz,
-                precursor_charge=spec.precursor_charge,
-                mz=spec.mz,
-                intensity=spec.intensity,
-                retention_time=float(rts_orig[i]),
-                cluster_id=int(cluster_labels[i]),
+            ConsensusTuple.from_spectrum(
+                spec_tuples[int(label_order[pos])],
+                float(rts_ord[pos]),
+                int(labels[pos]),
             )
-            for i, spec in enumerate(spec_tuples)
+            for pos in range(n_spectra)
         ]
 
     # Release memmap backing storage eagerly for large intervals.
     del pdist
     if n_spectra > _GC_COLLECT_MIN_SPECTRA:
         gc.collect()
-    return rep_spectra, cluster_labels
+    return ClusterResult(cluster_labels, rep_spectra)
 
 
 def cluster_chunk(
     chunk: Sequence[IntervalSpec],
     dataset: lance.LanceDataset,
-    clustering: ClusteringConfig,
-    consensus: ConsensusConfig,
+    options: ClusteringOptions,
     *,
-    min_mz: float = 101.0,
-    max_mz: float = 1500.0,
-    compute_representatives: bool = True,
-    batch_size: int | None = None,
+    read_batch_size: int | None = None,
 ) -> list[TaggedIntervalResult]:
     """
     Cluster all intervals in a worker chunk with batched Lance reads.
@@ -274,22 +283,16 @@ def cluster_chunk(
         Intervals assigned to this worker chunk.
     dataset : lance.LanceDataset
         Source per-charge Lance dataset.
-    clustering : ClusteringConfig
-        Validated clustering parameters.
-    consensus : ConsensusConfig
-        Validated consensus parameters.
-    min_mz, max_mz : float
-        Configured fragment m/z range for average consensus.
-    compute_representatives : bool, default=True
-        Whether to compute cluster representative spectra.
-    batch_size : int | None, default=None
+    options : ClusteringOptions
+        Bundled clustering, consensus, and representative options.
+    read_batch_size : int | None, default=None
         Cap on spectra fetched per batched Lance ``take`` call. Reads
         the entire chunk at once when ``None``.
 
     Returns
     -------
     list[TaggedIntervalResult]
-        List of ``(task_id, (rep_spectra, cluster_labels))`` results.
+        List of ``(task_id, ClusterResult)`` interval results.
     """
     if not chunk:
         return []
@@ -316,11 +319,7 @@ def cluster_chunk(
                     cluster_mz_interval(
                         interval_spectra,
                         spec.precursor_mzs,
-                        clustering,
-                        consensus,
-                        min_mz=min_mz,
-                        max_mz=max_mz,
-                        compute_representatives=compute_representatives,
+                        options,
                         already_sorted=True,
                     ),
                 )
@@ -332,42 +331,37 @@ def cluster_chunk(
     group_size = 0
     for spec in chunk:
         m = spec.n_spectra
-        if group and batch_size is not None and group_size + m > batch_size:
+        if (
+            group
+            and read_batch_size is not None
+            and group_size + m > read_batch_size
+        ):
             results.extend(_cluster_group(group))
             group, group_size = [], 0
         group.append(spec)
         group_size += m
-    if group:
-        results.extend(_cluster_group(group))
+    results.extend(_cluster_group(group))
     return results
 
 
 def _cluster_chunk_tagged(
     task: ChunkTask,
-    clustering: ClusteringConfig,
-    consensus: ConsensusConfig,
-    min_mz: float,
-    max_mz: float,
-    compute_representatives: bool,
+    options: ClusteringOptions,
 ) -> tuple[str, int, int, int, list[TaggedIntervalResult]]:
     """Execute one ``ChunkTask`` and tag results for Pass 1."""
     chunk_results = cluster_chunk(
         task.intervals,
         dataset=task.dataset,
-        clustering=clustering,
-        consensus=consensus,
-        min_mz=min_mz,
-        max_mz=max_mz,
-        compute_representatives=compute_representatives,
-        batch_size=clustering.batch_size,
+        options=options,
+        read_batch_size=options.clustering.batch_size,
     )
     return ("chunk", task.bucket_id, task.cost, task.n_spectra, chunk_results)
 
 
 def _tile_distance(
     tile: TileTask,
-    fragment_mz_tol: float,
-    min_matches: int,
+    fragment_tol: float,
+    min_matched_peaks: int,
 ) -> tuple[str, int, float]:
     """Compute rows ``[tile.r0, tile.r1)`` of a giant memmap."""
     spectra = tile.dataset.take(
@@ -378,7 +372,12 @@ def _tile_distance(
     )
     condensed = np.lib.format.open_memmap(tile.memmap_path, mode="r+")
     fill_condensed_rows(
-        condensed, spec_tuples, tile.r0, tile.r1, fragment_mz_tol, min_matches
+        condensed,
+        spec_tuples,
+        tile.r0,
+        tile.r1,
+        fragment_tol,
+        min_matched_peaks,
     )
     condensed.flush()
     return ("tile", tile.giant_idx, tile.tile_cost)
@@ -386,12 +385,8 @@ def _tile_distance(
 
 def _finalize_giant(
     giant: GiantInterval,
-    clustering: ClusteringConfig,
-    consensus: ConsensusConfig,
-    min_mz: float,
-    max_mz: float,
-    compute_representatives: bool,
-) -> tuple[int, int, IntervalResult]:
+    options: ClusteringOptions,
+) -> tuple[int, int, ClusterResult]:
     """Cluster a giant interval from its precomputed distance memmap."""
     spectra = giant.dataset.take(
         indices=giant.spec.row_ids, columns=list(INTERVAL_COLUMNS)
@@ -400,12 +395,8 @@ def _finalize_giant(
     result = cluster_mz_interval(
         spectra.to_pandas(),
         giant.spec.precursor_mzs,
-        clustering,
-        consensus,
-        min_mz=min_mz,
-        max_mz=max_mz,
+        options,
         pdist=pdist,
-        compute_representatives=compute_representatives,
         already_sorted=True,
     )
     return (giant.bucket_id, giant.spec.task_id, result)
@@ -422,7 +413,6 @@ def _allocate_giant_tiles(
     for gi, (bucket_id, dataset, spec) in enumerate(raw_giants):
         n = spec.n_spectra
         path, mm = open_shared_condensed(n)
-        mm.flush()
         del mm  # Workers reopen by path; release writer handle here.
         memmap_paths.append(path)
         giants.append(
@@ -471,7 +461,7 @@ def finalize_bucket(
     splits : Sequence[int]
         Interval split boundaries from ``prepare_bucket_chunks``.
     interval_results : Sequence[TaggedIntervalResult]
-        Unordered ``(task_id, (rep_spectra, labels))`` split results.
+        Unordered ``(task_id, ClusterResult)`` split results.
     bucket_label : str
         Human-readable charge label for summary logging.
 
@@ -485,23 +475,16 @@ def finalize_bucket(
     representative_spectra: list[ConsensusTuple] = []
     current_offset = 0
 
-    for task_id, (interval_reps, labels) in sorted(
+    for task_id, interval_result in sorted(
         interval_results, key=lambda item: item[0]
     ):
         start, stop = int(splits[task_id]), int(splits[task_id + 1])
-        offset_labels = np.asarray(labels, dtype=np.int32) + np.int32(
-            current_offset
+        shifted, current_offset = offset_cluster_result(
+            interval_result, current_offset
         )
-        cluster_labels[start:stop] = offset_labels
-        if interval_reps:
-            representative_spectra.extend(
-                rep._replace(
-                    cluster_id=np.int32(int(rep.cluster_id) + current_offset)
-                )
-                for rep in interval_reps
-            )
-        if len(offset_labels):
-            current_offset = int(np.max(offset_labels)) + 1
+        cluster_labels[start:stop] = shifted.labels
+        if shifted.representatives:
+            representative_spectra.extend(shifted.representatives)
 
     _, counts = np.unique(cluster_labels, return_counts=True)
     n_clusters = int(np.count_nonzero(counts > 1))
@@ -514,29 +497,28 @@ def finalize_bucket(
         n_clusters,
         n_singletons,
     )
-    return cluster_labels, representative_spectra
+    return ClusterResult(cluster_labels, representative_spectra)
 
 
 def _run_pass1(
     chunk_tasks: Sequence[ChunkTask],
     tile_tasks: Sequence[TileTask],
+    options: ClusteringOptions,
+    *,
     n_buckets: int,
-    n_giants: int,
     n_workers: int,
     total_spectra: int,
-    total_cost: int,
-    clustering: ClusteringConfig,
-    consensus: ConsensusConfig,
-    min_mz: float,
-    max_mz: float,
-    compute_representatives: bool,
-    results_by_bucket: dict[int, list[TaggedIntervalResult]],
-) -> None:
+) -> dict[int, list[TaggedIntervalResult]]:
     """Run Pass 1 (giant tiles and normal chunks) with progress logs."""
+    results_by_bucket: dict[int, list[TaggedIntervalResult]] = {}
     n_pass1 = len(chunk_tasks) + len(tile_tasks)
     if n_pass1 == 0:
-        return
+        return results_by_bucket
 
+    n_giants = len({tile.giant_idx for tile in tile_tasks})
+    total_cost = sum(t.cost for t in chunk_tasks) + sum(
+        t.tile_cost for t in tile_tasks
+    )
     logger.info(
         "Clustering %d spectra across %d charge bucket(s) in %d task(s) "
         "(%d giant interval(s) tiled) on %d worker(s)...",
@@ -546,14 +528,8 @@ def _run_pass1(
         n_giants,
         n_workers,
     )
-    run_chunk = partial(
-        _cluster_chunk_tagged,
-        clustering=clustering,
-        consensus=consensus,
-        min_mz=min_mz,
-        max_mz=max_mz,
-        compute_representatives=compute_representatives,
-    )
+    run_chunk = partial(_cluster_chunk_tagged, options=options)
+    clustering = options.clustering
 
     def _jobs() -> Iterator[Any]:
         for tile in tile_tasks:
@@ -568,28 +544,21 @@ def _run_pass1(
     next_log_pct = 5
     start = time.time()
 
-    results = joblib.Parallel(
-        n_jobs=-1,
-        backend="loky",
-        verbose=0,
-        return_as="generator_unordered",
-    )(_jobs())
-    for done_tasks, result in enumerate(results, start=1):
+    for done_tasks, result in enumerate(_parallel_pool()(_jobs()), start=1):
         if result[0] == "chunk":
             _, bucket_id, cost, n_chunk, chunk_results = result
-            results_by_bucket[bucket_id].extend(chunk_results)
+            results_by_bucket.setdefault(bucket_id, []).extend(chunk_results)
             done_cost += cost
             done_spectra += n_chunk
         else:
             done_cost += result[2]
-        pct = 100.0 * done_cost / total_cost if total_cost else 100.0
+        pct = (
+            min(100.0, 100.0 * done_cost / total_cost) if total_cost else 100.0
+        )
         if pct >= next_log_pct or done_tasks == n_pass1:
             elapsed = time.time() - start
-            eta = (
-                elapsed * (total_cost - done_cost) / done_cost
-                if done_cost
-                else 0.0
-            )
+            remaining_cost = max(0.0, total_cost - done_cost)
+            eta = elapsed * remaining_cost / done_cost if done_cost else 0.0
             logger.info(
                 "Clustering progress: %3.0f%% | %d/%d tasks | "
                 "%d/%d spectra processed | elapsed %s | ETA ~%s",
@@ -603,14 +572,16 @@ def _run_pass1(
             )
             next_log_pct = (int(pct) // 5 + 1) * 5
 
+    return results_by_bucket
+
 
 def generate_clusters_multi(
     bucket_datasets: Sequence[lance.LanceDataset],
     clustering: ClusteringConfig,
     consensus: ConsensusConfig | None = None,
     *,
-    min_mz: float = 101.0,
-    max_mz: float = 1500.0,
+    min_mz: float = DEFAULT_MIN_MZ,
+    max_mz: float = DEFAULT_MAX_MZ,
     bucket_labels: Sequence[str] | None = None,
     compute_representatives: bool = True,
 ) -> list[ClusterResult]:
@@ -639,17 +610,23 @@ def generate_clusters_multi(
     Returns
     -------
     list[ClusterResult]
-        Per-dataset ``(labels, representative_spectra)`` results in the
-        same order as ``bucket_datasets``.
+        Per-dataset ``ClusterResult(labels, representatives)`` results
+        in the same order as ``bucket_datasets``.
     """
-    effective_consensus: ConsensusConfig = (
-        MedoidConsensusConfig() if consensus is None else consensus
+    options = ClusteringOptions(
+        clustering=clustering,
+        consensus=(
+            MedoidConsensusConfig() if consensus is None else consensus
+        ),
+        min_mz=min_mz,
+        max_mz=max_mz,
+        compute_representatives=compute_representatives,
     )
     labels_list = (
         list(bucket_labels)
         if bucket_labels is not None
         else [
-            _default_bucket_label(ds, i)
+            bucket_label_from_uri(ds.uri, str(i))
             for i, ds in enumerate(bucket_datasets)
         ]
     )
@@ -661,7 +638,7 @@ def generate_clusters_multi(
         _MIN_CLUSTER_SAMPLES,
     )
 
-    n_workers = max(1, int(joblib.effective_n_jobs(-1)))
+    n_workers = effective_n_workers()
     num_chunks = CHUNKS_PER_WORKER * n_workers
     threshold = tile_threshold(clustering.batch_size)
 
@@ -673,13 +650,7 @@ def generate_clusters_multi(
         zip(bucket_datasets, labels_list, strict=True)
     ):
         n, splits, normal_chunks, giant_specs = prepare_bucket_chunks(
-            dataset,
-            label,
-            clustering.precursor_tol.mass,
-            clustering.precursor_tol.mode,
-            clustering.batch_size,
-            num_chunks,
-            threshold,
+            dataset, label, clustering, num_chunks, threshold
         )
         prepared.append((n, splits))
         for specs in normal_chunks:
@@ -698,55 +669,31 @@ def generate_clusters_multi(
     # Schedule heaviest chunks first so small buckets backfill cleanly.
     chunk_tasks.sort(key=lambda task: task.cost, reverse=True)
 
-    results_by_bucket: dict[int, list[TaggedIntervalResult]] = defaultdict(
-        list
-    )
     memmap_paths: list[str] = []
     try:
         giants, tile_tasks = _allocate_giant_tiles(
             raw_giants, n_workers, memmap_paths
         )
-        total_cost = sum(t.cost for t in chunk_tasks) + sum(
-            g.spec.cost for g in giants
-        )
         total_spectra = sum(n for n, _ in prepared)
-
-        _run_pass1(
-            chunk_tasks=chunk_tasks,
-            tile_tasks=tile_tasks,
+        results_by_bucket = _run_pass1(
+            chunk_tasks,
+            tile_tasks,
+            options,
             n_buckets=len(bucket_datasets),
-            n_giants=len(giants),
             n_workers=n_workers,
             total_spectra=total_spectra,
-            total_cost=total_cost,
-            clustering=clustering,
-            consensus=effective_consensus,
-            min_mz=min_mz,
-            max_mz=max_mz,
-            compute_representatives=compute_representatives,
-            results_by_bucket=results_by_bucket,
         )
 
         if giants:
             logger.info("Finalizing %d giant interval(s)...", len(giants))
-            finalize_results = joblib.Parallel(
-                n_jobs=-1,
-                backend="loky",
-                verbose=0,
-                return_as="generator_unordered",
-            )(
-                joblib.delayed(_finalize_giant)(
-                    giant,
-                    clustering,
-                    effective_consensus,
-                    min_mz,
-                    max_mz,
-                    compute_representatives,
-                )
+            finalize_results = _parallel_pool()(
+                joblib.delayed(_finalize_giant)(giant, options)
                 for giant in giants
             )
             for bucket_id, task_id, result in finalize_results:
-                results_by_bucket[bucket_id].append((task_id, result))
+                results_by_bucket.setdefault(bucket_id, []).append(
+                    (task_id, result)
+                )
     finally:
         for path in memmap_paths:
             with contextlib.suppress(OSError):
@@ -754,7 +701,10 @@ def generate_clusters_multi(
 
     return [
         finalize_bucket(
-            n, splits, results_by_bucket[bucket_id], labels_list[bucket_id]
+            n,
+            splits,
+            results_by_bucket.get(bucket_id, []),
+            labels_list[bucket_id],
         )
         for bucket_id, (n, splits) in enumerate(prepared)
     ]
@@ -765,8 +715,8 @@ def generate_clusters(
     clustering: ClusteringConfig,
     consensus: ConsensusConfig | None = None,
     *,
-    min_mz: float = 101.0,
-    max_mz: float = 1500.0,
+    min_mz: float = DEFAULT_MIN_MZ,
+    max_mz: float = DEFAULT_MAX_MZ,
     bucket_label: str | None = None,
     compute_representatives: bool = True,
 ) -> ClusterResult:

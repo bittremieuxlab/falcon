@@ -3,25 +3,52 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Annotated, Any, Literal, Self
+from typing import TYPE_CHECKING, Annotated, Any, Literal, Self, TypeVar
 
 from pydantic import (
     BaseModel,
     BeforeValidator,
     ConfigDict,
     Field,
-    GetJsonSchemaHandler,
     model_validator,
 )
-from pydantic.json_schema import JsonSchemaValue
-from pydantic_core import core_schema
 
 from ..types import (
+    AUTO_SENTINEL,
     INT32_MAX,
+    NONE_SENTINEL,
     ChargeBucket,
     mz_bin_bounds,
-    parse_charge_buckets,
+    parse_optional_charge_buckets,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from pydantic import GetJsonSchemaHandler
+    from pydantic.json_schema import JsonSchemaValue
+    from pydantic_core import core_schema
+
+DEFAULT_MIN_MZ: float = 101.0
+DEFAULT_MAX_MZ: float = 1500.0
+
+__all__ = [
+    "DEFAULT_MAX_MZ",
+    "DEFAULT_MIN_MZ",
+    "AverageConsensusConfig",
+    "ClusteringConfig",
+    "ConfigError",
+    "ConsensusConfig",
+    "FalconConfig",
+    "FalconSettings",
+    "IOConfig",
+    "MedoidConsensusConfig",
+    "PartialIOConfig",
+    "PrecursorTolerance",
+    "PreprocessingConfig",
+]
+
+_T = TypeVar("_T")
 
 
 class ConfigError(ValueError):
@@ -50,7 +77,22 @@ class _AllowSentinelSchema:
 
 def _none_sentinel(value: Any) -> Any:
     """Normalize the TOML/CLI ``"none"`` sentinel to ``None``."""
-    return None if value == "none" else value
+    return None if value == NONE_SENTINEL else value
+
+
+def _optional(
+    parser: Callable[[Any], _T],
+    *,
+    allow_none_sentinel: bool = False,
+) -> Callable[[Any], _T | None]:
+    """Wrap ``parser`` to pass ``None`` (or ``"none"``) through."""
+
+    def _parse(value: Any) -> _T | None:
+        if value is None or (allow_none_sentinel and value == NONE_SENTINEL):
+            return None
+        return parser(value)
+
+    return _parse
 
 
 def _parse_path(value: Any) -> Path:
@@ -66,12 +108,6 @@ def _parse_path(value: Any) -> Path:
     raise ValueError(f"Expected a path string or Path, got {type(value)}")
 
 
-def _parse_optional_path(value: Any) -> Path | None:
-    """Parse an optional path, treating ``"none"`` as ``None``."""
-    normalized = _none_sentinel(value)
-    return None if normalized is None else _parse_path(normalized)
-
-
 def _parse_output_prefix(value: Any) -> Path:
     """Validate an output file prefix path (non-empty file name)."""
     path = _parse_path(value)
@@ -81,11 +117,6 @@ def _parse_output_prefix(value: Any) -> Path:
             f"got {str(path)!r}"
         )
     return path
-
-
-def _parse_optional_output_prefix(value: Any) -> Path | None:
-    """Validate an optional output file prefix path."""
-    return None if value is None else _parse_output_prefix(value)
 
 
 def _parse_input_filenames(value: Any) -> tuple[str, ...]:
@@ -104,38 +135,33 @@ def _parse_input_filenames(value: Any) -> tuple[str, ...]:
     return tuple(result)
 
 
-def _parse_optional_input_filenames(value: Any) -> tuple[str, ...] | None:
-    """Validate an optional sequence of input file patterns."""
-    return None if value is None else _parse_input_filenames(value)
+_NonNegFloat = Annotated[float, Field(ge=0.0, allow_inf_nan=False)]
+_PosFloat = Annotated[float, Field(gt=0.0, allow_inf_nan=False)]
 
-
-NonNegFloat = Annotated[float, Field(ge=0.0, allow_inf_nan=False)]
-PosFloat = Annotated[float, Field(gt=0.0, allow_inf_nan=False)]
-
-OptionalNonNegFloat = Annotated[
-    NonNegFloat | None,
+_OptionalNonNegFloat = Annotated[
+    _NonNegFloat | None,
     BeforeValidator(_none_sentinel),
-    _AllowSentinelSchema("none"),
+    _AllowSentinelSchema(NONE_SENTINEL),
 ]
-OptionalPosFloat = Annotated[
-    PosFloat | None,
+_OptionalPosFloat = Annotated[
+    _PosFloat | None,
     BeforeValidator(_none_sentinel),
-    _AllowSentinelSchema("none"),
+    _AllowSentinelSchema(NONE_SENTINEL),
 ]
-OptionalPosInt = Annotated[
+_OptionalPosInt = Annotated[
     Annotated[int, Field(ge=1)] | None,
     BeforeValidator(_none_sentinel),
-    _AllowSentinelSchema("none"),
+    _AllowSentinelSchema(NONE_SENTINEL),
 ]
-OptionalWorkDir = Annotated[
+_OptionalWorkDir = Annotated[
     Path | None,
-    BeforeValidator(_parse_optional_path),
-    _AllowSentinelSchema("none"),
+    BeforeValidator(_optional(_parse_path, allow_none_sentinel=True)),
+    _AllowSentinelSchema(NONE_SENTINEL),
 ]
-OptionalChargeBuckets = Annotated[
+_OptionalChargeBuckets = Annotated[
     tuple[ChargeBucket, ...] | None,
-    BeforeValidator(parse_charge_buckets),
-    _AllowSentinelSchema("auto"),
+    BeforeValidator(parse_optional_charge_buckets),
+    _AllowSentinelSchema(AUTO_SENTINEL),
 ]
 
 _STRICT_MODEL_CONFIG = ConfigDict(frozen=True, extra="forbid", strict=True)
@@ -146,7 +172,7 @@ class PrecursorTolerance(BaseModel):
 
     model_config = _STRICT_MODEL_CONFIG
 
-    mass: NonNegFloat = 20.0
+    mass: _NonNegFloat = 20.0
     mode: Literal["ppm", "Da"] = "ppm"
 
 
@@ -156,14 +182,14 @@ class PreprocessingConfig(BaseModel):
     model_config = _STRICT_MODEL_CONFIG
 
     min_peaks: Annotated[int, Field(ge=1)] = 5
-    min_mz_range: NonNegFloat = 250.0
-    min_mz: NonNegFloat = 101.0
-    max_mz: PosFloat = 1500.0
-    remove_precursor_tol: OptionalPosFloat = 1.5
+    min_mz_range: _NonNegFloat = 250.0
+    min_mz: _NonNegFloat = DEFAULT_MIN_MZ
+    max_mz: _PosFloat = DEFAULT_MAX_MZ
+    remove_precursor_tol: _OptionalPosFloat = 1.5
     min_intensity: Annotated[
         float, Field(ge=0.0, lt=1.0, allow_inf_nan=False)
     ] = 0.01
-    max_peaks_used: OptionalPosInt = 50
+    max_peaks_used: _OptionalPosInt = 50
     scaling: Literal["off", "root", "log", "rank"] = "off"
 
     @model_validator(mode="after")
@@ -197,15 +223,15 @@ class ClusteringConfig(BaseModel):
     precursor_tol: PrecursorTolerance = Field(
         default_factory=PrecursorTolerance
     )
-    rt_tol: OptionalNonNegFloat = None
-    fragment_tol: PosFloat = 0.05
+    rt_tol: _OptionalNonNegFloat = None
+    fragment_tol: _PosFloat = 0.05
     linkage: Literal["single", "complete", "average"] = "complete"
     distance_threshold: Annotated[
         float, Field(gt=0.0, lt=1.0, allow_inf_nan=False)
     ] = 0.1
     min_matched_peaks: Annotated[int, Field(ge=0)] = 0
     batch_size: Annotated[int, Field(ge=1)] = 2**15
-    precursor_charge_buckets: OptionalChargeBuckets = None
+    precursor_charge_buckets: _OptionalChargeBuckets = None
 
 
 class MedoidConsensusConfig(BaseModel):
@@ -222,8 +248,8 @@ class AverageConsensusConfig(BaseModel):
     model_config = _STRICT_MODEL_CONFIG
 
     method: Literal["average"] = "average"
-    outlier_cutoff_lower: PosFloat = 1.5
-    outlier_cutoff_upper: PosFloat = 1.5
+    outlier_cutoff_lower: _PosFloat = 1.5
+    outlier_cutoff_upper: _PosFloat = 1.5
 
 
 ConsensusConfig = Annotated[
@@ -237,7 +263,7 @@ class _BaseIOConfig(BaseModel):
 
     model_config = _STRICT_MODEL_CONFIG
 
-    work_dir: OptionalWorkDir = None
+    work_dir: _OptionalWorkDir = None
     overwrite: bool = False
     export_representatives: bool = False
 
@@ -247,11 +273,11 @@ class PartialIOConfig(_BaseIOConfig):
 
     input_filenames: Annotated[
         tuple[str, ...] | None,
-        BeforeValidator(_parse_optional_input_filenames),
+        BeforeValidator(_optional(_parse_input_filenames)),
     ] = None
     output_filename: Annotated[
         Path | None,
-        BeforeValidator(_parse_optional_output_prefix),
+        BeforeValidator(_optional(_parse_output_prefix)),
     ] = None
 
 
@@ -317,22 +343,6 @@ class _BaseFalconConfig(BaseModel):
                 f"fragment_tol={frag_tol} exceeds int32 maximum ({INT32_MAX})"
             )
         return self
-
-    def to_toml(
-        self: FalconSettings | FalconConfig, *, work_dir: Path | None = None
-    ) -> str:
-        """Serialize resolved config as deterministic TOML text."""
-        from .serialize import format_toml
-
-        return format_toml(self, work_dir=work_dir)
-
-    def to_metadata_lines(
-        self: FalconSettings | FalconConfig, *, work_dir: Path | None = None
-    ) -> list[str]:
-        """Return canonical ``section.key = value`` provenance lines."""
-        from .serialize import format_metadata_lines
-
-        return format_metadata_lines(self, work_dir=work_dir)
 
 
 class FalconSettings(_BaseFalconConfig):

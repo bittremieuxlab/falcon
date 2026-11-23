@@ -5,10 +5,10 @@ from __future__ import annotations
 from importlib.metadata import PackageNotFoundError, version
 from typing import TYPE_CHECKING, Any
 
-pkg_name = "falcon-ms"
+_PKG_NAME = "falcon-ms"
 
 try:
-    __version__ = version(pkg_name)
+    __version__ = version(_PKG_NAME)
 except PackageNotFoundError:
     __version__ = "0.0.0.dev0"
 

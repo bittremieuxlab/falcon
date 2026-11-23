@@ -2,14 +2,12 @@
 
 import logging
 import math
-import os
 
 import numpy as np
+import pyteomics.mzml
 import pytest
 
 from falcon.ms_io import mzml_io
-
-DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
 
 
 def _mzml_dict(scan=None, ion_extra=None, extra_ions=None):
@@ -18,7 +16,8 @@ def _mzml_dict(scan=None, ion_extra=None, extra_ions=None):
     if extra_ions:
         ions.extend(extra_ions)
     return {
-        "id": "run:scan:5",
+        "id": "controllerType=0 controllerNumber=1 scan=5",
+        "ms level": 2,
         "m/z array": np.array([100.0, 200.0], dtype=np.float32),
         "intensity array": np.array([1.0, 2.0], dtype=np.float32),
         "scanList": {"scan": [scan if scan is not None else {}]},
@@ -30,9 +29,12 @@ def _mzml_dict(scan=None, ion_extra=None, extra_ions=None):
 
 class TestMzmlParseSpectrum:
     def test_missing_rt_is_nan(self):
-        spec = mzml_io._parse_spectrum(
-            _mzml_dict(ion_extra={"charge state": 2})
-        )
+        raw = _mzml_dict(ion_extra={"charge state": 2})
+        orig_id = raw["id"]
+        spec = mzml_io._parse_spectrum(raw, "run:scan:5")
+        assert spec.identifier == "run:scan:5"
+        assert raw["id"] == orig_id
+        assert spec.retention_time is not None
         assert math.isnan(spec.retention_time)
         assert spec.precursor_mz == pytest.approx(500.0)
         assert spec.precursor_charge == 2
@@ -41,13 +43,15 @@ class TestMzmlParseSpectrum:
         spec = mzml_io._parse_spectrum(
             _mzml_dict(
                 scan={"scan start time": 6.0}, ion_extra={"charge state": 2}
-            )
+            ),
+            "run:scan:5",
         )
         assert spec.retention_time == pytest.approx(6.0)
 
     def test_possible_charge_state_fallback(self):
         spec = mzml_io._parse_spectrum(
-            _mzml_dict(ion_extra={"possible charge state": 3})
+            _mzml_dict(ion_extra={"possible charge state": 3}),
+            "run:scan:5",
         )
         assert spec.precursor_charge == 3
 
@@ -55,12 +59,13 @@ class TestMzmlParseSpectrum:
         spec = mzml_io._parse_spectrum(
             _mzml_dict(
                 ion_extra={"charge state": 2, "possible charge state": 3}
-            )
+            ),
+            "run:scan:5",
         )
         assert spec.precursor_charge == 2
 
     def test_missing_charge_is_none(self):
-        spec = mzml_io._parse_spectrum(_mzml_dict())
+        spec = mzml_io._parse_spectrum(_mzml_dict(), "run:scan:5")
         assert spec.precursor_charge is None
 
     def test_multiple_selected_ions_uses_first(self):
@@ -68,16 +73,16 @@ class TestMzmlParseSpectrum:
             _mzml_dict(
                 ion_extra={"charge state": 2},
                 extra_ions=[{"selected ion m/z": 600.0, "charge state": 3}],
-            )
+            ),
+            "run:scan:5",
         )
         assert spec.precursor_mz == pytest.approx(500.0)
         assert spec.precursor_charge == 2
 
 
 class TestMzmlGetSpectra:
-    def test_sample_fixture_filters_ms1_and_extracts_metadata(self):
-        path = os.path.join(DATA_DIR, "sample.mzml")
-        spectra = list(mzml_io.get_spectra(path))
+    def test_sample_fixture_filters_ms1_and_extracts_metadata(self, data_dir):
+        spectra = list(mzml_io.get_spectra(data_dir / "sample.mzml"))
         assert len(spectra) == 1
         s = spectra[0]
         assert s.identifier == "sample:scan:2"
@@ -86,6 +91,25 @@ class TestMzmlGetSpectra:
         assert s.retention_time == pytest.approx(6.0)
         np.testing.assert_allclose(s.mz, [100.0])
         np.testing.assert_allclose(s.intensity, [100.0])
+
+    def test_get_spectra_does_not_mutate_spectrum_dict_id(self, monkeypatch):
+        raw = _mzml_dict(ion_extra={"charge state": 2})
+        orig_id = raw["id"]
+
+        class _FakeMzML:
+            def __init__(self, _source):
+                pass
+
+            def __enter__(self):
+                return iter([raw])
+
+            def __exit__(self, *_args):
+                return False
+
+        monkeypatch.setattr(pyteomics.mzml, "MzML", _FakeMzML)
+        spectra = list(mzml_io.get_spectra("run.mzml"))
+        assert [s.identifier for s in spectra] == ["run:scan:5"]
+        assert raw["id"] == orig_id
 
     def test_retains_ms3_and_skips_missing_ms_level(
         self, tmp_path, mzml_writer
@@ -116,7 +140,7 @@ class TestMzmlGetSpectra:
                 },
             ],
         )
-        spectra = list(mzml_io.get_spectra(str(path)))
+        spectra = list(mzml_io.get_spectra(path))
         assert [s.identifier for s in spectra] == ["levels:scan:3"]
         assert spectra[0].precursor_mz == pytest.approx(450.0)
         assert spectra[0].retention_time == pytest.approx(12.5)
@@ -156,7 +180,7 @@ class TestMzmlGetSpectra:
             ],
         )
         with caplog.at_level(logging.WARNING, logger="falcon"):
-            spectra = list(mzml_io.get_spectra(str(path)))
+            spectra = list(mzml_io.get_spectra(path))
         assert [s.identifier for s in spectra] == ["skip:scan:3"]
         assert any("no 'scan=' field" in r.message for r in caplog.records)
 
@@ -166,19 +190,18 @@ class TestMzmlGetSpectra:
         corrupt = tmp_path / "corrupt.mzml"
         corrupt.write_text("<mzML><run><spectrumList><spectrum")
         with caplog.at_level(logging.WARNING, logger="falcon"):
-            spectra = list(mzml_io.get_spectra(str(corrupt)))
+            spectra = list(mzml_io.get_spectra(corrupt))
         assert spectra == []
         assert any("Failed to read file" in r.message for r in caplog.records)
 
-    def test_reads_from_open_file_object(self):
-        path = os.path.join(DATA_DIR, "sample.mzml")
-        with open(path, "rb") as fh:
+    def test_reads_from_open_file_object(self, data_dir):
+        with (data_dir / "sample.mzml").open("rb") as fh:
             spectra = list(mzml_io.get_spectra(fh))
         assert len(spectra) == 1
         assert spectra[0].identifier == "sample:scan:2"
 
     def test_skips_spectrum_with_empty_selected_ion_list(self, tmp_path):
-        # Empty <selectedIonList count="0"/> triggers IndexError in parser.
+        # Empty <selectedIonList count="0"/> triggers IndexError.
         bad_mzml = tmp_path / "empty_ion.mzml"
         bad_mzml.write_text(
             '<?xml version="1.0" encoding="utf-8"?>\n'
@@ -196,6 +219,7 @@ class TestMzmlGetSpectra:
             "   </spectrum>\n"
             "  </spectrumList>\n"
             " </run>\n"
-            "</mzML>\n"
+            "</mzML>\n",
+            encoding="utf-8",
         )
-        assert list(mzml_io.get_spectra(str(bad_mzml))) == []
+        assert list(mzml_io.get_spectra(bad_mzml)) == []

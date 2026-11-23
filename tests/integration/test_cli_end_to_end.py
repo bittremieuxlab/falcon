@@ -1,18 +1,18 @@
 """End-to-end CLI integration tests on toy peak files."""
 
 import json
-import os
 import subprocess
 import sys
-import tempfile
 import tomllib
 
 import pandas as pd
 import pytest
 
 import falcon
-from falcon import ms_io
+from falcon import ms_io, staging
 from falcon.cli import main as falcon_main
+
+pytestmark = pytest.mark.integration
 
 PEAKS_A = [
     (150.0, 100.0),
@@ -35,38 +35,21 @@ LOW_QUALITY_PEAKS = [(150.0, 100.0), (160.0, 200.0)]
 
 class TestCliEndToEnd:
     def test_multi_charge_mgf_with_quality_filtering_and_representatives(
-        self, tmp_path, mgf_writer, monkeypatch
+        self, tmp_path, mgf_block, mgf_writer, track_mkdtemp
     ):
         """Toy multi-charge MGF: clusters per charge, filters low-q
         spectra, natural-sorts CSV, exports readable MGF reps, and
         cleans up its temporary work_dir.
         """
-        created_tmp_dirs: list[str] = []
-        orig_mkdtemp = tempfile.mkdtemp
-
-        def _tracking_mkdtemp(*args, **kwargs):
-            d = orig_mkdtemp(*args, **kwargs)
-            created_tmp_dirs.append(d)
-            return d
-
-        monkeypatch.setattr(tempfile, "mkdtemp", _tracking_mkdtemp)
-
-        format_mgf_spectrum, write_mgf = mgf_writer
-        mgf = write_mgf(
+        mgf = mgf_writer(
             tmp_path / "toy.mgf",
             [
-                format_mgf_spectrum(PEAKS_A, 500.0, charge=2, scan=1, rt=10.0),
-                format_mgf_spectrum(
-                    PEAKS_A, 500.002, charge=2, scan=10, rt=11.0
-                ),
-                format_mgf_spectrum(PEAKS_B, 600.0, charge=2, scan=2, rt=20.0),
-                format_mgf_spectrum(PEAKS_A, 500.0, charge=3, scan=3, rt=10.0),
-                format_mgf_spectrum(
-                    PEAKS_A, 500.0, charge=None, scan=4, rt=10.0
-                ),
-                format_mgf_spectrum(
-                    LOW_QUALITY_PEAKS, 500.0, charge=2, scan=5, rt=10.0
-                ),
+                mgf_block(PEAKS_A, 500.0, charge=2, scan=1, rt=10.0),
+                mgf_block(PEAKS_A, 500.002, charge=2, scan=10, rt=11.0),
+                mgf_block(PEAKS_B, 600.0, charge=2, scan=2, rt=20.0),
+                mgf_block(PEAKS_A, 500.0, charge=3, scan=3, rt=10.0),
+                mgf_block(PEAKS_A, 500.0, charge=None, scan=4, rt=10.0),
+                mgf_block(LOW_QUALITY_PEAKS, 500.0, charge=2, scan=5, rt=10.0),
             ],
         )
         out_prefix = tmp_path / "results.v2"
@@ -74,8 +57,8 @@ class TestCliEndToEnd:
             [str(mgf), str(out_prefix), "--export-representatives"]
         )
         assert rc == 0
-        assert len(created_tmp_dirs) == 1
-        assert not os.path.exists(created_tmp_dirs[0])
+        assert len(track_mkdtemp) == 1
+        assert not track_mkdtemp[0].exists()
 
         df = pd.read_csv(f"{out_prefix}.csv", comment="#")
         assert list(df["identifier"]) == [
@@ -168,19 +151,18 @@ class TestCliEndToEnd:
         assert by_id["run_a:scan:2"] != by_id["run_b:scan:2"]
 
     def test_explicit_charge_buckets_cross_charge_and_drop_unmapped(
-        self, tmp_path, mgf_writer
+        self, tmp_path, mgf_block, mgf_writer
     ):
         """Grouped bucket '[2, 3]' clusters charges 2 and 3 together;
         omitting 'other' drops charge 4 spectra.
         """
-        format_mgf_spectrum, write_mgf = mgf_writer
-        mgf = write_mgf(
+        mgf = mgf_writer(
             tmp_path / "charges.mgf",
             [
-                format_mgf_spectrum(PEAKS_A, 500.0, charge=2, scan=1),
-                format_mgf_spectrum(PEAKS_A, 500.0, charge=3, scan=2),
-                format_mgf_spectrum(PEAKS_A, 500.0, charge=None, scan=3),
-                format_mgf_spectrum(PEAKS_A, 500.0, charge=4, scan=4),
+                mgf_block(PEAKS_A, 500.0, charge=2, scan=1),
+                mgf_block(PEAKS_A, 500.0, charge=3, scan=2),
+                mgf_block(PEAKS_A, 500.0, charge=None, scan=3),
+                mgf_block(PEAKS_A, 500.0, charge=4, scan=4),
             ],
         )
         out_prefix = tmp_path / "grouped"
@@ -212,24 +194,13 @@ class TestCliEndToEnd:
         )
 
     def test_work_dir_cache_reuse_mismatch_overwrite_and_abort_cleanup(
-        self, tmp_path, mgf_writer, monkeypatch
+        self, tmp_path, mgf_block, mgf_writer, track_mkdtemp
     ):
-        created_tmp_dirs: list[str] = []
-        orig_mkdtemp = tempfile.mkdtemp
-
-        def _tracking_mkdtemp(*args, **kwargs):
-            d = orig_mkdtemp(*args, **kwargs)
-            created_tmp_dirs.append(d)
-            return d
-
-        monkeypatch.setattr(tempfile, "mkdtemp", _tracking_mkdtemp)
-
-        format_mgf_spectrum, write_mgf = mgf_writer
-        mgf = write_mgf(
+        mgf = mgf_writer(
             tmp_path / "cache.mgf",
             [
-                format_mgf_spectrum(PEAKS_A, 500.0, charge=2, scan=1, rt=10.0),
-                format_mgf_spectrum(PEAKS_A, 500.0, charge=2, scan=2, rt=11.0),
+                mgf_block(PEAKS_A, 500.0, charge=2, scan=1, rt=10.0),
+                mgf_block(PEAKS_A, 500.0, charge=2, scan=2, rt=11.0),
             ],
         )
         work_dir = tmp_path / "work"
@@ -249,7 +220,9 @@ class TestCliEndToEnd:
             )
             == 0
         )
-        assert (work_dir / "spectra" / "staging_cache.json").is_file()
+        assert (
+            work_dir / "spectra" / staging.STAGING_CACHE_FILENAME
+        ).is_file()
 
         # Run 2 reuses cache cleanly across a distance_threshold sweep.
         assert (
@@ -285,8 +258,8 @@ class TestCliEndToEnd:
         # Run 4 without --overwrite aborts with exit code 1 AND cleans up
         # its automatic temporary work_dir.
         assert falcon_main([str(mgf), str(out1)]) == 1
-        assert len(created_tmp_dirs) == 1
-        assert not os.path.exists(created_tmp_dirs[0])
+        assert len(track_mkdtemp) == 1
+        assert not track_mkdtemp[0].exists()
 
         # Run 5 with --overwrite refreshes cache and succeeds.
         assert (
@@ -303,24 +276,19 @@ class TestCliEndToEnd:
         )
 
     def test_hierarchical_toml_extends_average_rt_tol_and_save_replay(
-        self, tmp_path, mgf_writer
+        self, tmp_path, mgf_block, mgf_writer
     ):
         """End-to-end run with hierarchical TOML extends, RT splitting,
         root scaling, averaged representatives, and --save-config replay.
         """
-        format_mgf_spectrum, write_mgf = mgf_writer
-        mgf = write_mgf(
+        mgf = mgf_writer(
             tmp_path / "avg.mgf",
             [
-                format_mgf_spectrum(PEAKS_A, 500.0, charge=2, scan=1, rt=10.0),
-                format_mgf_spectrum(PEAKS_A, 500.0, charge=2, scan=2, rt=11.0),
-                format_mgf_spectrum(PEAKS_A, 500.0, charge=2, scan=3, rt=12.0),
-                format_mgf_spectrum(
-                    PEAKS_A, 500.0, charge=2, scan=4, rt=200.0
-                ),
-                format_mgf_spectrum(
-                    PEAKS_A, 500.0, charge=2, scan=5, rt=201.0
-                ),
+                mgf_block(PEAKS_A, 500.0, charge=2, scan=1, rt=10.0),
+                mgf_block(PEAKS_A, 500.0, charge=2, scan=2, rt=11.0),
+                mgf_block(PEAKS_A, 500.0, charge=2, scan=3, rt=12.0),
+                mgf_block(PEAKS_A, 500.0, charge=2, scan=4, rt=200.0),
+                mgf_block(PEAKS_A, 500.0, charge=2, scan=5, rt=201.0),
             ],
         )
         base_toml = tmp_path / "base.toml"
@@ -364,7 +332,12 @@ class TestCliEndToEnd:
 
         reps = list(ms_io.get_spectra(f"{out_prefix}.mgf"))
         assert len(reps) == 2
-        assert sorted(round(r.retention_time, 1) for r in reps) == [
+        assert all(r.retention_time is not None for r in reps)
+        assert sorted(
+            round(float(r.retention_time), 1)
+            for r in reps
+            if r.retention_time is not None
+        ) == [
             11.0,
             200.5,
         ]
@@ -397,11 +370,10 @@ class TestCliEndToEnd:
         )
         assert f"falcon {falcon.__version__}" in proc.stdout
 
-    def test_programmatic_top_level_api(self, tmp_path, mgf_writer):
-        format_mgf_spectrum, write_mgf = mgf_writer
-        mgf = write_mgf(
+    def test_programmatic_top_level_api(self, tmp_path, mgf_block, mgf_writer):
+        mgf = mgf_writer(
             tmp_path / "api.mgf",
-            [format_mgf_spectrum(PEAKS_A, 500.0, charge=2, scan=1, rt=10.0)],
+            [mgf_block(PEAKS_A, 500.0, charge=2, scan=1, rt=10.0)],
         )
         cfg = falcon.load_config(
             overrides={
@@ -416,12 +388,11 @@ class TestCliEndToEnd:
         assert list(df["identifier"]) == ["api:scan:1"]
 
     def test_all_spectra_rejected_produces_valid_empty_outputs(
-        self, tmp_path, mgf_writer
+        self, tmp_path, mgf_block, mgf_writer
     ):
-        format_mgf_spectrum, write_mgf = mgf_writer
-        mgf = write_mgf(
+        mgf = mgf_writer(
             tmp_path / "lowq.mgf",
-            [format_mgf_spectrum(LOW_QUALITY_PEAKS, 500.0, charge=2, scan=1)],
+            [mgf_block(LOW_QUALITY_PEAKS, 500.0, charge=2, scan=1)],
         )
         out_prefix = tmp_path / "empty_run"
         rc = falcon_main(
@@ -433,29 +404,18 @@ class TestCliEndToEnd:
         assert (tmp_path / "empty_run.mgf").is_file()
 
     def test_missing_input_glob_and_unwritable_output_fail_and_cleanup(
-        self, tmp_path, mgf_writer, monkeypatch
+        self, tmp_path, mgf_block, mgf_writer, track_mkdtemp
     ):
-        created_tmp_dirs: list[str] = []
-        orig_mkdtemp = tempfile.mkdtemp
-
-        def _tracking_mkdtemp(*args, **kwargs):
-            d = orig_mkdtemp(*args, **kwargs)
-            created_tmp_dirs.append(d)
-            return d
-
-        monkeypatch.setattr(tempfile, "mkdtemp", _tracking_mkdtemp)
-
-        format_mgf_spectrum, write_mgf = mgf_writer
         with pytest.raises(FileNotFoundError):
             falcon_main(
                 [str(tmp_path / "missing_*.mgf"), str(tmp_path / "out")]
             )
-        assert not os.path.exists(created_tmp_dirs[-1])
+        assert not track_mkdtemp[-1].exists()
 
-        mgf = write_mgf(
+        mgf = mgf_writer(
             tmp_path / "ok.mgf",
-            [format_mgf_spectrum(PEAKS_A, 500.0, charge=2, scan=1)],
+            [mgf_block(PEAKS_A, 500.0, charge=2, scan=1)],
         )
         with pytest.raises(FileNotFoundError):
             falcon_main([str(mgf), str(tmp_path / "no_such_dir" / "out")])
-        assert not os.path.exists(created_tmp_dirs[-1])
+        assert not track_mkdtemp[-1].exists()

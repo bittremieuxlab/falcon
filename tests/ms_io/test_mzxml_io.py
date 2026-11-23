@@ -2,14 +2,12 @@
 
 import logging
 import math
-import os
 
 import numpy as np
+import pyteomics.mzxml
 import pytest
 
 from falcon.ms_io import mzxml_io
-
-DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
 
 
 def _mzxml_dict(extra_precursor=None, rt=None, more_precursors=None):
@@ -18,7 +16,8 @@ def _mzxml_dict(extra_precursor=None, rt=None, more_precursors=None):
     if more_precursors:
         precursors.extend(more_precursors)
     d = {
-        "id": "run:scan:7",
+        "id": "7",
+        "msLevel": 2,
         "m/z array": np.array([100.0, 200.0], dtype=np.float32),
         "intensity array": np.array([1.0, 2.0], dtype=np.float32),
         "precursorMz": precursors,
@@ -30,14 +29,20 @@ def _mzxml_dict(extra_precursor=None, rt=None, more_precursors=None):
 
 class TestMzxmlParseSpectrum:
     def test_missing_rt_and_charge(self):
-        spec = mzxml_io._parse_spectrum(_mzxml_dict())
+        raw = _mzxml_dict()
+        orig_id = raw["id"]
+        spec = mzxml_io._parse_spectrum(raw, "run:scan:7")
+        assert spec.identifier == "run:scan:7"
+        assert raw["id"] == orig_id
+        assert spec.retention_time is not None
         assert math.isnan(spec.retention_time)
         assert spec.precursor_mz == pytest.approx(400.0)
         assert spec.precursor_charge is None
 
     def test_rt_and_charge_present(self):
         spec = mzxml_io._parse_spectrum(
-            _mzxml_dict(extra_precursor={"precursorCharge": 2}, rt=6.0)
+            _mzxml_dict(extra_precursor={"precursorCharge": 2}, rt=6.0),
+            "run:scan:7",
         )
         assert spec.retention_time == pytest.approx(6.0)
         assert spec.precursor_charge == 2
@@ -47,16 +52,16 @@ class TestMzxmlParseSpectrum:
             _mzxml_dict(
                 extra_precursor={"precursorCharge": 2},
                 more_precursors=[{"precursorMz": 550.0, "precursorCharge": 3}],
-            )
+            ),
+            "run:scan:7",
         )
         assert spec.precursor_mz == pytest.approx(400.0)
         assert spec.precursor_charge == 2
 
 
 class TestMzxmlGetSpectra:
-    def test_sample_fixture_filters_ms1_and_extracts_metadata(self):
-        path = os.path.join(DATA_DIR, "sample.mzxml")
-        spectra = list(mzxml_io.get_spectra(path))
+    def test_sample_fixture_filters_ms1_and_extracts_metadata(self, data_dir):
+        spectra = list(mzxml_io.get_spectra(data_dir / "sample.mzxml"))
         assert len(spectra) == 1
         s = spectra[0]
         assert s.identifier == "sample:scan:2"
@@ -67,6 +72,31 @@ class TestMzxmlGetSpectra:
         assert s.retention_time == pytest.approx(0.1)
         np.testing.assert_allclose(s.mz, [160.0])
         np.testing.assert_allclose(s.intensity, [10.0])
+
+    def test_get_spectra_does_not_mutate_spectrum_dict_id(self, monkeypatch):
+        raw = _mzxml_dict(extra_precursor={"precursorCharge": 2})
+        orig_id = raw["id"]
+
+        class _FakeMzXML:
+            def __init__(self, _source):
+                pass
+
+            def __enter__(self):
+                return iter([raw])
+
+            def __exit__(self, *_args):
+                return False
+
+        monkeypatch.setattr(pyteomics.mzxml, "MzXML", _FakeMzXML)
+        spectra = list(mzxml_io.get_spectra("run.mzxml"))
+        assert [s.identifier for s in spectra] == ["run:scan:7"]
+        assert raw["id"] == orig_id
+
+    def test_reads_from_open_file_object(self, data_dir):
+        with (data_dir / "sample.mzxml").open("rb") as fh:
+            spectra = list(mzxml_io.get_spectra(fh))
+        assert len(spectra) == 1
+        assert spectra[0].identifier == "sample:scan:2"
 
     def test_retains_ms3_and_skips_ms1(self, tmp_path, mzxml_writer):
         path = mzxml_writer(
@@ -89,7 +119,7 @@ class TestMzxmlGetSpectra:
                 },
             ],
         )
-        spectra = list(mzxml_io.get_spectra(str(path)))
+        spectra = list(mzxml_io.get_spectra(path))
         assert [s.identifier for s in spectra] == ["levels:scan:3"]
         assert spectra[0].retention_time == pytest.approx(1.0)
 
@@ -116,7 +146,7 @@ class TestMzxmlGetSpectra:
                 },
             ],
         )
-        spectra = list(mzxml_io.get_spectra(str(path)))
+        spectra = list(mzxml_io.get_spectra(path))
         assert [s.identifier for s in spectra] == ["bad:scan:3"]
 
     def test_malformed_xml_logs_warning_instead_of_crashing(
@@ -125,7 +155,7 @@ class TestMzxmlGetSpectra:
         corrupt = tmp_path / "corrupt.mzxml"
         corrupt.write_text("<mzXML><msRun><scan num='1'")
         with caplog.at_level(logging.WARNING, logger="falcon"):
-            spectra = list(mzxml_io.get_spectra(str(corrupt)))
+            spectra = list(mzxml_io.get_spectra(corrupt))
         assert spectra == []
         assert any("Failed to read file" in r.message for r in caplog.records)
 
@@ -155,5 +185,5 @@ class TestMzxmlGetSpectra:
                 },
             ],
         )
-        spectra = list(mzxml_io.get_spectra(str(path)))
+        spectra = list(mzxml_io.get_spectra(path))
         assert [s.identifier for s in spectra] == ["empty_charge:scan:5"]

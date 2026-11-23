@@ -5,7 +5,7 @@ from __future__ import annotations
 import numba as nb
 import numpy as np
 
-from ..types import SpectrumTuple
+__all__ = ["cosine_fast_arrays"]
 
 
 @nb.njit(cache=True, fastmath=True, boundscheck=False)
@@ -14,7 +14,7 @@ def cosine_fast_arrays(
     intensity1: np.ndarray,
     mz2: np.ndarray,
     intensity2: np.ndarray,
-    fragment_mz_tolerance: float,
+    fragment_tol: float,
 ) -> tuple[float, int]:
     """
     Compute greedy one-to-one cosine similarity over peak arrays.
@@ -28,7 +28,7 @@ def cosine_fast_arrays(
         First spectrum's sorted fragment m/z and unit-norm intensities.
     mz2, intensity2 : np.ndarray
         Second spectrum's sorted fragment m/z and unit-norm intensities.
-    fragment_mz_tolerance : float
+    fragment_tol : float
         Maximum absolute m/z difference (in Da, inclusive) allowed for
         two fragment peaks to match.
 
@@ -45,12 +45,10 @@ def cosine_fast_arrays(
     for i in range(n1):
         peak_mz = mz1[i]
         peak_intensity = intensity1[i]
-        while other_idx < n2 - 1 and (
-            peak_mz - fragment_mz_tolerance > mz2[other_idx]
-        ):
+        while other_idx < n2 - 1 and peak_mz - fragment_tol > mz2[other_idx]:
             other_idx += 1
         j = other_idx
-        while j < n2 and abs(peak_mz - mz2[j]) <= fragment_mz_tolerance:
+        while j < n2 and abs(peak_mz - mz2[j]) <= fragment_tol:
             # Negate score so plain tuple sort orders by descending
             # score with ascending (i, j) tie-breaking and stays
             # Numba-cacheable (no key-lambda closure).
@@ -72,37 +70,3 @@ def cosine_fast_arrays(
 
     score = max(0.0, min(score, 1.0))
     return score, n_matches
-
-
-@nb.njit(fastmath=True, boundscheck=False)
-def cosine_fast(
-    spec: SpectrumTuple,
-    spec_other: SpectrumTuple,
-    fragment_mz_tolerance: float,
-) -> tuple[float, int]:
-    """
-    Compute greedy one-to-one cosine similarity between two spectra.
-
-    Parameters
-    ----------
-    spec : SpectrumTuple
-        First spectrum tuple.
-    spec_other : SpectrumTuple
-        Second spectrum tuple.
-    fragment_mz_tolerance : float
-        Maximum absolute m/z difference (in Da, inclusive) allowed for
-        two fragment peaks to match.
-
-    Returns
-    -------
-    tuple[float, int]
-        Cosine similarity clamped to ``[0.0, 1.0]`` and the number of
-        matched peak pairs.
-    """
-    return cosine_fast_arrays(
-        spec.mz,
-        spec.intensity,
-        spec_other.mz,
-        spec_other.intensity,
-        fragment_mz_tolerance,
-    )

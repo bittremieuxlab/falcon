@@ -7,10 +7,9 @@ import json
 import logging
 import sys
 import textwrap
-from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from pydantic import ValidationError
 
@@ -19,16 +18,34 @@ from .config import (
     AverageConsensusConfig,
     ClusteringConfig,
     ConfigError,
-    FalconConfig,
-    FalconSettings,
+    IOConfig,
     MedoidConsensusConfig,
     PreprocessingConfig,
     build_json_schema,
+    format_toml,
     load_config,
     load_settings,
     write_saved_config,
 )
+from .types import AUTO_SENTINEL, NONE_SENTINEL
 from .utils import configure_logger
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Sequence
+
+    from .config import FalconConfig, FalconSettings
+
+__all__ = [
+    "CliAction",
+    "DumpSchemaAction",
+    "NewlineTextHelpFormatter",
+    "PrintConfigAction",
+    "RunAction",
+    "build_parser",
+    "format_validation_error",
+    "main",
+    "parse_cli",
+]
 
 _T = TypeVar("_T")
 
@@ -46,23 +63,16 @@ _DEFAULT_PREP = PreprocessingConfig()
 _DEFAULT_CLUST = ClusteringConfig()
 _DEFAULT_AVG = AverageConsensusConfig()
 
-_IO_DIRECT_KEYS = (
-    "input_filenames",
-    "output_filename",
-    "work_dir",
-    "overwrite",
-    "export_representatives",
-)
+_IO_DIRECT_KEYS = tuple(IOConfig.model_fields)
 _PREP_KEYS = tuple(PreprocessingConfig.model_fields)
-_CLUST_DIRECT_KEYS = (
-    "rt_tol",
-    "fragment_tol",
-    "linkage",
-    "distance_threshold",
-    "min_matched_peaks",
-    "batch_size",
+_CLUST_DIRECT_KEYS = tuple(
+    k
+    for k in ClusteringConfig.model_fields
+    if k not in {"precursor_tol", "precursor_charge_buckets"}
 )
-_AVG_CUTOFF_KEYS = ("outlier_cutoff_lower", "outlier_cutoff_upper")
+_AVG_CUTOFF_KEYS = tuple(
+    k for k in AverageConsensusConfig.model_fields if k != "method"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,7 +140,7 @@ def _cli_optional(
     """Wrap ``converter`` to accept the ``"none"`` disable sentinel."""
 
     def _parse(raw: str) -> _T | str:
-        return "none" if raw == "none" else converter(raw)
+        return NONE_SENTINEL if raw == NONE_SENTINEL else converter(raw)
 
     return _parse
 
@@ -144,11 +154,12 @@ def _parse_cli_charge_buckets(
 ) -> str | list[list[int | str] | str]:
     """Convert raw CLI bucket tokens into structured config values."""
     stripped = [tok.strip() for tok in tokens]
-    if stripped == ["auto"]:
-        return "auto"
-    if "auto" in stripped:
+    if stripped == [AUTO_SENTINEL]:
+        return AUTO_SENTINEL
+    if AUTO_SENTINEL in stripped:
         raise ConfigError(
-            "Cannot combine 'auto' with explicit --precursor-charge-buckets"
+            f"Cannot combine '{AUTO_SENTINEL}' with explicit "
+            "--precursor-charge-buckets"
         )
 
     buckets: list[list[int | str] | str] = []
@@ -200,20 +211,21 @@ def _add_config_args(parser: argparse.ArgumentParser) -> None:
             "repeated; files may also declare 'extends'."
         ),
     )
-    group.add_argument(
+    mode_group = group.add_mutually_exclusive_group()
+    mode_group.add_argument(
         "--print-config",
         action="store_true",
         default=False,
         help="Print the resolved configuration as TOML and exit.",
     )
-    group.add_argument(
+    mode_group.add_argument(
         "--save-config",
         type=Path,
         default=None,
         metavar="PATH",
         help="Write the resolved run configuration as TOML to PATH.",
     )
-    group.add_argument(
+    mode_group.add_argument(
         "--dump-schema",
         action="store_true",
         default=False,
@@ -258,10 +270,10 @@ def _add_io_args(parser: argparse.ArgumentParser) -> None:
     group.add_argument(
         "--work-dir",
         default=argparse.SUPPRESS,
-        metavar="DIR|none",
+        metavar=f"DIR|{NONE_SENTINEL}",
         help=(
-            "Working directory for Lance staging cache, or 'none' for a "
-            "temporary directory."
+            "Working directory for Lance staging cache, or "
+            f"'{NONE_SENTINEL}' for a temporary directory."
         ),
     )
     group.add_argument(
@@ -313,10 +325,11 @@ def _add_preprocessing_args(parser: argparse.ArgumentParser) -> None:
         "--remove-precursor-tol",
         type=_cli_optional_float,
         default=argparse.SUPPRESS,
-        metavar="DA|none",
+        metavar=f"DA|{NONE_SENTINEL}",
         help=(
-            "Window (Da) around precursor m/z to remove peaks, or 'none' "
-            f"to disable (default: {p.remove_precursor_tol})."
+            f"Window (Da) around precursor m/z to remove peaks, or "
+            f"'{NONE_SENTINEL}' to disable "
+            f"(default: {p.remove_precursor_tol})."
         ),
     )
     group.add_argument(
@@ -332,10 +345,10 @@ def _add_preprocessing_args(parser: argparse.ArgumentParser) -> None:
         "--max-peaks-used",
         type=_cli_optional_int,
         default=argparse.SUPPRESS,
-        metavar="N|none",
+        metavar=f"N|{NONE_SENTINEL}",
         help=(
-            "Maximum most-intense peaks to retain, or 'none' for all "
-            f"(default: {p.max_peaks_used})."
+            f"Maximum most-intense peaks to retain, or '{NONE_SENTINEL}' "
+            f"for all (default: {p.max_peaks_used})."
         ),
     )
     group.add_argument(
@@ -357,15 +370,18 @@ def _add_clustering_args(parser: argparse.ArgumentParser) -> None:
         default=argparse.SUPPRESS,
         help=(
             'Precursor mass tolerance and unit ("ppm" or "Da", '
-            f"default: {int(c.precursor_tol.mass)} {c.precursor_tol.mode})."
+            f"default: {c.precursor_tol.mass:g} {c.precursor_tol.mode})."
         ),
     )
     group.add_argument(
         "--rt-tol",
         type=_cli_optional_float,
         default=argparse.SUPPRESS,
-        metavar="TOL|none",
-        help="Retention time tolerance, or 'none' to disable (default: none).",
+        metavar=f"TOL|{NONE_SENTINEL}",
+        help=(
+            f"Retention time tolerance, or '{NONE_SENTINEL}' to disable "
+            f"(default: {NONE_SENTINEL})."
+        ),
     )
     group.add_argument(
         "--fragment-tol",
@@ -415,7 +431,7 @@ def _add_clustering_args(parser: argparse.ArgumentParser) -> None:
         default=argparse.SUPPRESS,
         help=(
             "Charge buckets such as '[1]' '[2, 3]' unknown other, or "
-            "'auto' to cluster each observed charge separately."
+            f"'{AUTO_SENTINEL}' to cluster each observed charge separately."
         ),
     )
 
@@ -596,33 +612,12 @@ def parse_cli(args: Sequence[str] | None = None) -> CliAction:
     parsed = parser.parse_args(list(args) if args is not None else None)
     ns = vars(parsed)
 
-    dump_schema: bool = ns["dump_schema"]
+    if ns["dump_schema"]:
+        return DumpSchemaAction()
+
     print_config: bool = ns["print_config"]
     save_config: Path | None = ns["save_config"]
     config_files: list[str] = ns["config_files"]
-
-    if dump_schema and print_config:
-        parser.error("Cannot combine --dump-schema and --print-config")
-    if dump_schema and save_config is not None:
-        parser.error("Cannot combine --dump-schema and --save-config")
-    if print_config and save_config is not None:
-        parser.error(
-            "Cannot combine --print-config and --save-config "
-            "(redirect --print-config output to a file instead)"
-        )
-
-    if dump_schema:
-        return DumpSchemaAction()
-
-    if (
-        save_config is not None
-        and save_config.exists()
-        and save_config.is_dir()
-    ):
-        parser.error(
-            f"--save-config path is a directory, expected a file path: "
-            f"{save_config}"
-        )
 
     try:
         overrides = _extract_cli_overrides(ns)
@@ -659,7 +654,7 @@ def main(args: Sequence[str] | None = None) -> int:
         print(json.dumps(build_json_schema(), indent=2))
         return 0
     if isinstance(action, PrintConfigAction):
-        print(action.settings.to_toml(), end="")
+        print(format_toml(action.settings), end="")
         return 0
 
     if action.save_config is not None:

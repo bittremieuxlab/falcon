@@ -94,6 +94,7 @@ select = [
     "RUF",  # Ruff-specific rules
     "S",    # flake8-bandit (security)
     "SIM",  # flake8-simplify
+    "TC",   # flake8-type-checking
     "UP",   # pyupgrade
     "W",    # pycodestyle warnings
 ]
@@ -129,6 +130,9 @@ error-on-warning = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = ["-ra", "--strict-markers", "--strict-config"]
+markers = [
+    "integration: end-to-end and Lance-backed integration tests",
+]
 
 [tool.coverage.run]
 branch = true

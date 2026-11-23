@@ -2,6 +2,7 @@
 
 import base64
 import struct
+import tempfile
 from pathlib import Path
 
 import lance
@@ -9,9 +10,20 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-from falcon.config import load_config
-from falcon.staging import SPECTRUM_SCHEMA
-from falcon.types import ConsensusTuple, SpectrumTuple
+from falcon.config import ClusteringConfig, PrecursorTolerance, load_config
+from falcon.dataset import SPECTRUM_SCHEMA
+from falcon.types import SpectrumTuple, make_consensus_tuple
+
+DATA_DIR = Path(__file__).resolve().parent / "data"
+
+TOY_PEAKS_5 = [
+    (150.0, 100.0),
+    (250.0, 200.0),
+    (350.0, 150.0),
+    (450.0, 300.0),
+    (550.0, 250.0),
+]
+LOW_QUALITY_PEAKS = [(150.0, 100.0), (160.0, 200.0)]
 
 
 def make_spectrum_tuple(
@@ -44,15 +56,14 @@ def make_consensus_record(
     rt=120.0,
     cluster_id=0,
 ):
-    """Build a toy ``ConsensusTuple`` with canonical float32/int32 dtypes."""
-    norm_charge = np.int32(charge) if isinstance(charge, int) else charge
-    return ConsensusTuple(
-        precursor_mz=np.float32(precursor_mz),
-        precursor_charge=norm_charge,
+    """Build a toy ``ConsensusTuple`` via ``make_consensus_tuple``."""
+    return make_consensus_tuple(
+        precursor_mz=precursor_mz,
+        precursor_charge=charge,
         mz=np.asarray(mz, dtype=np.float32),
         intensity=np.asarray(intensity, dtype=np.float32),
-        retention_time=np.float32(rt),
-        cluster_id=np.int32(cluster_id),
+        retention_time=float("nan") if rt is None else rt,
+        cluster_id=cluster_id,
     )
 
 
@@ -70,32 +81,15 @@ def make_falcon_config(
     return load_config(overrides={"io": io_section, **sections})
 
 
-@pytest.fixture
-def mock_spectra():
-    """Factory fixture creating identical SpectrumTuples."""
-
-    def _make(n, mz_base=100.0, mz_step=1.0, n_peaks=3, charge=2):
-        spectra = []
-        for _ in range(n):
-            mz = np.array(
-                [mz_base + j * mz_step for j in range(n_peaks)],
-                dtype=np.float32,
-            )
-            intensity = np.array(
-                [0.5 + 0.1 * j for j in range(n_peaks)], dtype=np.float32
-            )
-            intensity = intensity / np.linalg.norm(intensity)
-            spectra.append(
-                SpectrumTuple(
-                    precursor_mz=np.float32(mz_base),
-                    precursor_charge=charge,
-                    mz=mz,
-                    intensity=intensity,
-                )
-            )
-        return spectra
-
-    return _make
+def make_da_clustering(**overrides):
+    """Build a ``ClusteringConfig`` with 0.5 Da precursor tolerance."""
+    defaults = {
+        "precursor_tol": PrecursorTolerance(mass=0.5, mode="Da"),
+        "fragment_tol": 0.05,
+        "distance_threshold": 0.1,
+    }
+    defaults.update(overrides)
+    return ClusteringConfig(**defaults)
 
 
 def make_spectrum_row(
@@ -107,78 +101,17 @@ def make_spectrum_row(
     retention_time=0.0,
 ):
     """Build a single Lance row dict for a spectrum (L2-normalized)."""
-    mz = np.asarray(mz, dtype=np.float32)
-    intensity = np.asarray(intensity, dtype=np.float32)
-    norm = np.linalg.norm(intensity)
-    if norm > 0:
-        intensity = intensity / norm
+    spec = make_spectrum_tuple(
+        mz, intensity, precursor_mz=precursor_mz, charge=precursor_charge
+    )
     return {
         "identifier": identifier,
-        "precursor_mz": np.float32(precursor_mz),
-        "precursor_charge": precursor_charge,
-        "mz": mz,
-        "intensity": intensity,
+        "precursor_mz": spec.precursor_mz,
+        "precursor_charge": spec.precursor_charge,
+        "mz": spec.mz,
+        "intensity": spec.intensity,
         "retention_time": np.float32(retention_time),
     }
-
-
-@pytest.fixture
-def spectrum_row():
-    """Expose ``make_spectrum_row`` as a fixture."""
-    return make_spectrum_row
-
-
-@pytest.fixture
-def spec_factory():
-    """Expose ``make_spectrum_tuple`` as a fixture."""
-    return make_spectrum_tuple
-
-
-@pytest.fixture
-def consensus_factory():
-    """Expose ``make_consensus_record`` as a fixture."""
-    return make_consensus_record
-
-
-@pytest.fixture
-def config_factory():
-    """Expose ``make_falcon_config`` as a fixture."""
-    return make_falcon_config
-
-
-@pytest.fixture
-def mgf_writer():
-    """Return ``(format_mgf_spectrum, write_mgf)`` helpers."""
-    return format_mgf_spectrum, write_mgf
-
-
-@pytest.fixture
-def mzml_writer():
-    """Expose ``write_toy_mzml`` as a fixture."""
-    return write_toy_mzml
-
-
-@pytest.fixture
-def mzxml_writer():
-    """Expose ``write_toy_mzxml`` as a fixture."""
-    return write_toy_mzxml
-
-
-@pytest.fixture
-def lance_dataset(tmp_path):
-    """Factory fixture writing rows to a Lance dataset."""
-
-    def _make(rows, charge=2, name=None):
-        filename = name or f"spectra_charge_{charge}.lance"
-        path = str(tmp_path / filename)
-        return lance.write_dataset(
-            pa.Table.from_pylist(rows, SPECTRUM_SCHEMA),
-            path,
-            mode="overwrite",
-            data_storage_version="stable",
-        )
-
-    return _make
 
 
 def format_mgf_spectrum(
@@ -188,7 +121,6 @@ def format_mgf_spectrum(
     scan=None,
     rt=None,
     title=None,
-    extra_params=None,
 ):
     """Format a single MGF spectrum block as text."""
     lines = ["BEGIN IONS"]
@@ -202,9 +134,6 @@ def format_mgf_spectrum(
         lines.append(f"CHARGE={abs(charge)}{sign}")
     if rt is not None:
         lines.append(f"RTINSECONDS={rt}")
-    if extra_params:
-        for key, value in extra_params.items():
-            lines.append(f"{key}={value}")
     for mz, intensity in peaks:
         lines.append(f"{mz:.4f} {intensity:.4f}")
     lines.append("END IONS")
@@ -213,7 +142,7 @@ def format_mgf_spectrum(
 
 def write_mgf(path: Path, entries: list[str]) -> Path:
     """Write formatted MGF spectrum blocks to ``path``."""
-    path.write_text("".join(entries))
+    path.write_text("".join(entries), encoding="utf-8")
     return path
 
 
@@ -313,7 +242,7 @@ def write_toy_mzml(path: Path, spectra_specs: list[dict]) -> Path:
         "</mzML>\n"
         "</indexedmzML>\n"
     )
-    path.write_text(xml)
+    path.write_text(xml, encoding="utf-8")
     return path
 
 
@@ -368,5 +297,112 @@ def write_toy_mzxml(path: Path, spectra_specs: list[dict]) -> Path:
         " </msRun>\n"
         "</mzXML>\n"
     )
-    path.write_text(xml)
+    path.write_text(xml, encoding="utf-8")
     return path
+
+
+@pytest.fixture(scope="session")
+def data_dir():
+    """Return path to checked-in peak-file fixtures."""
+    return DATA_DIR
+
+
+@pytest.fixture(scope="session")
+def spec_factory():
+    """Expose ``make_spectrum_tuple`` as a session fixture."""
+    return make_spectrum_tuple
+
+
+@pytest.fixture(scope="session")
+def consensus_factory():
+    """Expose ``make_consensus_record`` as a session fixture."""
+    return make_consensus_record
+
+
+@pytest.fixture(scope="session")
+def config_factory():
+    """Expose ``make_falcon_config`` as a session fixture."""
+    return make_falcon_config
+
+
+@pytest.fixture(scope="session")
+def da_clustering_factory():
+    """Expose ``make_da_clustering`` as a session fixture."""
+    return make_da_clustering
+
+
+@pytest.fixture(scope="session")
+def spectrum_row():
+    """Expose ``make_spectrum_row`` as a session fixture."""
+    return make_spectrum_row
+
+
+@pytest.fixture(scope="session")
+def mock_spectra():
+    """Factory fixture creating identical L2-normalized SpectrumTuples."""
+
+    def _make(n, n_peaks=3):
+        mz = [100.0 + float(j) for j in range(n_peaks)]
+        intensity = [0.5 + 0.1 * j for j in range(n_peaks)]
+        return [
+            make_spectrum_tuple(mz, intensity, precursor_mz=100.0, charge=2)
+            for _ in range(n)
+        ]
+
+    return _make
+
+
+@pytest.fixture(scope="session")
+def mgf_block():
+    """Expose ``format_mgf_spectrum`` as a session fixture."""
+    return format_mgf_spectrum
+
+
+@pytest.fixture(scope="session")
+def mgf_writer():
+    """Expose ``write_mgf`` as a session fixture."""
+    return write_mgf
+
+
+@pytest.fixture(scope="session")
+def mzml_writer():
+    """Expose ``write_toy_mzml`` as a session fixture."""
+    return write_toy_mzml
+
+
+@pytest.fixture(scope="session")
+def mzxml_writer():
+    """Expose ``write_toy_mzxml`` as a session fixture."""
+    return write_toy_mzxml
+
+
+@pytest.fixture
+def lance_dataset(tmp_path):
+    """Factory fixture writing rows to a Lance dataset."""
+
+    def _make(rows, charge=2, name=None):
+        filename = name or f"spectra_charge_{charge}.lance"
+        path = str(tmp_path / filename)
+        return lance.write_dataset(
+            pa.Table.from_pylist(rows, SPECTRUM_SCHEMA),
+            path,
+            mode="overwrite",
+            data_storage_version="stable",
+        )
+
+    return _make
+
+
+@pytest.fixture
+def track_mkdtemp(monkeypatch):
+    """Track directories allocated via ``tempfile.mkdtemp``."""
+    created: list[Path] = []
+    real_mkdtemp = tempfile.mkdtemp
+
+    def _tracking_mkdtemp(*args, **kwargs):
+        path = real_mkdtemp(*args, **kwargs)
+        created.append(Path(path))
+        return path
+
+    monkeypatch.setattr(tempfile, "mkdtemp", _tracking_mkdtemp)
+    return created

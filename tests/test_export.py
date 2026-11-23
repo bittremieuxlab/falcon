@@ -1,31 +1,33 @@
-"""Unit tests for falcon.export (output validation and CSV/MGF export)."""
+"""Unit tests for falcon.export (output prep and CSV/MGF export)."""
+
+import concurrent.futures
 
 import numpy as np
 import pandas as pd
 import pytest
 
 from falcon import export
-from falcon.config import FalconConfig, IOConfig
+from falcon.types import ClusterResult
 
 
-class TestValidateOutputs:
+class TestPrepareOutputs:
     def test_allows_run_when_outputs_do_not_exist(
         self, tmp_path, config_factory
     ):
         cfg = config_factory(output_filename=tmp_path / "results")
-        assert export.validate_outputs(cfg.io) is False
+        assert export.prepare_outputs(cfg.io) is True
 
     @pytest.mark.parametrize("existing_ext", ["csv", "mgf"])
-    def test_aborts_without_overwrite_preserving_existing_file(
+    def test_blocks_without_overwrite_preserving_existing_file(
         self, tmp_path, existing_ext, config_factory
     ):
         prefix = tmp_path / "run_v1.2"
         existing = tmp_path / f"run_v1.2.{existing_ext}"
-        existing.write_text("keep")
+        existing.write_text("keep", encoding="utf-8")
         cfg = config_factory(output_filename=prefix)
 
-        assert export.validate_outputs(cfg.io) is True
-        assert existing.read_text() == "keep"
+        assert export.prepare_outputs(cfg.io) is False
+        assert existing.read_text(encoding="utf-8") == "keep"
 
     def test_removes_both_csv_and_mgf_when_overwrite_enabled(
         self, tmp_path, config_factory
@@ -33,23 +35,20 @@ class TestValidateOutputs:
         prefix = tmp_path / "run_v1.2"
         csv_file = tmp_path / "run_v1.2.csv"
         mgf_file = tmp_path / "run_v1.2.mgf"
-        csv_file.write_text("old csv")
-        mgf_file.write_text("old mgf")
+        csv_file.write_text("old csv", encoding="utf-8")
+        mgf_file.write_text("old mgf", encoding="utf-8")
         cfg = config_factory(output_filename=prefix, io={"overwrite": True})
 
-        assert export.validate_outputs(cfg.io) is False
+        assert export.prepare_outputs(cfg.io) is True
         assert not csv_file.exists()
         assert not mgf_file.exists()
 
 
 class TestWriteClusterCsv:
-    def test_writes_metadata_comments_and_overwrites_cleanly(self, tmp_path):
-        cfg = FalconConfig(
-            io=IOConfig(
-                input_filenames=("in.mgf",),
-                output_filename=tmp_path / "run_v1.2",
-            )
-        )
+    def test_writes_metadata_comments_and_overwrites_cleanly(
+        self, tmp_path, config_factory
+    ):
+        cfg = config_factory(output_filename=tmp_path / "run_v1.2")
         df = pd.DataFrame(
             {
                 "identifier": ["f:scan:1", "f:scan:2"],
@@ -59,7 +58,7 @@ class TestWriteClusterCsv:
                 "cluster": [0, 0],
             }
         )
-        # Write twice to prove "w" mode does not append duplicate tables.
+        # Write twice to prove "w" mode does not append rows.
         export.write_cluster_csv(df, cfg, tmp_path)
         export.write_cluster_csv(df, cfg, tmp_path)
 
@@ -113,7 +112,7 @@ class TestExportResults:
         )
         rep1 = consensus_factory(
             precursor_mz=500.0,
-            charge=np.int32(2),
+            charge=2,
             mz=(100.0, 200.0),
             intensity=(0.7, 0.7),
             rt=10.0,
@@ -121,7 +120,7 @@ class TestExportResults:
         )
         rep2 = consensus_factory(
             precursor_mz=600.0,
-            charge=np.int32(3),
+            charge=3,
             mz=(150.0, 250.0),
             intensity=(0.7, 0.7),
             rt=20.0,
@@ -138,7 +137,7 @@ class TestExportResults:
             cfg,
             tmp_path,
             [ds1, ds2],
-            [(labels1, [rep1]), (labels2, [rep2])],
+            [ClusterResult(labels1, [rep1]), ClusterResult(labels2, [rep2])],
         )
 
         # Caller label arrays must remain unmutated.
@@ -158,16 +157,47 @@ class TestExportResults:
         assert "TITLE=falcon:cluster:0" in mgf_text
         assert "TITLE=falcon:cluster:1" in mgf_text
 
-    def test_empty_inputs_and_empty_bucket_writes_empty_csv_and_mgf(
-        self, tmp_path, lance_dataset, config_factory
+    def test_csv_only_when_export_representatives_disabled(
+        self, tmp_path, lance_dataset, spectrum_row, config_factory
     ):
+        ds = lance_dataset(
+            [spectrum_row("s:1", 500.0, [100.0, 200.0], [1.0, 1.0], 2, 10.0)],
+            charge=2,
+        )
+        out_prefix = tmp_path / "csv_only"
+        cfg = config_factory(
+            output_filename=out_prefix, io={"export_representatives": False}
+        )
+        export.export_results(
+            cfg,
+            tmp_path,
+            [ds],
+            [ClusterResult(np.array([0], dtype=np.int32), [])],
+        )
+        df = pd.read_csv(f"{out_prefix}.csv", comment="#")
+        assert list(df["identifier"]) == ["s:1"]
+        assert list(df["cluster"]) == [0]
+        assert not (tmp_path / "csv_only.mgf").exists()
+
+    def test_empty_bucket_writes_empty_csv_and_mgf_without_spawning_threads(
+        self, tmp_path, lance_dataset, config_factory, monkeypatch
+    ):
+        def _forbid_pool(*_args, **_kwargs):
+            raise AssertionError("ThreadPoolExecutor should not be spawned")
+
+        monkeypatch.setattr(
+            concurrent.futures, "ThreadPoolExecutor", _forbid_pool
+        )
         empty_ds = lance_dataset([], charge=2)
         out_prefix = tmp_path / "empty_out"
         cfg = config_factory(
             output_filename=out_prefix, io={"export_representatives": True}
         )
         export.export_results(
-            cfg, tmp_path, [empty_ds], [(np.empty(0, dtype=np.int32), [])]
+            cfg,
+            tmp_path,
+            [empty_ds],
+            [ClusterResult(np.empty(0, dtype=np.int32), [])],
         )
         df = pd.read_csv(f"{out_prefix}.csv", comment="#")
         assert len(df) == 0
@@ -181,7 +211,7 @@ class TestExportResults:
         assert (tmp_path / "empty_out.mgf").is_file()
 
     @pytest.mark.parametrize("export_reps", [False, True])
-    def test_propagates_writer_exceptions(
+    def test_propagates_csv_writer_exceptions(
         self,
         tmp_path,
         lance_dataset,
@@ -200,5 +230,39 @@ class TestExportResults:
         )
         with pytest.raises(FileNotFoundError):
             export.export_results(
-                cfg, tmp_path, [ds], [(np.array([0], dtype=np.int32), [])]
+                cfg,
+                tmp_path,
+                [ds],
+                [ClusterResult(np.array([0], dtype=np.int32), [])],
+            )
+
+    def test_propagates_mgf_writer_exception_via_thread_pool(
+        self,
+        tmp_path,
+        lance_dataset,
+        spectrum_row,
+        consensus_factory,
+        config_factory,
+        monkeypatch,
+    ):
+        ds = lance_dataset(
+            [spectrum_row("s:1", 500.0, [100.0, 200.0], [1.0, 1.0], 2, 10.0)],
+            charge=2,
+        )
+        rep = consensus_factory(cluster_id=0)
+        cfg = config_factory(
+            output_filename=tmp_path / "out",
+            io={"export_representatives": True},
+        )
+
+        def _boom(*_args, **_kwargs):
+            raise OSError("mgf disk full")
+
+        monkeypatch.setattr(export.ms_io, "write_spectra", _boom)
+        with pytest.raises(OSError, match="mgf disk full"):
+            export.export_results(
+                cfg,
+                tmp_path,
+                [ds],
+                [ClusterResult(np.array([0], dtype=np.int32), [rep])],
             )

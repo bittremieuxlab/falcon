@@ -8,6 +8,39 @@ from scipy.spatial.distance import pdist as scipy_pdist
 from falcon.cluster import refine
 
 
+class TestCutLinkage:
+    def test_returns_zero_based_int32_labels_across_thresholds(self):
+        values = np.array([100.0, 101.0, 105.0, 107.0, 110.0])
+        z = refine.linkage_1d(values, "Da")
+
+        all_singletons = refine.cut_linkage(z, 0.5)
+        assert all_singletons.dtype == np.int32
+        assert len(np.unique(all_singletons)) == 5
+        assert set(all_singletons.tolist()) == {0, 1, 2, 3, 4}
+
+        mid = refine.cut_linkage(z, 2.0)
+        assert mid.dtype == np.int32
+        assert mid[0] == mid[1]
+        assert mid[2] == mid[3]
+        assert len({mid[0], mid[2], mid[4]}) == 3
+        assert mid.min() == 0
+
+        merged = refine.cut_linkage(z, 10.0)
+        assert merged.dtype == np.int32
+        np.testing.assert_array_equal(merged, np.zeros(5, dtype=np.int32))
+
+    def test_matches_scipy_fcluster_zero_based_boundary(self):
+        values = np.array([10.0, 11.0, 20.0, 22.0])
+        z = refine.linkage_1d(values, "Da")
+        for threshold in (0.99, 1.0, 1.99, 2.0, 12.0):
+            expected = (sch.fcluster(z, threshold, "distance") - 1).astype(
+                np.int32
+            )
+            actual = refine.cut_linkage(z, threshold)
+            assert actual.dtype == np.int32
+            np.testing.assert_array_equal(actual, expected)
+
+
 class TestLinkage1D:
     def test_da_exact_and_matches_scipy_complete_linkage(self):
         values = np.array([100.0, 101.0, 105.0, 107.0, 110.0])
@@ -142,7 +175,19 @@ class TestPostprocessCluster:
             assert mzs_arr[mask].max() - mzs_arr[mask].min() <= 0.5
             assert rts_arr[mask].max() - rts_arr[mask].min() <= 1.0
 
-    def test_rt_with_mixed_nan_single_valid_and_all_nan(self):
+    def test_rt_single_valid_with_nan_stays_separate_without_rt_linkage(self):
+        labels = np.zeros(3, dtype=np.int32)
+        mzs = np.array([100.0, 100.05, 100.1], dtype=np.float64)
+        rts = np.array([10.0, np.nan, np.nan], dtype=np.float64)
+        n = refine.postprocess_cluster(
+            labels, mzs, rts, 0.5, "Da", 1.0, min_samples=2, start_label=4
+        )
+        assert n == 2
+        assert labels[1] == labels[2]
+        assert labels[0] != labels[1]
+        assert set(labels.tolist()) == {4, 5}
+
+    def test_rt_with_mixed_nan_and_all_nan(self):
         mzs = np.array(
             [100.0, 100.05, 100.1, 100.15, 200.0, 200.05, 200.1, 200.15]
         )
@@ -156,21 +201,6 @@ class TestPostprocessCluster:
         assert labels[2] == labels[3]
         assert labels[6] == labels[7]
         assert len({labels[0], labels[2], labels[4], labels[6]}) == 4
-
-        labels_1v = np.zeros(3, dtype=np.int32)
-        n_1v = refine.postprocess_cluster(
-            labels_1v,
-            np.array([100.0, 100.05, 100.1]),
-            np.array([10.0, np.nan, np.nan]),
-            0.5,
-            "Da",
-            1.0,
-            2,
-            0,
-        )
-        assert n_1v == 2
-        assert labels_1v[1] == labels_1v[2]
-        assert labels_1v[0] != labels_1v[1]
 
         labels_all_nan = np.zeros(4, dtype=np.int32)
         n_all_nan = refine.postprocess_cluster(

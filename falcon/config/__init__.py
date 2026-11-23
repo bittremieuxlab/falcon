@@ -10,6 +10,8 @@ from .loader import (
     merge_config_dicts,
 )
 from .models import (
+    DEFAULT_MAX_MZ,
+    DEFAULT_MIN_MZ,
     AverageConsensusConfig,
     ClusteringConfig,
     ConfigError,
@@ -30,6 +32,8 @@ from .serialize import (
 )
 
 __all__ = [
+    "DEFAULT_MAX_MZ",
+    "DEFAULT_MIN_MZ",
     "AverageConsensusConfig",
     "ChargeBucket",
     "ChargeValue",

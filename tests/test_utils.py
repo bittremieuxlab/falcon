@@ -1,11 +1,11 @@
-"""Unit tests for falcon.utils and package metadata."""
+"""Unit tests for falcon.utils logging, path, glob, and worker code."""
 
 import logging
 import sys
 
+import joblib
 import pytest
 
-import falcon
 from falcon import utils
 
 
@@ -28,12 +28,6 @@ def isolated_root_logger():
     numba_logger.setLevel(prev_numba_level)
     numexpr_logger.setLevel(prev_numexpr_level)
     logging.captureWarnings(False)
-
-
-class TestPackageMetadata:
-    def test_version_is_non_empty_string(self):
-        assert isinstance(falcon.__version__, str)
-        assert falcon.__version__
 
 
 class TestConfigureLogger:
@@ -68,7 +62,7 @@ class TestConfigureLogger:
         assert root.handlers == [existing]
 
 
-class TestResolvePathAndFormatHms:
+class TestPathGlobAndTimeHelpers:
     def test_resolve_path_handles_existing_missing_and_symlink_loop(
         self, tmp_path
     ):
@@ -84,9 +78,55 @@ class TestResolvePathAndFormatHms:
         with pytest.raises((OSError, RuntimeError)):
             utils.resolve_path(loop)
 
+    def test_expand_input_globs_sorted_and_preserves_repeated_matches(
+        self, tmp_path
+    ):
+        for name in ("c.mgf", "a.mgf", "b.mgf"):
+            (tmp_path / name).write_text("", encoding="utf-8")
+
+        expanded = utils.expand_input_globs(
+            [str(tmp_path / "*.mgf"), str(tmp_path / "b.mgf")]
+        )
+        assert expanded == [
+            tmp_path / "a.mgf",
+            tmp_path / "b.mgf",
+            tmp_path / "c.mgf",
+            tmp_path / "b.mgf",
+        ]
+
+    def test_expand_input_globs_unmatched_literals_flag(self, tmp_path):
+        missing_literal = tmp_path / "missing.mgf"
+        missing_glob = str(tmp_path / "none_*.mgf")
+
+        assert (
+            utils.expand_input_globs(
+                [str(missing_literal), missing_glob],
+                keep_unmatched_literals=False,
+            )
+            == []
+        )
+        assert utils.expand_input_globs(
+            [str(missing_literal), missing_glob],
+            keep_unmatched_literals=True,
+        ) == [missing_literal]
+
     @pytest.mark.parametrize(
         ("seconds", "expected"),
-        [(0, "0:00:00"), (59.9, "0:00:59"), (3661, "1:01:01")],
+        [
+            (-10.5, "0:00:00"),
+            (-0.1, "0:00:00"),
+            (0, "0:00:00"),
+            (59.9, "0:00:59"),
+            (3661, "1:01:01"),
+        ],
     )
     def test_format_hms(self, seconds, expected):
         assert utils.format_hms(seconds) == expected
+
+    def test_effective_n_workers_returns_positive_int(self, monkeypatch):
+        workers = utils.effective_n_workers()
+        assert isinstance(workers, int)
+        assert workers >= 1
+
+        monkeypatch.setattr(joblib, "effective_n_jobs", lambda _n: 0)
+        assert utils.effective_n_workers() == 1

@@ -1,24 +1,48 @@
 """Shared domain data types, charge-bucket parsing, and m/z bin math.
 
-This leaf module depends only on stdlib and NumPy so lightweight entry
-points (such as ``falcon.config`` and ``falcon.cli``) and peak readers
-(``falcon.ms_io``) never pull in heavy scientific dependencies like
-Numba, SciPy, Lance, or ``spectrum_utils``.
+This leaf module imports only stdlib at module load time so lightweight
+entry points (``falcon.config`` and ``falcon.cli``) never pull in NumPy,
+Numba, SciPy, Lance, or ``spectrum_utils``. Array helpers import NumPy
+lazily when called.
 """
 
 from __future__ import annotations
 
 import math
-from typing import Any, Literal, NamedTuple, TypedDict
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypedDict
 
-import numpy as np
+if TYPE_CHECKING:
+    import numpy as np
 
 INT8_MIN = -128
 INT8_MAX = 127
 INT32_MAX = 2**31 - 1
 
+NONE_SENTINEL = "none"
+AUTO_SENTINEL = "auto"
+
 ChargeValue = int | Literal["unknown"]
 ChargeBucket = tuple[ChargeValue, ...] | Literal["other"]
+
+__all__ = [
+    "AUTO_SENTINEL",
+    "INT8_MAX",
+    "INT8_MIN",
+    "INT32_MAX",
+    "NONE_SENTINEL",
+    "ChargeBucket",
+    "ChargeValue",
+    "ClusterResult",
+    "ConsensusTuple",
+    "ProcessedSpectrum",
+    "SpectrumTuple",
+    "charge_sort_key",
+    "make_consensus_tuple",
+    "mz_bin_bounds",
+    "offset_cluster_result",
+    "parse_charge_bucket_list",
+    "parse_optional_charge_buckets",
+]
 
 
 class ProcessedSpectrum(TypedDict):
@@ -50,6 +74,47 @@ class ConsensusTuple(NamedTuple):
     intensity: np.ndarray
     retention_time: np.float32
     cluster_id: np.int32
+
+    @classmethod
+    def from_spectrum(
+        cls,
+        spec: SpectrumTuple,
+        retention_time: float,
+        cluster_id: int,
+    ) -> ConsensusTuple:
+        """
+        Build a ``ConsensusTuple`` directly from a ``SpectrumTuple``.
+
+        Parameters
+        ----------
+        spec : SpectrumTuple
+            Source spectrum whose precursor and fragment peaks become
+            the representative.
+        retention_time : float
+            Retention time for the representative (or ``NaN``).
+        cluster_id : int
+            Cluster label assigned to this representative.
+
+        Returns
+        -------
+        ConsensusTuple
+            Representative spectrum record with canonical dtypes.
+        """
+        return make_consensus_tuple(
+            precursor_mz=spec.precursor_mz,
+            precursor_charge=spec.precursor_charge,
+            mz=spec.mz,
+            intensity=spec.intensity,
+            retention_time=retention_time,
+            cluster_id=cluster_id,
+        )
+
+
+class ClusterResult(NamedTuple):
+    """Cluster label assignments and representative spectra."""
+
+    labels: np.ndarray
+    representatives: list[ConsensusTuple]
 
 
 def make_consensus_tuple(
@@ -85,6 +150,8 @@ def make_consensus_tuple(
     ConsensusTuple
         Typed representative spectrum record.
     """
+    import numpy as np
+
     if precursor_charge is None or math.isnan(float(precursor_charge)):
         norm_charge: np.int32 | float = np.nan
     else:
@@ -97,6 +164,52 @@ def make_consensus_tuple(
         retention_time=np.float32(retention_time),
         cluster_id=np.int32(cluster_id),
     )
+
+
+def offset_cluster_result(
+    result: ClusterResult,
+    offset: int,
+    *,
+    include_representatives: bool = True,
+) -> tuple[ClusterResult, int]:
+    """
+    Shift cluster labels and representative IDs by ``offset``.
+
+    Never mutates ``result.labels`` in place.
+
+    Parameters
+    ----------
+    result : ClusterResult
+        Source cluster labels and representative spectra.
+    offset : int
+        Non-negative integer offset added to every label and cluster ID.
+    include_representatives : bool, default=True
+        When ``False``, skip offsetting representative spectra and
+        return an empty list.
+
+    Returns
+    -------
+    tuple[ClusterResult, int]
+        Shifted ``ClusterResult`` and the next available global label
+        offset (``max(shifted_labels) + 1``, or ``offset`` if empty).
+    """
+    import numpy as np
+
+    if len(result.labels) == 0:
+        return ClusterResult(np.empty(0, dtype=np.int32), []), offset
+
+    offset_labels = np.asarray(result.labels, dtype=np.int32) + np.int32(
+        offset
+    )
+    if include_representatives and result.representatives:
+        offset_reps = [
+            rep._replace(cluster_id=np.int32(int(rep.cluster_id) + offset))
+            for rep in result.representatives
+        ]
+    else:
+        offset_reps = []
+    next_offset = int(np.max(offset_labels)) + 1
+    return ClusterResult(offset_labels, offset_reps), next_offset
 
 
 def charge_sort_key(value: ChargeValue) -> tuple[bool, int | str]:
@@ -164,36 +277,29 @@ def _parse_single_charge_bucket(
     return tuple(sorted(bucket_seen, key=charge_sort_key))
 
 
-def parse_charge_buckets(
-    value: Any,
-) -> tuple[ChargeBucket, ...] | None:
+def parse_charge_bucket_list(value: Any) -> tuple[ChargeBucket, ...]:
     """
-    Validate and canonicalize ``precursor_charge_buckets``.
+    Validate and canonicalize a non-empty charge-bucket specification.
 
-    Accepts ``None`` or ``"auto"`` (returning ``None``), or a non-empty
-    sequence of non-overlapping int8/``"unknown"`` buckets and at most
-    one ``"other"`` sentinel.
+    Accepts a non-empty list or tuple of non-overlapping
+    int8/``"unknown"`` buckets and at most one ``"other"`` sentinel.
 
     Parameters
     ----------
     value : Any
-        Raw charge bucket specification from Python, TOML, CLI, or a
-        cached staging manifest.
+        Raw sequence of charge buckets.
 
     Returns
     -------
-    tuple[ChargeBucket, ...] | None
-        Canonical immutable charge bucket tuple, or ``None`` for auto
-        mode.
+    tuple[ChargeBucket, ...]
+        Canonical immutable charge bucket tuple.
 
     Raises
     ------
     ValueError
-        If the bucket specification is malformed, empty, out of int8
-        bounds, or contains duplicate or overlapping charges.
+        If ``value`` is not a non-empty sequence of valid,
+        non-overlapping charge buckets.
     """
-    if value is None or value == "auto":
-        return None
     if not isinstance(value, (list, tuple)):
         raise ValueError(
             "precursor_charge_buckets must be 'auto' or a non-empty list "
@@ -217,6 +323,28 @@ def parse_charge_buckets(
         buckets.append(_parse_single_charge_bucket(raw_bucket, seen_values))
 
     return tuple(buckets)
+
+
+def parse_optional_charge_buckets(
+    value: Any,
+) -> tuple[ChargeBucket, ...] | None:
+    """
+    Validate ``precursor_charge_buckets``, allowing ``None``/``"auto"``.
+
+    Parameters
+    ----------
+    value : Any
+        Raw charge bucket specification from Python, TOML, or CLI.
+
+    Returns
+    -------
+    tuple[ChargeBucket, ...] | None
+        Canonical immutable charge bucket tuple, or ``None`` for auto
+        mode.
+    """
+    if value is None or value == AUTO_SENTINEL:
+        return None
+    return parse_charge_bucket_list(value)
 
 
 def mz_bin_bounds(

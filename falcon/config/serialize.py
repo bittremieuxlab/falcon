@@ -2,20 +2,28 @@
 
 from __future__ import annotations
 
-import glob
 import os
-from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .. import __version__
-from ..utils import resolve_path
+from ..types import AUTO_SENTINEL, NONE_SENTINEL
+from ..utils import expand_input_globs, resolve_path
 from .models import (
     AverageConsensusConfig,
     ConfigError,
-    FalconConfig,
     FalconSettings,
 )
+
+if TYPE_CHECKING:
+    from .models import FalconConfig
+
+__all__ = [
+    "build_json_schema",
+    "format_metadata_lines",
+    "format_toml",
+    "write_saved_config",
+]
 
 _TOML_ESCAPES: dict[str, str] = {
     "\\": "\\\\",
@@ -65,6 +73,30 @@ def _toml_literal(value: Any) -> str:
     raise TypeError(f"Unsupported TOML value type: {type(value)}")
 
 
+def _format_optional_toml(
+    key: str,
+    value: Any,
+    sentinel: str,
+    *,
+    comment_when_none: bool,
+) -> str:
+    """
+    Format an optional TOML field with round-trip-safe sentinel output.
+
+    Fields whose model default is non-``None`` (``remove_precursor_tol``
+    and ``max_peaks_used``) must emit an uncommented sentinel when
+    disabled (``comment_when_none=False``), because omitting them would
+    revert to the non-``None`` default upon reload. Fields whose default
+    is ``None`` (``work_dir``, ``rt_tol``, ``precursor_charge_buckets``)
+    emit commented sentinels (``comment_when_none=True``) while
+    preserving exact round-trip fidelity.
+    """
+    if value is not None:
+        return f"{key} = {_toml_literal(value)}"
+    prefix = "# " if comment_when_none else ""
+    return f"{prefix}{key} = {_toml_literal(sentinel)}"
+
+
 def format_toml(
     cfg: FalconSettings | FalconConfig,
     *,
@@ -86,6 +118,15 @@ def format_toml(
         Deterministic TOML text terminated by a trailing newline.
     """
     effective_work_dir = cfg.io.work_dir if work_dir is None else work_dir
+    if effective_work_dir is None:
+        work_dir_value: str | None = None
+    elif effective_work_dir == Path(NONE_SENTINEL):
+        # Preserve a literal relative directory named "none" as "./none"
+        # so reloading does not interpret it as the disable sentinel.
+        work_dir_value = f"./{NONE_SENTINEL}"
+    else:
+        work_dir_value = str(effective_work_dir)
+
     lines: list[str] = ["[io]"]
     if cfg.io.input_filenames is not None:
         lines.append(
@@ -99,15 +140,11 @@ def format_toml(
         )
     else:
         lines.append('# output_filename = ""')
-    if effective_work_dir is not None:
-        work_dir_str = (
-            "./none"
-            if effective_work_dir == Path("none")
-            else str(effective_work_dir)
+    lines.append(
+        _format_optional_toml(
+            "work_dir", work_dir_value, NONE_SENTINEL, comment_when_none=True
         )
-        lines.append(f"work_dir = {_toml_literal(work_dir_str)}")
-    else:
-        lines.append('# work_dir = "none"')
+    )
     lines.append(f"overwrite = {_toml_literal(cfg.io.overwrite)}")
     lines.append(
         f"export_representatives = "
@@ -123,17 +160,18 @@ def format_toml(
             f"min_mz_range = {_toml_literal(prep.min_mz_range)}",
             f"min_mz = {_toml_literal(prep.min_mz)}",
             f"max_mz = {_toml_literal(prep.max_mz)}",
-            (
-                f"remove_precursor_tol = "
-                f"{_toml_literal(prep.remove_precursor_tol)}"
-                if prep.remove_precursor_tol is not None
-                else 'remove_precursor_tol = "none"'
+            _format_optional_toml(
+                "remove_precursor_tol",
+                prep.remove_precursor_tol,
+                NONE_SENTINEL,
+                comment_when_none=False,
             ),
             f"min_intensity = {_toml_literal(prep.min_intensity)}",
-            (
-                f"max_peaks_used = {_toml_literal(prep.max_peaks_used)}"
-                if prep.max_peaks_used is not None
-                else 'max_peaks_used = "none"'
+            _format_optional_toml(
+                "max_peaks_used",
+                prep.max_peaks_used,
+                NONE_SENTINEL,
+                comment_when_none=False,
             ),
             f"scaling = {_toml_literal(prep.scaling)}",
         ]
@@ -144,21 +182,19 @@ def format_toml(
         [
             "",
             "[clustering]",
-            (
-                f"rt_tol = {_toml_literal(clust.rt_tol)}"
-                if clust.rt_tol is not None
-                else '# rt_tol = "none"'
+            _format_optional_toml(
+                "rt_tol", clust.rt_tol, NONE_SENTINEL, comment_when_none=True
             ),
             f"fragment_tol = {_toml_literal(clust.fragment_tol)}",
             f"linkage = {_toml_literal(clust.linkage)}",
             f"distance_threshold = {_toml_literal(clust.distance_threshold)}",
             f"min_matched_peaks = {_toml_literal(clust.min_matched_peaks)}",
             f"batch_size = {_toml_literal(clust.batch_size)}",
-            (
-                f"precursor_charge_buckets = "
-                f"{_toml_literal(clust.precursor_charge_buckets)}"
-                if clust.precursor_charge_buckets is not None
-                else '# precursor_charge_buckets = "auto"'
+            _format_optional_toml(
+                "precursor_charge_buckets",
+                clust.precursor_charge_buckets,
+                AUTO_SENTINEL,
+                comment_when_none=True,
             ),
             "",
             "[clustering.precursor_tol]",
@@ -283,18 +319,6 @@ def build_json_schema() -> dict[str, Any]:
     return schema
 
 
-def _expand_input_candidates(patterns: Sequence[str]) -> list[Path]:
-    """Expand input patterns into sorted globs and literal paths."""
-    candidates: list[Path] = []
-    for pattern in patterns:
-        matches = sorted(glob.glob(pattern))
-        if matches:
-            candidates.extend(Path(match) for match in matches)
-        elif not glob.has_magic(pattern):
-            candidates.append(Path(pattern))
-    return candidates
-
-
 def _paths_alias(
     destination: Path,
     resolved_dest: Path,
@@ -321,21 +345,24 @@ def _validate_save_destination(
     """Ensure ``destination`` is a file path distinct from inputs."""
     if destination.exists() and destination.is_dir():
         raise ConfigError(
-            f"--save-config path is a directory, expected a file path: "
+            "Config output path is a directory, expected a file path: "
             f"{destination}"
         )
     try:
         resolved_dest = resolve_path(destination)
     except (OSError, RuntimeError) as exc:
         raise ConfigError(
-            f"Failed to resolve --save-config path {destination}: {exc}"
+            f"Failed to resolve config output path {destination}: {exc}"
         ) from exc
 
     dest_exists = destination.exists()
-    for candidate in _expand_input_candidates(config.io.input_filenames):
+    candidates = expand_input_globs(
+        config.io.input_filenames, keep_unmatched_literals=True
+    )
+    for candidate in candidates:
         if _paths_alias(destination, resolved_dest, dest_exists, candidate):
             raise ConfigError(
-                f"--save-config path {destination} aliases input file "
+                f"Config output path {destination} aliases input file "
                 f"{candidate}; choose a distinct destination"
             )
 
@@ -360,7 +387,7 @@ def write_saved_config(config: FalconConfig, destination: Path) -> None:
     """
     _validate_save_destination(config, destination)
     try:
-        destination.write_text(config.to_toml(), encoding="utf-8")
+        destination.write_text(format_toml(config), encoding="utf-8")
     except OSError as exc:
         raise ConfigError(
             f"Failed to write configuration to {destination}: {exc}"
