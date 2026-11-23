@@ -296,6 +296,19 @@ def _has_unverified_staging_files(spectra_dir: Path) -> bool:
     return False
 
 
+def _staged_dataset_names(spectra_dir: Path) -> set[str] | None:
+    """Return staged ``spectra_charge*.lance`` dir names, or None."""
+    names: set[str] = set()
+    for entry in spectra_dir.iterdir():
+        if entry.name.startswith("spectra_charge") and entry.name.endswith(
+            ".lance"
+        ):
+            if not entry.is_dir():
+                return None
+            names.add(entry.name)
+    return names
+
+
 def _load_or_prepare_buckets(
     config: FalconConfig,
     work_dir: Path,
@@ -308,8 +321,9 @@ def _load_or_prepare_buckets(
     directory is cleared and spectra are re-read and re-partitioned.
     Otherwise, a cached staging manifest (``staging_cache.json``) is
     reused only when ``schema_version``, resolved inputs (paths, sizes,
-    modification times), ``preprocessing``, ``fragment_tol``, and
-    ``precursor_charge_buckets`` all match.
+    modification times), ``preprocessing``, ``fragment_tol``,
+    ``precursor_charge_buckets``, and the staged dataset directories on
+    disk all match.
 
     Parameters
     ----------
@@ -354,12 +368,25 @@ def _load_or_prepare_buckets(
                 "with --overwrite or a different --work-dir."
             )
         try:
-            return list(deserialize_cached_buckets(cached.get("buckets")))
+            cached_buckets: list[BucketKey] = list(
+                deserialize_cached_buckets(cached.get("buckets"))
+            )
         except ValueError as exc:
             raise ValueError(
                 f"Invalid staging cache buckets in {cache_path}: {exc}; "
                 "rerun with --overwrite or a different --work-dir."
             ) from exc
+        expected_datasets = {
+            f"spectra_charge{bucket_key_to_str(bucket)}.lance"
+            for bucket in cached_buckets
+        }
+        if _staged_dataset_names(spectra_dir) != expected_datasets:
+            raise ValueError(
+                f"Invalid staging cache buckets in {cache_path}: staged "
+                "datasets on disk do not match cached buckets; rerun "
+                "with --overwrite or a different --work-dir."
+            )
+        return cached_buckets
     elif _has_unverified_staging_files(spectra_dir):
         raise ValueError(
             f"Working directory {work_dir} contains an unverified or legacy "

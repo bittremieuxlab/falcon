@@ -161,6 +161,8 @@ class TestLoadOrPrepareBuckets:
         manifest = build_staging_manifest(
             orig_cfg, [input_file], buckets=[(1,), (2,)]
         )
+        (spectra_dir / "spectra_charge_1.lance").mkdir()
+        (spectra_dir / "spectra_charge_2.lance").mkdir()
         (spectra_dir / "staging_cache.json").write_text(
             json.dumps(manifest), encoding="utf-8"
         )
@@ -430,16 +432,17 @@ class TestLoadOrPrepareBuckets:
             build_calls += 1
             return orig_build(*args, **kwargs)
 
+        def _fake_stage(_inputs, _wd, _proc, _buckets):
+            for name in (
+                "spectra_charge_1_2.lance",
+                "spectra_charge_unknown.lance",
+                "spectra_charge_other.lance",
+            ):
+                (spectra_dir / name).mkdir()
+            return [(2, 1), ("unknown",), "other"]
+
         monkeypatch.setattr(falcon_mod, "build_staging_manifest", _spy_build)
-        monkeypatch.setattr(
-            falcon_mod,
-            "_prepare_spectra",
-            lambda _inputs, _wd, _proc, _buckets: [
-                (2, 1),
-                ("unknown",),
-                "other",
-            ],
-        )
+        monkeypatch.setattr(falcon_mod, "_prepare_spectra", _fake_stage)
 
         falcon_mod._load_or_prepare_buckets(cfg, tmp_path, lambda s: None)
         assert build_calls == 1
@@ -460,6 +463,82 @@ class TestLoadOrPrepareBuckets:
             cfg, tmp_path, lambda s: None
         )
         assert reused == [(1, 2), ("unknown",), "other"]
+
+    @pytest.mark.parametrize(
+        ("cached_buckets", "disk_entries"),
+        [
+            # Missing staged dataset for one of the cached buckets.
+            ([(1,), (2,)], [("spectra_charge_1.lance", True)]),
+            # Extra staged dataset not listed in the manifest.
+            (
+                [(2,)],
+                [
+                    ("spectra_charge_2.lance", True),
+                    ("spectra_charge_3.lance", True),
+                ],
+            ),
+            # Empty manifest cannot reuse when staged datasets exist.
+            ([], [("spectra_charge_2.lance", True)]),
+            # Regular file instead of a Lance dataset directory.
+            ([(2,)], [("spectra_charge_2.lance", False)]),
+        ],
+    )
+    def test_cached_buckets_mismatching_staged_datasets_raises(
+        self, tmp_path, cached_buckets, disk_entries
+    ):
+        input_file = tmp_path / "in.mgf"
+        input_file.write_text("v1")
+        spectra_dir = tmp_path / "spectra"
+        spectra_dir.mkdir()
+        for name, is_dir in disk_entries:
+            path = spectra_dir / name
+            if is_dir:
+                path.mkdir()
+            else:
+                path.write_text("not a dataset")
+
+        cfg = make_falcon_config(
+            input_filenames=[str(input_file)],
+            output_filename=tmp_path / "out",
+            io={"work_dir": str(tmp_path)},
+        )
+        manifest = build_staging_manifest(
+            cfg, [input_file], buckets=cached_buckets
+        )
+        (spectra_dir / "staging_cache.json").write_text(
+            json.dumps(manifest), encoding="utf-8"
+        )
+        with pytest.raises(
+            ValueError,
+            match=r"rerun with --overwrite or a different --work-dir",
+        ):
+            falcon_mod._load_or_prepare_buckets(cfg, tmp_path, lambda s: None)
+
+    def test_empty_cached_buckets_reused_when_no_staged_datasets_exist(
+        self, tmp_path, monkeypatch
+    ):
+        input_file = tmp_path / "in.mgf"
+        input_file.write_text("v1")
+        spectra_dir = tmp_path / "spectra"
+        spectra_dir.mkdir()
+        cfg = make_falcon_config(
+            input_filenames=[str(input_file)],
+            output_filename=tmp_path / "out",
+            io={"work_dir": str(tmp_path)},
+        )
+        manifest = build_staging_manifest(cfg, [input_file], buckets=[])
+        (spectra_dir / "staging_cache.json").write_text(
+            json.dumps(manifest), encoding="utf-8"
+        )
+
+        def _fail(*_args, **_kwargs):
+            raise AssertionError("_prepare_spectra should not be called")
+
+        monkeypatch.setattr(falcon_mod, "_prepare_spectra", _fail)
+        assert (
+            falcon_mod._load_or_prepare_buckets(cfg, tmp_path, lambda s: None)
+            == []
+        )
 
 
 # ----------------------------------------------------------------------
