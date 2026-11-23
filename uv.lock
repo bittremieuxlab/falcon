@@ -615,7 +615,7 @@ requires-dist = [
     { name = "pyarrow", specifier = ">=2.0.0" },
     { name = "pydantic", specifier = ">=2.10" },
     { name = "pylance", specifier = ">=14.0.3" },
-    { name = "pyteomics", extras = ["xml"], specifier = ">=4.4.0" },
+    { name = "pyteomics", extras = ["xml"], specifier = ">=5.0.2" },
     { name = "scipy", specifier = ">=1.5.3" },
     { name = "spectrum-utils", specifier = "==0.3.5" },
 ]
