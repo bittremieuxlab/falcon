@@ -1,264 +1,407 @@
 """Unit tests for falcon.config."""
 
+from pathlib import Path
+
 import pytest
+from pydantic import ValidationError
 
-from falcon.config import Config, NewlineTextHelpFormatter
-
-
-def _parse(args):
-    """Parse CLI arguments with a fresh Config instance."""
-    cfg = Config()
-    cfg.parse(args)
-    return cfg
-
+from falcon.config import (
+    AverageConsensusConfig,
+    ClusteringConfig,
+    ConfigError,
+    FalconConfig,
+    FalconSettings,
+    IOConfig,
+    MedoidConsensusConfig,
+    PartialIOConfig,
+    PrecursorTolerance,
+    PreprocessingConfig,
+)
 
 # ----------------------------------------------------------------------
-# Defaults, CLI overrides, and INI configuration files
+# Defaults, immutability, and strict type enforcement
 # ----------------------------------------------------------------------
 
 
-class TestConfigParsing:
-    def test_defaults(self):
-        cfg = _parse(["in.mgf", "out"])
-        assert cfg.input_filenames == ["in.mgf"]
-        assert cfg.output_filename == "out"
-        assert cfg.work_dir is None
-        assert cfg.overwrite is False
-        assert cfg.export_representatives is False
-        assert cfg.precursor_tol == [20.0, "ppm"]
-        assert cfg.rt_tol is None
-        assert cfg.fragment_tol == 0.05
-        assert cfg.linkage == "complete"
-        assert cfg.distance_threshold == 0.1
-        assert cfg.min_matched_peaks == 0
-        assert cfg.consensus_method == "medoid"
-        assert cfg.outlier_cutoff_lower == 1.5
-        assert cfg.outlier_cutoff_upper == 1.5
-        assert cfg.batch_size == 2**15
-        assert cfg.precursor_charge_buckets is None
-        assert cfg.min_peaks == 5
-        assert cfg.min_mz_range == 250.0
-        assert cfg.min_mz == 101.0
-        assert cfg.max_mz == 1500.0
-        assert cfg.remove_precursor_tol == 1.5
-        assert cfg.min_intensity == 0.01
-        assert cfg.max_peaks_used == 50
-        assert cfg.scaling == "off"
-
-    def test_multiple_input_files_and_flags(self):
-        cfg = _parse(
-            [
-                "a.mgf",
-                "b.mzml",
-                "results",
-                "--work_dir",
-                "custom_work_dir",
-                "--overwrite",
-                "--export_representatives",
-                "--min_matched_peaks",
-                "6",
-                "--batch_size",
-                "128",
-                "--rt_tol",
-                "30.5",
-                "--outlier_cutoff_lower",
-                "2.0",
-                "--outlier_cutoff_upper",
-                "3.5",
-            ]
+class TestConfigModels:
+    def test_default_settings_and_immutability(self):
+        cfg = FalconConfig(
+            io=IOConfig(
+                input_filenames=("in.mgf",),
+                output_filename=Path("out"),
+            )
         )
-        assert cfg.input_filenames == ["a.mgf", "b.mzml"]
-        assert cfg.output_filename == "results"
-        assert cfg.work_dir == "custom_work_dir"
-        assert cfg.overwrite is True
-        assert cfg.export_representatives is True
-        assert cfg.min_matched_peaks == 6
-        assert cfg.batch_size == 128
-        assert cfg.rt_tol == 30.5
-        assert cfg.outlier_cutoff_lower == 2.0
-        assert cfg.outlier_cutoff_upper == 3.5
+        assert cfg.io.input_filenames == ("in.mgf",)
+        assert cfg.io.output_filename == Path("out")
+        assert cfg.io.work_dir is None
+        assert cfg.io.overwrite is False
+        assert cfg.io.export_representatives is False
+        assert cfg.preprocessing.min_peaks == 5
+        assert cfg.preprocessing.min_mz == 101.0
+        assert cfg.preprocessing.max_mz == 1500.0
+        assert cfg.preprocessing.min_mz_range == 250.0
+        assert cfg.preprocessing.remove_precursor_tol == 1.5
+        assert cfg.preprocessing.min_intensity == 0.01
+        assert cfg.preprocessing.max_peaks_used == 50
+        assert cfg.preprocessing.scaling == "off"
+        assert cfg.clustering.precursor_tol == PrecursorTolerance(
+            mass=20.0, mode="ppm"
+        )
+        assert cfg.clustering.rt_tol is None
+        assert cfg.clustering.fragment_tol == 0.05
+        assert cfg.clustering.linkage == "complete"
+        assert cfg.clustering.distance_threshold == 0.1
+        assert cfg.clustering.min_matched_peaks == 0
+        assert cfg.clustering.batch_size == 32768
+        assert cfg.clustering.precursor_charge_buckets is None
+        assert cfg.consensus == MedoidConsensusConfig()
+        assert hash(cfg) == hash(cfg)
+        with pytest.raises(ValidationError):
+            cfg.clustering.batch_size = 10  # type: ignore[misc]
+
+    def test_falcon_settings_defaults_without_io_paths(self):
+        settings = FalconSettings()
+        assert settings.io == PartialIOConfig()
+        assert settings.io.input_filenames is None
+        assert settings.io.output_filename is None
+        assert isinstance(ConfigError("bad"), ValueError)
+
+    def test_int_accepted_for_float_fields(self):
+        cfg = PreprocessingConfig(
+            min_mz=0, max_mz=1000, min_mz_range=150, remove_precursor_tol=2
+        )
+        assert cfg.min_mz == 0.0
+        assert cfg.max_mz == 1000.0
+        assert cfg.min_mz_range == 150.0
+        assert cfg.remove_precursor_tol == 2.0
 
     @pytest.mark.parametrize(
-        ("tol_val", "tol_mode", "expected_val"),
+        ("model_cls", "kwargs"),
         [
-            ("20", "ppm", 20.0),
-            ("0.5", "Da", 0.5),
-            ("0", "Da", 0.0),
+            (PreprocessingConfig, {"min_peaks": True}),
+            (PreprocessingConfig, {"min_peaks": 5.0}),
+            (PreprocessingConfig, {"min_peaks": "5"}),
+            (PreprocessingConfig, {"min_mz": True}),
+            (PreprocessingConfig, {"min_mz": "101.0"}),
+            (PreprocessingConfig, {"max_peaks_used": False}),
+            (PreprocessingConfig, {"max_peaks_used": 50.0}),
+            (PreprocessingConfig, {"unknown_key": 1}),
+            (ClusteringConfig, {"batch_size": True}),
+            (ClusteringConfig, {"batch_size": 10.0}),
+            (ClusteringConfig, {"min_matched_peaks": False}),
+            (ClusteringConfig, {"distance_threshold": "0.1"}),
+            (ClusteringConfig, {"distance_threshold": True}),
+            (ClusteringConfig, {"extra_field": 123}),
+            (PrecursorTolerance, {"mass": True}),
+            (PrecursorTolerance, {"mass": "20"}),
+            (PrecursorTolerance, {"mode": "PPM"}),
+            (PrecursorTolerance, {"mode": "da"}),
+            (PrecursorTolerance, {"extra": 1}),
+            (PartialIOConfig, {"overwrite": 1}),
+            (PartialIOConfig, {"overwrite": "true"}),
+            (PartialIOConfig, {"export_representatives": "yes"}),
+            (PartialIOConfig, {"work_dir": 123}),
+            (PartialIOConfig, {"work_dir": True}),
+            (MedoidConsensusConfig, {"outlier_cutoff_lower": 1.5}),
+            (AverageConsensusConfig, {"outlier_cutoff_lower": True}),
+            (AverageConsensusConfig, {"outlier_cutoff_upper": "1.5"}),
+            (FalconSettings, {"unknown_section": {}}),
         ],
     )
-    def test_precursor_tol_valid(self, tol_val, tol_mode, expected_val):
-        cfg = _parse(["in.mgf", "out", "--precursor_tol", tol_val, tol_mode])
-        assert cfg.precursor_tol == [expected_val, tol_mode]
+    def test_strict_types_and_extra_forbid(self, model_cls, kwargs):
+        with pytest.raises(ValidationError):
+            model_cls.model_validate(kwargs)
 
     @pytest.mark.parametrize("scaling", ["off", "root", "log", "rank"])
-    def test_scaling_choices(self, scaling):
-        cfg = _parse(["in.mgf", "out", "--scaling", scaling])
-        assert cfg.scaling == scaling
+    def test_valid_scaling_choices(self, scaling):
+        assert PreprocessingConfig(scaling=scaling).scaling == scaling
 
     @pytest.mark.parametrize("linkage", ["single", "complete", "average"])
-    def test_linkage_choices(self, linkage):
-        cfg = _parse(["in.mgf", "out", "--linkage", linkage])
-        assert cfg.linkage == linkage
+    def test_valid_linkage_choices(self, linkage):
+        assert ClusteringConfig(linkage=linkage).linkage == linkage
 
-    @pytest.mark.parametrize("method", ["medoid", "average"])
-    def test_consensus_method_choices(self, method):
-        cfg = _parse(["in.mgf", "out", "--consensus_method", method])
-        assert cfg.consensus_method == method
-
-    def test_config_file_loading_and_cli_precedence(self, tmp_path):
-        cfg_file = tmp_path / "config.ini"
-        cfg_file.write_text(
-            "fragment_tol = 0.1\nmin_peaks = 9\nlinkage = average\n"
+    def test_consensus_discriminated_union(self):
+        avg = FalconSettings.model_validate(
+            {
+                "consensus": {
+                    "method": "average",
+                    "outlier_cutoff_lower": 2.0,
+                    "outlier_cutoff_upper": 3.0,
+                }
+            }
         )
-        cfg = _parse(
-            [
-                "in.mgf",
-                "out",
-                "-c",
-                str(cfg_file),
-                "--fragment_tol",
-                "0.03",
-            ]
-        )
-        # CLI overrides INI; unspecified INI values override defaults.
-        assert cfg.fragment_tol == 0.03
-        assert cfg.min_peaks == 9
-        assert cfg.linkage == "average"
+        assert isinstance(avg.consensus, AverageConsensusConfig)
+        assert avg.consensus.outlier_cutoff_lower == 2.0
+        assert avg.consensus.outlier_cutoff_upper == 3.0
 
-    def test_help_formatter_preserves_newlines(self):
-        formatter = NewlineTextHelpFormatter("falcon")
-        text = "Line one\n\nLine two"
-        formatted = formatter._fill_text(text, width=80, indent="")
-        assert formatted == "Line one\n\nLine two"
-
-
-# ----------------------------------------------------------------------
-# Charge bucket parsing and validation
-# ----------------------------------------------------------------------
-
-
-class TestChargeBucketsParsing:
-    def test_explicit_buckets_with_unknown_and_other(self):
-        cfg = _parse(
-            [
-                "in.mgf",
-                "out",
-                "--precursor_charge_buckets",
-                "[1]",
-                "[2, 3]",
-                "[unknown]",
-                "other",
-            ]
-        )
-        assert cfg.precursor_charge_buckets == [
-            {1},
-            {2, 3},
-            {"unknown"},
-            "other",
-        ]
-
-    def test_unbracketed_whitespace_and_mixed_unknown(self):
-        cfg = _parse(
-            [
-                "in.mgf",
-                "out",
-                "--precursor_charge_buckets",
-                " 1, unknown ",
-                "[ -2 , , -1 ]",
-            ]
-        )
-        assert cfg.precursor_charge_buckets == [
-            {1, "unknown"},
-            {-2, -1},
-        ]
-
-    @pytest.mark.parametrize(
-        "bucket_args",
-        [
-            ["[1, 2]", "[2, 3]"],  # overlapping int charge
-            ["[1, unknown]", "[unknown]"],  # overlapping unknown
-            ["[1]", "other", "other"],  # duplicate catch-all 'other'
-            ["[]"],  # empty bracketed bucket
-            ["[ , ]"],  # only whitespace/commas
-            [""],  # empty string
-            ["[abc]"],  # non-integer token
-            ["[1.5]"],  # float token
-            ["[other]"],  # 'other' inside brackets
-        ],
-    )
-    def test_invalid_charge_buckets_rejected(self, bucket_args):
-        with pytest.raises(SystemExit) as exc_info:
-            _parse(
-                [
-                    "in.mgf",
-                    "out",
-                    "--precursor_charge_buckets",
-                    *bucket_args,
-                ]
+        with pytest.raises(ValidationError):
+            FalconSettings.model_validate(
+                {
+                    "consensus": {
+                        "method": "medoid",
+                        "outlier_cutoff_lower": 2.0,
+                    }
+                }
             )
-        assert exc_info.value.code == 2
 
 
 # ----------------------------------------------------------------------
-# Parameter validation
+# Numeric bounds, finiteness, and nullable TOML sentinels
 # ----------------------------------------------------------------------
 
 
-class TestConfigValidation:
+class TestBoundsAndSentinels:
     @pytest.mark.parametrize(
-        "bad_args",
+        "bad_float", [float("nan"), float("inf"), -float("inf")]
+    )
+    def test_non_finite_floats_rejected(self, bad_float):
+        with pytest.raises(ValidationError):
+            PrecursorTolerance(mass=bad_float, mode="ppm")
+        with pytest.raises(ValidationError):
+            ClusteringConfig(rt_tol=bad_float)
+        with pytest.raises(ValidationError):
+            ClusteringConfig(fragment_tol=bad_float)
+        with pytest.raises(ValidationError):
+            ClusteringConfig(distance_threshold=bad_float)
+        with pytest.raises(ValidationError):
+            PreprocessingConfig(min_mz_range=bad_float)
+        with pytest.raises(ValidationError):
+            PreprocessingConfig(min_mz=bad_float)
+        with pytest.raises(ValidationError):
+            PreprocessingConfig(max_mz=bad_float)
+        with pytest.raises(ValidationError):
+            PreprocessingConfig(remove_precursor_tol=bad_float)
+        with pytest.raises(ValidationError):
+            PreprocessingConfig(min_intensity=bad_float)
+        with pytest.raises(ValidationError):
+            AverageConsensusConfig(outlier_cutoff_lower=bad_float)
+        with pytest.raises(ValidationError):
+            AverageConsensusConfig(outlier_cutoff_upper=bad_float)
+
+    @pytest.mark.parametrize(
+        ("model_cls", "kwargs"),
         [
-            ["--precursor_tol", "20", "mz"],  # unknown unit
-            ["--precursor_tol", "20", "PPM"],  # case-sensitive mode
-            ["--precursor_tol", "20", "da"],  # case-sensitive mode
-            ["--precursor_tol", "abc", "ppm"],  # non-numeric mass
-            ["--precursor_tol", "-1", "Da"],  # negative mass
-            ["--precursor_tol", "nan", "ppm"],  # NaN mass
-            ["--distance_threshold", "0"],  # zero threshold
-            ["--distance_threshold", "-0.1"],  # negative threshold
-            ["--distance_threshold", "nan"],  # NaN threshold
-            ["--batch_size", "0"],  # zero batch size
-            ["--batch_size", "-10"],  # negative batch size
-            ["--linkage", "ward"],  # unsupported linkage
-            ["--consensus_method", "median"],  # unsupported consensus
-            ["--scaling", "zscore"],  # unsupported scaling
+            (PrecursorTolerance, {"mass": -0.01, "mode": "Da"}),
+            (ClusteringConfig, {"rt_tol": -1.0}),
+            (ClusteringConfig, {"fragment_tol": 0.0}),
+            (ClusteringConfig, {"fragment_tol": -0.05}),
+            (ClusteringConfig, {"distance_threshold": 0.0}),
+            (ClusteringConfig, {"distance_threshold": -0.1}),
+            (ClusteringConfig, {"distance_threshold": 1.0}),
+            (ClusteringConfig, {"distance_threshold": 1.2}),
+            (ClusteringConfig, {"min_matched_peaks": -1}),
+            (ClusteringConfig, {"batch_size": 0}),
+            (ClusteringConfig, {"batch_size": -10}),
+            (PreprocessingConfig, {"min_peaks": 0}),
+            (PreprocessingConfig, {"min_mz": -1.0}),
+            (PreprocessingConfig, {"max_mz": 0.0}),
+            (PreprocessingConfig, {"min_mz_range": -0.1}),
+            (PreprocessingConfig, {"remove_precursor_tol": 0.0}),
+            (PreprocessingConfig, {"remove_precursor_tol": -1.0}),
+            (PreprocessingConfig, {"min_intensity": -0.01}),
+            (PreprocessingConfig, {"min_intensity": 1.0}),
+            (PreprocessingConfig, {"min_intensity": 1.5}),
+            (PreprocessingConfig, {"max_peaks_used": 0}),
+            (AverageConsensusConfig, {"outlier_cutoff_lower": 0.0}),
+            (AverageConsensusConfig, {"outlier_cutoff_lower": -1.0}),
+            (AverageConsensusConfig, {"outlier_cutoff_upper": 0.0}),
+            (AverageConsensusConfig, {"outlier_cutoff_upper": -0.5}),
         ],
     )
-    def test_invalid_cli_options_fail_fast(self, bad_args):
-        with pytest.raises(SystemExit) as exc_info:
-            _parse(["in.mgf", "out", *bad_args])
-        assert exc_info.value.code == 2
+    def test_out_of_range_values_rejected(self, model_cls, kwargs):
+        with pytest.raises(ValidationError):
+            model_cls.model_validate(kwargs)
 
-    def test_validate_before_parse_raises(self):
-        cfg = Config()
-        with pytest.raises(RuntimeError, match="not been initialized"):
-            cfg._validate()
+    def test_valid_edge_boundaries(self):
+        tol = PrecursorTolerance(mass=0.0, mode="Da")
+        assert tol.mass == 0.0
+        clust = ClusteringConfig(
+            rt_tol=0.0, distance_threshold=0.999, batch_size=1
+        )
+        assert clust.rt_tol == 0.0
+        assert clust.batch_size == 1
+        prep = PreprocessingConfig(
+            min_peaks=1,
+            min_mz=0.0,
+            max_mz=10.0,
+            min_mz_range=10.0,
+            min_intensity=0.0,
+            max_peaks_used=1,
+        )
+        assert prep.min_mz == 0.0
+        assert prep.min_mz_range == 10.0
+
+    def test_nullable_toml_sentinels_normalize_to_none(self):
+        settings = FalconSettings.model_validate(
+            {
+                "io": {"work_dir": "none"},
+                "preprocessing": {
+                    "remove_precursor_tol": "none",
+                    "max_peaks_used": "none",
+                },
+                "clustering": {
+                    "rt_tol": "none",
+                    "precursor_charge_buckets": "auto",
+                },
+            }
+        )
+        assert settings.io.work_dir is None
+        assert settings.preprocessing.remove_precursor_tol is None
+        assert settings.preprocessing.max_peaks_used is None
+        assert settings.clustering.rt_tol is None
+        assert settings.clustering.precursor_charge_buckets is None
+
+    @pytest.mark.parametrize(
+        ("model_cls", "kwargs"),
+        [
+            (ClusteringConfig, {"rt_tol": "off"}),
+            (ClusteringConfig, {"precursor_charge_buckets": "none"}),
+            (ClusteringConfig, {"precursor_charge_buckets": "off"}),
+            (PreprocessingConfig, {"remove_precursor_tol": "off"}),
+            (PreprocessingConfig, {"max_peaks_used": "all"}),
+        ],
+    )
+    def test_invalid_sentinel_strings_rejected(self, model_cls, kwargs):
+        with pytest.raises(ValidationError):
+            model_cls.model_validate(kwargs)
 
 
 # ----------------------------------------------------------------------
-# Attribute and mapping accessors
+# IOConfig path validation
 # ----------------------------------------------------------------------
 
 
-class TestConfigAccessors:
-    def test_access_before_parse_raises(self):
-        cfg = Config()
-        with pytest.raises(RuntimeError, match="not been initialized"):
-            _ = cfg.fragment_tol
-        with pytest.raises(RuntimeError, match="not been initialized"):
-            _ = cfg["fragment_tol"]
+class TestIOConfig:
+    def test_accepts_list_and_string_paths_preserving_dotted_prefix(self):
+        io = IOConfig.model_validate(
+            {
+                "input_filenames": ["a.mgf", "b.mzml"],
+                "output_filename": "dir/run_v1.2",
+                "work_dir": "./none",
+            }
+        )
+        assert io.input_filenames == ("a.mgf", "b.mzml")
+        assert io.output_filename == Path("dir/run_v1.2")
+        assert io.work_dir == Path("./none")
 
-    def test_getattr_getitem_and_setattr_sync(self):
-        cfg = _parse(["in.mgf", "out"])
-        assert cfg["fragment_tol"] == cfg.fragment_tol == 0.05
-        cfg.fragment_tol = 0.02
-        assert cfg["fragment_tol"] == 0.02
-        assert cfg.fragment_tol == 0.02
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"input_filenames": [], "output_filename": "out"},
+            {"input_filenames": [""], "output_filename": "out"},
+            {"input_filenames": ["   "], "output_filename": "out"},
+            {"input_filenames": "a.mgf", "output_filename": "out"},
+            {"input_filenames": [123], "output_filename": "out"},
+            {"input_filenames": ["a.mgf"], "output_filename": ""},
+            {"input_filenames": ["a.mgf"], "output_filename": "   "},
+            {"input_filenames": ["a.mgf"], "output_filename": Path(".")},
+            {"input_filenames": ["a.mgf"], "output_filename": Path("/")},
+            {
+                "input_filenames": ["a.mgf"],
+                "output_filename": "out",
+                "work_dir": "",
+            },
+            {
+                "input_filenames": ["a.mgf"],
+                "output_filename": "out",
+                "work_dir": "   ",
+            },
+        ],
+    )
+    def test_invalid_io_paths_rejected(self, payload):
+        with pytest.raises(ValidationError):
+            IOConfig.model_validate(payload)
 
-    def test_missing_option_raises_standard_errors(self):
-        cfg = _parse(["in.mgf", "out"])
-        assert not hasattr(cfg, "nonexistent_option")
-        with pytest.raises(AttributeError):
-            _ = cfg.nonexistent_option
-        with pytest.raises(KeyError):
-            _ = cfg["nonexistent_option"]
+
+# ----------------------------------------------------------------------
+# Charge bucket validation and canonicalization
+# ----------------------------------------------------------------------
+
+
+class TestChargeBuckets:
+    def test_canonicalizes_lists_tuples_and_sets(self):
+        clust = ClusteringConfig.model_validate(
+            {
+                "precursor_charge_buckets": [
+                    [3, 2],
+                    {"unknown", -1},
+                    (127, -128),
+                    "other",
+                ]
+            }
+        )
+        assert clust.precursor_charge_buckets == (
+            (2, 3),
+            (-1, "unknown"),
+            (-128, 127),
+            "other",
+        )
+
+    @pytest.mark.parametrize(
+        "buckets",
+        [
+            [],  # empty outer sequence
+            [[]],  # empty inner bucket
+            [[2, 2]],  # duplicate inside bucket
+            [["unknown", "unknown"]],  # duplicate unknown inside bucket
+            [[1, 2], [2, 3]],  # overlapping integer charge
+            [[1, "unknown"], ["unknown"]],  # overlapping unknown
+            [[1], "other", "other"],  # duplicate 'other'
+            [["other"]],  # 'other' inside a bucket
+            [[True]],  # bool inside bucket
+            [[False]],  # bool inside bucket
+            [[-129]],  # below int8 min
+            [[128]],  # above int8 max
+            [[1.5]],  # float charge
+            [["abc"]],  # invalid string charge
+            "12",  # bare string
+            [1],  # bare int instead of bucket sequence
+        ],
+    )
+    def test_invalid_charge_buckets_rejected(self, buckets):
+        with pytest.raises(ValidationError):
+            ClusteringConfig.model_validate(
+                {"precursor_charge_buckets": buckets}
+            )
+
+
+# ----------------------------------------------------------------------
+# Cross-field and cross-section invariants
+# ----------------------------------------------------------------------
+
+
+class TestCrossFieldInvariants:
+    def test_preprocessing_cross_field_checks(self):
+        with pytest.raises(ValidationError, match="min_mz"):
+            PreprocessingConfig(min_mz=500.0, max_mz=500.0)
+        with pytest.raises(ValidationError, match="min_mz"):
+            PreprocessingConfig(min_mz=600.0, max_mz=500.0)
+        with pytest.raises(ValidationError, match="min_mz_range"):
+            PreprocessingConfig(min_mz=100.0, max_mz=200.0, min_mz_range=150.0)
+        with pytest.raises(ValidationError, match="max_peaks_used"):
+            PreprocessingConfig(min_peaks=10, max_peaks_used=5)
+
+    def test_cross_section_min_matched_peaks_vs_max_peaks_used(self):
+        with pytest.raises(ValidationError, match="min_matched_peaks"):
+            FalconSettings(
+                preprocessing=PreprocessingConfig(max_peaks_used=5),
+                clustering=ClusteringConfig(min_matched_peaks=6),
+            )
+        # Valid when max_peaks_used is disabled (None).
+        settings = FalconSettings(
+            preprocessing=PreprocessingConfig(max_peaks_used=None),
+            clustering=ClusteringConfig(min_matched_peaks=100),
+        )
+        assert settings.clustering.min_matched_peaks == 100
+
+    def test_cross_section_fragment_tol_bin_overflow_rejected(self):
+        with pytest.raises(ValidationError, match="fragment_tol"):
+            FalconSettings(
+                preprocessing=PreprocessingConfig(min_mz=0.0, max_mz=1500.0),
+                clustering=ClusteringConfig(fragment_tol=1e-320),
+            )
+        with pytest.raises(ValidationError, match="bin"):
+            FalconSettings(
+                preprocessing=PreprocessingConfig(min_mz=0.0, max_mz=1500.0),
+                clustering=ClusteringConfig(fragment_tol=1e-8),
+            )

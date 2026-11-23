@@ -1,421 +1,417 @@
-"""Command-line and INI file configuration parsing and validation."""
+"""Strict, hierarchical configuration models and validation for Falcon."""
 
-import argparse
-import textwrap
-from collections.abc import Sequence
-from typing import Any
+from __future__ import annotations
 
-import configargparse
+import math
+from pathlib import Path
+from typing import Annotated, Any, Literal, Self
 
-from falcon import __version__
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    GetJsonSchemaHandler,
+    model_validator,
+)
+from pydantic.json_schema import JsonSchemaValue
+from pydantic_core import core_schema
+
+_INT8_MIN = -128
+_INT8_MAX = 127
+_INT32_MAX = 2**31 - 1
+
+ChargeValue = int | Literal["unknown"]
+ChargeBucket = tuple[ChargeValue, ...] | Literal["other"]
 
 
-class NewlineTextHelpFormatter(argparse.HelpFormatter):
-    """Help formatter that preserves explicit newlines in text."""
-
-    def _fill_text(self, text: str, width: int, indent: str) -> str:
-        return "\n".join(
-            textwrap.fill(
-                line,
-                width,
-                initial_indent=indent,
-                subsequent_indent=indent,
-                replace_whitespace=False,
-            ).strip()
-            for line in text.splitlines(keepends=True)
-        )
+class ConfigError(ValueError):
+    """Raised when configuration files or layer structures are invalid."""
 
 
-class Config:
-    """
-    Command-line and INI file configuration container.
+class _AllowSentinelSchema:
+    """Pydantic schema annotation adding a TOML string sentinel literal."""
 
-    Settings can be supplied via a ``config.ini`` file (by default in
-    the current directory), an explicit ``-c``/``--config`` file, or
-    command-line arguments. CLI values override file values, which
-    override defaults.
-    """
+    def __init__(self, sentinel: str) -> None:
+        self.sentinel = sentinel
 
-    def __init__(self) -> None:
-        """Initialize the argument parser and default settings."""
-        self._parser = configargparse.ArgParser(
-            description=(
-                "falcon: Large-scale tandem mass spectrum clustering\n"
-                "===================================================\n\n"
-                f"falcon version {__version__}\n\n"
-                "Official code website: "
-                "https://github.com/bittremieuxlab/falcon\n\n"
-            ),
-            default_config_files=["config.ini"],
-            args_for_setting_config_path=["-c", "--config"],
-            formatter_class=NewlineTextHelpFormatter,
-        )
+    def __get_pydantic_json_schema__(
+        self,
+        schema: core_schema.CoreSchema,
+        handler: GetJsonSchemaHandler,
+    ) -> JsonSchemaValue:
+        json_schema = handler(schema)
+        if "anyOf" in json_schema:
+            json_schema["anyOf"] = [
+                *json_schema["anyOf"],
+                {"const": self.sentinel},
+            ]
+        return json_schema
 
-        # IO
-        self._parser.add_argument(
-            "input_filenames",
-            nargs="+",
-            help="Input peak files (supported formats: .mzML, .mzXML, .MGF).",
-        )
-        self._parser.add_argument("output_filename", help="Output file name.")
-        self._parser.add_argument(
-            "--work_dir",
-            default=None,
-            help="Working directory (default: temporary directory).",
-        )
-        self._parser.add_argument(
-            "--overwrite",
-            action="store_true",
-            help="Overwrite existing results (default: don't overwrite).",
-        )
-        self._parser.add_argument(
-            "--export_representatives",
-            action="store_true",
-            help="Export cluster representatives to an MGF file "
-            "(default: no export).",
-        )
 
-        # CLUSTERING
-        self._parser.add_argument(
-            "--precursor_tol",
-            nargs=2,
-            default=[20, "ppm"],
-            help="Precursor tolerance mass and mode (default: 20 ppm). "
-            'Mode should be either "ppm" or "Da".',
-        )
-        self._parser.add_argument(
-            "--rt_tol",
-            type=float,
-            default=None,
-            help="Retention time tolerance (default: no retention time "
-            "filtering).",
-        )
-        self._parser.add_argument(
-            "--fragment_tol",
-            type=float,
-            default=0.05,
-            help="Fragment mass tolerance in m/z (default: %(default)s m/z).",
-        )
-        self._parser.add_argument(
-            "--linkage",
-            type=str,
-            default="complete",
-            choices=["single", "complete", "average"],
-            help="Linkage criterion for hierarchical clustering "
-            "(default: %(default)s).",
-        )
-        self._parser.add_argument(
-            "--distance_threshold",
-            type=float,
-            default=0.1,
-            help=(
-                "The distance threshold parameter (cosine distance) for "
-                "clustering (default: %(default)s). Relevant cosine distance "
-                "thresholds are typically between 0.05 and 0.30."
-            ),
-        )
-        self._parser.add_argument(
-            "--min_matched_peaks",
-            type=int,
-            default=0,
-            help=(
-                "Minimum number of matched peaks to consider the spectra "
-                "similar (default: %(default)s). Typically 6 for "
-                "metabolomics data."
-            ),
-        )
-        self._parser.add_argument(
-            "--consensus_method",
-            type=str,
-            default="medoid",
-            choices=["medoid", "average"],
-            help="Method to use for consensus spectrum computation "
-            "(default: %(default)s).",
-        )
-        self._parser.add_argument(
-            "--outlier_cutoff_lower",
-            type=float,
-            default=1.5,
-            help=(
-                "Number of standard deviations below the median for outlier "
-                "rejection (default: %(default)s). Only used when "
-                "consensus_method='average'."
-            ),
-        )
-        self._parser.add_argument(
-            "--outlier_cutoff_upper",
-            type=float,
-            default=1.5,
-            help=(
-                "Number of standard deviations above the median for outlier "
-                "rejection (default: %(default)s). Only used when "
-                "consensus_method='average'."
-            ),
-        )
-        self._parser.add_argument(
-            "--batch_size",
-            type=int,
-            default=2**15,
-            help="Batch size for clustering (default: %(default)s).",
-        )
-        self._parser.add_argument(
-            "--precursor_charge_buckets",
-            nargs="+",
-            default=None,
-            metavar="BUCKET",
-            help=(
-                "Charge buckets for precursor charges. Clustering will be "
-                "performed separately within each bucket. If not specified, "
-                "every distinct precursor charge is caught and "
-                "clustered separately, including spectra with a missing "
-                "charge. To group charges instead, pass one bucket per "
-                "argument, e.g. '[1]' '[2]' '[3]' '[4]' '[unknown]' 'other' "
-                "(each bucket is a list of charges; 'unknown' matches missing "
-                "charges and 'other' catches any charge not in a named "
-                "bucket)."
-            ),
-        )
+def _none_sentinel(value: Any) -> Any:
+    """Normalize the TOML/CLI ``"none"`` sentinel to ``None``."""
+    if value == "none":
+        return None
+    return value
 
-        # PREPROCESSING
-        self._parser.add_argument(
-            "--min_peaks",
-            default=5,
-            type=int,
-            help="Discard spectra with fewer than this number of peaks "
-            "(default: %(default)s).",
-        )
-        self._parser.add_argument(
-            "--min_mz_range",
-            default=250.0,
-            type=float,
-            help="Discard spectra with a smaller mass range "
-            "(default: %(default)s m/z).",
-        )
-        self._parser.add_argument(
-            "--min_mz",
-            default=101.0,
-            type=float,
-            help="Minimum peak m/z value (inclusive, "
-            "default: %(default)s m/z).",
-        )
-        self._parser.add_argument(
-            "--max_mz",
-            default=1500.0,
-            type=float,
-            help="Maximum peak m/z value (inclusive, "
-            "default: %(default)s m/z).",
-        )
-        self._parser.add_argument(
-            "--remove_precursor_tol",
-            default=1.5,
-            type=float,
-            help="Window around the precursor mass to remove peaks "
-            "(default: %(default)s m/z).",
-        )
-        self._parser.add_argument(
-            "--min_intensity",
-            default=0.01,
-            type=float,
-            help="Remove peaks with a lower intensity relative to the base "
-            "intensity (default: %(default)s).",
-        )
-        self._parser.add_argument(
-            "--max_peaks_used",
-            default=50,
-            type=int,
-            help="Only use the specified most intense peaks in the spectra "
-            "(default: %(default)s).",
-        )
-        self._parser.add_argument(
-            "--scaling",
-            default="off",
-            type=str,
-            choices=["off", "root", "log", "rank"],
-            help="Peak scaling method used to reduce the influence of very "
-            "intense peaks (default: %(default)s).",
-        )
-        # Filled in 'parse', contains the specified settings.
-        self._namespace: dict[str, Any] | None = None
 
-    def parse(self, args_str: str | list[str] | None = None) -> None:
-        """
-        Parse and validate configuration settings.
+def _parse_path(value: Any) -> Path:
+    """Validate and convert a non-empty string or Path to ``Path``."""
+    if isinstance(value, Path):
+        if not str(value).strip():
+            raise ValueError("Path must not be empty")
+        return value
+    if isinstance(value, str):
+        if not value.strip():
+            raise ValueError("Path must not be empty or whitespace")
+        return Path(value)
+    raise ValueError(f"Expected a path string or Path, got {type(value)}")
 
-        Parameters
-        ----------
-        args_str : str | list[str] | None, default=None
-            CLI arguments to parse. When ``None``, arguments are read
-            from ``sys.argv``; omitted options fall back to the config
-            file and then built-in defaults.
-        """
-        self._namespace = vars(self._parser.parse_args(args_str))
 
-        try:
-            self._namespace["precursor_tol"][0] = float(
-                self._namespace["precursor_tol"][0]
+def _parse_optional_path(value: Any) -> Path | None:
+    """Parse an optional path, treating ``"none"`` as ``None``."""
+    if value is None or value == "none":
+        return None
+    return _parse_path(value)
+
+
+def _parse_output_prefix(value: Any) -> Path:
+    """Validate an output file prefix path (non-empty file name)."""
+    path = _parse_path(value)
+    if path.name in ("", ".", ".."):
+        raise ValueError(
+            "output_filename must include a file prefix name, "
+            f"got {str(path)!r}"
+        )
+    return path
+
+
+def _parse_optional_output_prefix(value: Any) -> Path | None:
+    """Validate an optional output file prefix path."""
+    if value is None:
+        return None
+    return _parse_output_prefix(value)
+
+
+def _parse_input_filenames(value: Any) -> tuple[str, ...]:
+    """Validate a non-empty sequence of non-blank input file patterns."""
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("input_filenames must be a list or tuple of strings")
+    if len(value) == 0:
+        raise ValueError("input_filenames must contain at least one pattern")
+    result: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError(
+                "Each entry in input_filenames must be a non-empty string"
             )
-        except ValueError:
-            self._parser.error(
-                "--precursor_tol mass must be a number, got "
-                f'"{self._namespace["precursor_tol"][0]}"'
-            )
+        result.append(item)
+    return tuple(result)
 
-        # Leave unset buckets as None so each observed charge (including
-        # missing charges) is clustered in its own bucket.
-        if self._namespace["precursor_charge_buckets"] is not None:
-            self._namespace["precursor_charge_buckets"] = (
-                self.parse_and_validate_charge_buckets(
-                    self._namespace["precursor_charge_buckets"]
+
+def _parse_optional_input_filenames(value: Any) -> tuple[str, ...] | None:
+    """Validate an optional sequence of input file patterns."""
+    if value is None:
+        return None
+    return _parse_input_filenames(value)
+
+
+def _charge_sort_key(value: ChargeValue) -> tuple[bool, int | str]:
+    """Sort numeric charges ascending before the ``"unknown"`` sentinel."""
+    return (isinstance(value, str), value)
+
+
+def _parse_single_charge_bucket(
+    raw_bucket: Any,
+    seen_values: set[ChargeValue],
+) -> tuple[ChargeValue, ...]:
+    """Validate and canonicalize one non-``"other"`` charge bucket."""
+    if not isinstance(raw_bucket, (list, tuple, set, frozenset)):
+        raise ValueError(
+            "Each charge bucket must be a sequence of charges or 'other'"
+        )
+    if len(raw_bucket) == 0:
+        raise ValueError("Charge bucket must not be empty")
+
+    bucket_seen: set[ChargeValue] = set()
+    for elem in raw_bucket:
+        if isinstance(elem, bool):
+            raise ValueError(
+                "Charge bucket entries must be integers or 'unknown', "
+                "not booleans"
+            )
+        if elem == "unknown":
+            parsed: ChargeValue = "unknown"
+        elif isinstance(elem, int):
+            if not (_INT8_MIN <= elem <= _INT8_MAX):
+                raise ValueError(
+                    f"Precursor charge {elem} is outside int8 range "
+                    f"[{_INT8_MIN}, {_INT8_MAX}]"
                 )
-            )
-
-        self._validate()
-
-    def _validate(self) -> None:
-        """
-        Validate parsed settings that argparse cannot check directly.
-
-        Invalid values are reported via ``self._parser.error`` so CLI
-        errors fail fast at startup with standard usage output.
-        """
-        if self._namespace is None:
-            raise RuntimeError("The configuration has not been initialized")
-        ns = self._namespace
-        if not (ns["precursor_tol"][0] >= 0):
-            self._parser.error(
-                "--precursor_tol mass must be non-negative, got "
-                f"{ns['precursor_tol'][0]}"
-            )
-        mode = ns["precursor_tol"][1]
-        if mode not in ("ppm", "Da"):
-            self._parser.error(
-                f'--precursor_tol mode must be "ppm" or "Da", got "{mode}"'
-            )
-        if not (ns["distance_threshold"] > 0):
-            self._parser.error(
-                "--distance_threshold must be positive, got "
-                f"{ns['distance_threshold']}"
-            )
-        if ns["batch_size"] < 1:
-            self._parser.error(
-                "--batch_size must be a positive integer, got "
-                f"{ns['batch_size']}"
-            )
-
-    def parse_and_validate_charge_buckets(
-        self, bucket_args: Sequence[str]
-    ) -> list[set[int | str] | str]:
-        """
-        Parse and validate precursor charge bucket specifications.
-
-        Parameters
-        ----------
-        bucket_args : Sequence[str]
-            Raw charge bucket specifications from the CLI or config
-            file (e.g. ``"[1]"``, ``"[2, 3]"``, ``"[unknown]"``,
-            ``"other"``).
-
-        Returns
-        -------
-        list[set[int | str] | str]
-            Parsed buckets, each either a set of integer charges and/or
-            ``"unknown"``, or the sentinel string ``"other"``.
-        """
-        buckets: list[set[int | str] | str] = []
-        seen_values: set[int | str] = set()
-        seen_other = False
-
-        for raw in bucket_args:
-            raw = raw.strip()
-
-            if raw == "other":
-                if seen_other:
-                    self._parser.error(
-                        "Charge bucket 'other' appears more than once"
-                    )
-                seen_other = True
-                buckets.append("other")
-                continue
-
-            values = self._parse_charge_bucket(raw)
-
-            # Reject charges assigned to more than one bucket.
-            overlap = values & seen_values
-            if overlap:
-                sorted_overlap = sorted(
-                    overlap, key=lambda x: (isinstance(x, str), x)
-                )
-                self._parser.error(
-                    f"Charge value(s) {sorted_overlap} "
-                    f"appear in more than one bucket"
-                )
-
-            seen_values |= values
-            buckets.append(values)
-
-        return buckets
-
-    def _parse_charge_bucket(self, raw: str) -> set[int | str]:
-        """
-        Parse a single charge bucket specification into a set of values.
-
-        Accepts an optionally bracketed comma-separated list of integer
-        charges and/or the ``unknown`` sentinel, e.g. ``[1]``,
-        ``[2, 3]``, ``[unknown]``, or ``[1, unknown]``.
-
-        Parameters
-        ----------
-        raw : str
-            Raw single-bucket specification.
-
-        Returns
-        -------
-        set[int | str]
-            Parsed integer charges and/or ``"unknown"`` in the bucket.
-        """
-        inner = raw
-        if inner.startswith("[") and inner.endswith("]"):
-            inner = inner[1:-1]
-        values: set[int | str] = set()
-        for part in inner.split(","):
-            part = part.strip()
-            if not part:
-                continue
-            if part == "unknown":
-                values.add("unknown")
-            else:
-                try:
-                    values.add(int(part))
-                except ValueError:
-                    self._parser.error(
-                        f"Invalid charge bucket value '{part}' in '{raw}' "
-                        f"(expected integers and/or 'unknown')"
-                    )
-        if not values:
-            self._parser.error(f"Empty charge bucket: '{raw}'")
-        return values
-
-    def __getattr__(self, option: str) -> Any:
-        """Return a parsed configuration option by attribute name."""
-        if self._namespace is None:
-            raise RuntimeError("The configuration has not been initialized")
-        try:
-            return self._namespace[option]
-        except KeyError as exc:
-            raise AttributeError(option) from exc
-
-    def __setattr__(self, option: str, value: Any) -> None:
-        """Set private attributes normally and update parsed options."""
-        if option.startswith("_") or self._namespace is None:
-            super().__setattr__(option, value)
+            parsed = elem
         else:
-            self._namespace[option] = value
+            raise ValueError(
+                f"Invalid charge bucket entry {elem!r}: expected int8 "
+                f"charge or 'unknown'"
+            )
 
-    def __getitem__(self, item: str) -> Any:
-        """Return a parsed configuration option by mapping key."""
-        if self._namespace is None:
-            raise RuntimeError("The configuration has not been initialized")
-        return self._namespace[item]
+        if parsed in bucket_seen:
+            raise ValueError(
+                f"Duplicate charge value {parsed!r} within the same bucket"
+            )
+        if parsed in seen_values:
+            raise ValueError(
+                f"Charge value {parsed!r} appears in more than one bucket"
+            )
+        bucket_seen.add(parsed)
+
+    seen_values |= bucket_seen
+    return tuple(sorted(bucket_seen, key=_charge_sort_key))
 
 
-config = Config()
+def _parse_charge_buckets(
+    value: Any,
+) -> tuple[ChargeBucket, ...] | None:
+    """Validate and canonicalize ``precursor_charge_buckets``."""
+    if value is None or value == "auto":
+        return None
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(
+            "precursor_charge_buckets must be 'auto' or a non-empty list "
+            "of buckets"
+        )
+    if len(value) == 0:
+        raise ValueError("precursor_charge_buckets must not be empty")
+
+    buckets: list[ChargeBucket] = []
+    seen_values: set[ChargeValue] = set()
+    seen_other = False
+    for raw_bucket in value:
+        if raw_bucket == "other":
+            if seen_other:
+                raise ValueError(
+                    "Charge bucket 'other' appears more than once"
+                )
+            seen_other = True
+            buckets.append("other")
+            continue
+        buckets.append(_parse_single_charge_bucket(raw_bucket, seen_values))
+
+    return tuple(buckets)
+
+
+FiniteFloat = Annotated[float, Field(allow_inf_nan=False)]
+NonNegFloat = Annotated[float, Field(ge=0.0, allow_inf_nan=False)]
+PosFloat = Annotated[float, Field(gt=0.0, allow_inf_nan=False)]
+
+OptionalNonNegFloat = Annotated[
+    NonNegFloat | None,
+    BeforeValidator(_none_sentinel),
+    _AllowSentinelSchema("none"),
+]
+OptionalPosFloat = Annotated[
+    PosFloat | None,
+    BeforeValidator(_none_sentinel),
+    _AllowSentinelSchema("none"),
+]
+OptionalPosInt = Annotated[
+    Annotated[int, Field(ge=1)] | None,
+    BeforeValidator(_none_sentinel),
+    _AllowSentinelSchema("none"),
+]
+OptionalWorkDir = Annotated[
+    Path | None,
+    BeforeValidator(_parse_optional_path),
+    _AllowSentinelSchema("none"),
+]
+OptionalChargeBuckets = Annotated[
+    tuple[ChargeBucket, ...] | None,
+    BeforeValidator(_parse_charge_buckets),
+    _AllowSentinelSchema("auto"),
+]
+
+_STRICT_MODEL_CONFIG = ConfigDict(frozen=True, extra="forbid", strict=True)
+
+
+class PrecursorTolerance(BaseModel):
+    """Precursor mass tolerance value and unit mode."""
+
+    model_config = _STRICT_MODEL_CONFIG
+
+    mass: NonNegFloat = 20.0
+    mode: Literal["ppm", "Da"] = "ppm"
+
+
+class PreprocessingConfig(BaseModel):
+    """Spectrum quality-filtering and normalization settings."""
+
+    model_config = _STRICT_MODEL_CONFIG
+
+    min_peaks: Annotated[int, Field(ge=1)] = 5
+    min_mz_range: NonNegFloat = 250.0
+    min_mz: NonNegFloat = 101.0
+    max_mz: PosFloat = 1500.0
+    remove_precursor_tol: OptionalPosFloat = 1.5
+    min_intensity: Annotated[
+        float, Field(ge=0.0, lt=1.0, allow_inf_nan=False)
+    ] = 0.01
+    max_peaks_used: OptionalPosInt = 50
+    scaling: Literal["off", "root", "log", "rank"] = "off"
+
+    @model_validator(mode="after")
+    def _validate_invariants(self) -> Self:
+        if self.min_mz >= self.max_mz:
+            raise ValueError(
+                f"min_mz ({self.min_mz}) must be strictly less than "
+                f"max_mz ({self.max_mz})"
+            )
+        if self.min_mz_range > self.max_mz - self.min_mz:
+            raise ValueError(
+                f"min_mz_range ({self.min_mz_range}) exceeds available "
+                f"m/z span max_mz - min_mz ({self.max_mz - self.min_mz})"
+            )
+        if (
+            self.max_peaks_used is not None
+            and self.max_peaks_used < self.min_peaks
+        ):
+            raise ValueError(
+                f"max_peaks_used ({self.max_peaks_used}) must be at least "
+                f"min_peaks ({self.min_peaks})"
+            )
+        return self
+
+
+class ClusteringConfig(BaseModel):
+    """Spectrum comparison and hierarchical clustering settings."""
+
+    model_config = _STRICT_MODEL_CONFIG
+
+    precursor_tol: PrecursorTolerance = Field(
+        default_factory=PrecursorTolerance
+    )
+    rt_tol: OptionalNonNegFloat = None
+    fragment_tol: PosFloat = 0.05
+    linkage: Literal["single", "complete", "average"] = "complete"
+    distance_threshold: Annotated[
+        float, Field(gt=0.0, lt=1.0, allow_inf_nan=False)
+    ] = 0.1
+    min_matched_peaks: Annotated[int, Field(ge=0)] = 0
+    batch_size: Annotated[int, Field(ge=1)] = 2**15
+    precursor_charge_buckets: OptionalChargeBuckets = None
+
+
+class MedoidConsensusConfig(BaseModel):
+    """Medoid representative spectrum selection settings."""
+
+    model_config = _STRICT_MODEL_CONFIG
+
+    method: Literal["medoid"] = "medoid"
+
+
+class AverageConsensusConfig(BaseModel):
+    """Averaged consensus spectrum with iterative sigma clipping."""
+
+    model_config = _STRICT_MODEL_CONFIG
+
+    method: Literal["average"] = "average"
+    outlier_cutoff_lower: PosFloat = 1.5
+    outlier_cutoff_upper: PosFloat = 1.5
+
+
+ConsensusConfig = Annotated[
+    MedoidConsensusConfig | AverageConsensusConfig,
+    Field(discriminator="method"),
+]
+
+
+class _BaseIOConfig(BaseModel):
+    """Shared optional I/O flags for partial and complete configs."""
+
+    model_config = _STRICT_MODEL_CONFIG
+
+    work_dir: OptionalWorkDir = None
+    overwrite: bool = False
+    export_representatives: bool = False
+
+
+class PartialIOConfig(_BaseIOConfig):
+    """Input/output settings where paths may be omitted in overlays."""
+
+    input_filenames: Annotated[
+        tuple[str, ...] | None,
+        BeforeValidator(_parse_optional_input_filenames),
+    ] = None
+    output_filename: Annotated[
+        Path | None,
+        BeforeValidator(_parse_optional_output_prefix),
+    ] = None
+
+
+class IOConfig(_BaseIOConfig):
+    """Complete input/output settings required to execute a run."""
+
+    input_filenames: Annotated[
+        tuple[str, ...],
+        BeforeValidator(_parse_input_filenames),
+    ]
+    output_filename: Annotated[
+        Path,
+        BeforeValidator(_parse_output_prefix),
+    ]
+
+
+class _BaseFalconConfig(BaseModel):
+    """Shared scientific configuration sections and cross-section checks."""
+
+    model_config = _STRICT_MODEL_CONFIG
+
+    preprocessing: PreprocessingConfig = Field(
+        default_factory=PreprocessingConfig
+    )
+    clustering: ClusteringConfig = Field(default_factory=ClusteringConfig)
+    consensus: ConsensusConfig = Field(default_factory=MedoidConsensusConfig)
+
+    @model_validator(mode="after")
+    def _validate_cross_section(self) -> Self:
+        max_peaks = self.preprocessing.max_peaks_used
+        if (
+            max_peaks is not None
+            and self.clustering.min_matched_peaks > max_peaks
+        ):
+            raise ValueError(
+                f"clustering.min_matched_peaks "
+                f"({self.clustering.min_matched_peaks}) cannot exceed "
+                f"preprocessing.max_peaks_used ({max_peaks})"
+            )
+
+        min_mz = self.preprocessing.min_mz
+        max_mz = self.preprocessing.max_mz
+        frag_tol = self.clustering.fragment_tol
+        span_ratio = (max_mz - min_mz) / frag_tol
+        if not math.isfinite(span_ratio):
+            raise ValueError(
+                f"clustering.fragment_tol ({frag_tol}) causes non-finite "
+                f"m/z bin count over [{min_mz}, {max_mz}]"
+            )
+        start_dim = min_mz - (min_mz % frag_tol)
+        end_dim = max_mz + frag_tol - (max_mz % frag_tol)
+        n_bins_raw = (end_dim - start_dim) / frag_tol
+        if not math.isfinite(n_bins_raw) or math.ceil(n_bins_raw) > _INT32_MAX:
+            raise ValueError(
+                f"m/z bin count for [{min_mz}, {max_mz}] at fragment_tol="
+                f"{frag_tol} exceeds int32 maximum ({_INT32_MAX})"
+            )
+        return self
+
+
+class FalconSettings(_BaseFalconConfig):
+    """Validated Falcon settings allowing omitted run I/O paths."""
+
+    io: PartialIOConfig = Field(default_factory=PartialIOConfig)
+
+
+class FalconConfig(_BaseFalconConfig):
+    """Complete, immutable, validated configuration for a Falcon run."""
+
+    io: IOConfig

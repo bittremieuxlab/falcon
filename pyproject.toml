@@ -24,7 +24,6 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Bio-Informatics",
 ]
 dependencies = [
-    "configargparse>=1.4",
     "fastcluster>=1.3.0",
     "joblib>=1.3.0",
     "lxml>=4.6.2",
@@ -33,6 +32,7 @@ dependencies = [
     "numpy>=1.19.4",
     "pandas>=1.2.0",
     "pyarrow>=2.0.0",
+    "pydantic>=2.10",
     "pylance>=14.0.3",
     "pyteomics[xml]>=4.4.0",
     "scipy>=1.5.3",
