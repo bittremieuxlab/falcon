@@ -1125,7 +1125,8 @@ def _singleton_consensus_tuple(
         precursor_mz=np.float32(spec.precursor_mz),
         precursor_charge=(
             np.int32(spec.precursor_charge)
-            if not np.isnan(spec.precursor_charge)
+            if spec.precursor_charge is not None
+            and not np.isnan(spec.precursor_charge)
             else np.nan
         ),
         mz=spec.mz.astype(np.float32),
@@ -1245,8 +1246,11 @@ def _cluster_mz_interval(
             labels = labels[refined_order]
             rts = rts[refined_order]
             order_map = np.arange(len(labels))[label_order][refined_order]
-            if consensus_method == "medoid":
-                consensus_params["pdist"] = pdist
+            rep_params = (
+                {**consensus_params, "pdist": pdist}
+                if consensus_method == "medoid"
+                else consensus_params
+            )
             # Representative spectra are returned sorted by label.
             rep_spectra = _get_representative_spectra(
                 spec_tuples,
@@ -1254,8 +1258,9 @@ def _cluster_mz_interval(
                 rts,
                 order_map,
                 consensus_method,
-                consensus_params,
+                rep_params,
             )
+            del rep_params
             cluster_labels = labels[refined_order_inv[label_order_inv]]
         else:  # Every spectrum ended up as its own singleton.
             rts_in = rts[label_order_inv]

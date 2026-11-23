@@ -157,7 +157,8 @@ def _consensus_tuples_from_columns(
             precursor_mz=np.float32(precursor_mzs[i]),
             precursor_charge=(
                 np.int32(precursor_charges[i])
-                if not np.isnan(precursor_charges[i])
+                if precursor_charges[i] is not None
+                and not np.isnan(precursor_charges[i])
                 else np.nan
             ),
             mz=mzs[i].astype(np.float32),

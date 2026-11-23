@@ -67,7 +67,28 @@ jobs:
         run: uv sync --locked --no-default-groups --group test
 
       - name: Run pytest with coverage
-        run: uv run pytest --cov=falcon --cov-report=term-missing
+        run: >-
+          uv run pytest
+          --cov=falcon
+          --cov-report=term-missing
+          --cov-fail-under=95
+
+      - name: Publish coverage summary
+        if: >-
+          !cancelled() &&
+          matrix.os == 'ubuntu-latest' &&
+          matrix.python-version == '3.12'
+        env:
+          RUNNER_OS_LABEL: ${{ matrix.os }}
+          PYTHON_VERSION: ${{ matrix.python-version }}
+        run: |
+          if [ -f .coverage ]; then
+            {
+              echo "### Coverage (${RUNNER_OS_LABEL}, Python ${PYTHON_VERSION})"
+              echo ""
+              uv run coverage report --format=markdown
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
   build:
     name: Build & Smoke Test Package

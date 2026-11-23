@@ -250,9 +250,15 @@ class Config:
         """
         self._namespace = vars(self._parser.parse_args(args_str))
 
-        self._namespace["precursor_tol"][0] = float(
-            self._namespace["precursor_tol"][0]
-        )
+        try:
+            self._namespace["precursor_tol"][0] = float(
+                self._namespace["precursor_tol"][0]
+            )
+        except ValueError:
+            self._parser.error(
+                "--precursor_tol mass must be a number, got "
+                f'"{self._namespace["precursor_tol"][0]}"'
+            )
 
         # Leave unset buckets as None so each observed charge (including
         # missing charges) is clustered in its own bucket.
@@ -275,12 +281,17 @@ class Config:
         if self._namespace is None:
             raise RuntimeError("The configuration has not been initialized")
         ns = self._namespace
+        if not (ns["precursor_tol"][0] >= 0):
+            self._parser.error(
+                "--precursor_tol mass must be non-negative, got "
+                f"{ns['precursor_tol'][0]}"
+            )
         mode = ns["precursor_tol"][1]
         if mode not in ("ppm", "Da"):
             self._parser.error(
                 f'--precursor_tol mode must be "ppm" or "Da", got "{mode}"'
             )
-        if ns["distance_threshold"] <= 0:
+        if not (ns["distance_threshold"] > 0):
             self._parser.error(
                 "--distance_threshold must be positive, got "
                 f"{ns['distance_threshold']}"
@@ -312,11 +323,17 @@ class Config:
         """
         buckets: list[set[int | str] | str] = []
         seen_values: set[int | str] = set()
+        seen_other = False
 
         for raw in bucket_args:
             raw = raw.strip()
 
             if raw == "other":
+                if seen_other:
+                    self._parser.error(
+                        "Charge bucket 'other' appears more than once"
+                    )
+                seen_other = True
                 buckets.append("other")
                 continue
 
@@ -382,7 +399,10 @@ class Config:
         """Return a parsed configuration option by attribute name."""
         if self._namespace is None:
             raise RuntimeError("The configuration has not been initialized")
-        return self._namespace[option]
+        try:
+            return self._namespace[option]
+        except KeyError as exc:
+            raise AttributeError(option) from exc
 
     def __setattr__(self, option: str, value: Any) -> None:
         """Set private attributes normally and update parsed options."""
@@ -393,7 +413,9 @@ class Config:
 
     def __getitem__(self, item: str) -> Any:
         """Return a parsed configuration option by mapping key."""
-        return self.__getattr__(item)
+        if self._namespace is None:
+            raise RuntimeError("The configuration has not been initialized")
+        return self._namespace[item]
 
 
 config = Config()
