@@ -6,8 +6,8 @@ import math
 import numpy as np
 import pytest
 
-from falcon.cluster.consensus import ConsensusTuple
 from falcon.ms_io import mgf_io
+from falcon.types import ConsensusTuple
 
 _DEFAULT_CHARGE = np.int32(2)
 _DEFAULT_RT = np.float32(120.0)
@@ -28,7 +28,6 @@ def _make_consensus(
         intensity=np.asarray(intensity, dtype=np.float32),
         retention_time=rt,
         cluster_id=np.int32(cluster_id),
-        mz_split=np.int32(0),
     )
 
 
@@ -60,6 +59,14 @@ class TestMgfRead:
         assert s.retention_time == pytest.approx(123.5)
         np.testing.assert_allclose(s.mz, [100.0, 200.0])
         np.testing.assert_allclose(s.intensity, [50.0, 100.0])
+
+    def test_dotted_filename_preserves_full_stem(self, tmp_path):
+        mgf = tmp_path / "sample.v1.mgf"
+        mgf.write_text(
+            "BEGIN IONS\nSCANS=7\nPEPMASS=500.0\n100.0 50\nEND IONS\n"
+        )
+        spectra = list(mgf_io.get_spectra(str(mgf)))
+        assert [s.identifier for s in spectra] == ["sample.v1:scan:7"]
 
     def test_missing_charge_and_rt(self, tmp_path):
         mgf = tmp_path / "minimal.mgf"

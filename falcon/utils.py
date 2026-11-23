@@ -1,23 +1,10 @@
-"""Logging configuration and random seed helpers."""
+"""Logging setup and small shared path and formatting helpers."""
+
+from __future__ import annotations
 
 import logging
-import random
 import sys
-
-import numpy as np
-
-
-def set_seeds(my_seed: int = 42) -> None:
-    """
-    Seed Python's and NumPy's legacy global random generators.
-
-    Parameters
-    ----------
-    my_seed : int, default=42
-        Random seed applied to ``random`` and ``numpy.random``.
-    """
-    random.seed(my_seed)
-    np.random.seed(my_seed)
+from pathlib import Path
 
 
 def configure_logger() -> logging.Logger:
@@ -52,3 +39,46 @@ def configure_logger() -> logging.Logger:
     logging.getLogger("numba").setLevel(logging.WARNING)
     logging.getLogger("numexpr").setLevel(logging.WARNING)
     return logger
+
+
+def resolve_path(path: Path) -> Path:
+    """
+    Resolve ``path`` strictly, falling back when the target is absent.
+
+    Using ``strict=True`` first surfaces symlink loops and permission
+    errors while still allowing non-existent destination paths.
+
+    Parameters
+    ----------
+    path : Path
+        Filesystem path to canonicalize.
+
+    Returns
+    -------
+    Path
+        Canonicalized path.
+    """
+    try:
+        return path.resolve(strict=True)
+    except FileNotFoundError:
+        return path.resolve(strict=False)
+
+
+def format_hms(seconds: float) -> str:
+    """
+    Format a non-negative duration in seconds as ``H:MM:SS``.
+
+    Parameters
+    ----------
+    seconds : float
+        Elapsed or estimated duration in seconds.
+
+    Returns
+    -------
+    str
+        Human-readable ``H:MM:SS`` string.
+    """
+    total = int(seconds)
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f"{hours:d}:{minutes:02d}:{secs:02d}"

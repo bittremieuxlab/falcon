@@ -128,3 +128,32 @@ class TestMzxmlGetSpectra:
             spectra = list(mzxml_io.get_spectra(str(corrupt)))
         assert spectra == []
         assert any("Failed to read file" in r.message for r in caplog.records)
+
+    def test_skips_empty_precursor_charge_type_error(
+        self, tmp_path, mzxml_writer
+    ):
+        # Empty precursorCharge="" yields None in Pyteomics -> TypeError
+        # on int(None); reader must skip it instead of aborting.
+        path = mzxml_writer(
+            tmp_path / "empty_charge.mzxml",
+            [
+                {
+                    "scan": 1,
+                    "ms_level": 2,
+                    "precursor_mz": 400.0,
+                    "charge": "",
+                    "mz": [100.0],
+                    "intensity": [10.0],
+                },
+                {
+                    "scan": 5,
+                    "ms_level": 2,
+                    "precursor_mz": 500.0,
+                    "charge": 2,
+                    "mz": [120.0],
+                    "intensity": [20.0],
+                },
+            ],
+        )
+        spectra = list(mzxml_io.get_spectra(str(path)))
+        assert [s.identifier for s in spectra] == ["empty_charge:scan:5"]

@@ -2,6 +2,8 @@
 
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import tomllib
 
@@ -9,8 +11,8 @@ import pandas as pd
 import pytest
 
 import falcon
-from falcon.falcon import main as falcon_main
-from falcon.ms_io import ms_io
+from falcon import ms_io
+from falcon.cli import main as falcon_main
 
 PEAKS_A = [
     (150.0, 100.0),
@@ -386,6 +388,14 @@ class TestCliEndToEnd:
         assert falcon_main(["--dump-schema"]) == 0
         schema = json.loads(capsys.readouterr().out)
         assert "extends" in schema["properties"]
+
+        proc = subprocess.run(
+            [sys.executable, "-m", "falcon", "--version"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        assert f"falcon {falcon.__version__}" in proc.stdout
 
     def test_programmatic_top_level_api(self, tmp_path, mgf_writer):
         format_mgf_spectrum, write_mgf = mgf_writer

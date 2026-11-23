@@ -176,3 +176,26 @@ class TestMzmlGetSpectra:
             spectra = list(mzml_io.get_spectra(fh))
         assert len(spectra) == 1
         assert spectra[0].identifier == "sample:scan:2"
+
+    def test_skips_spectrum_with_empty_selected_ion_list(self, tmp_path):
+        # Empty <selectedIonList count="0"/> triggers IndexError in parser.
+        bad_mzml = tmp_path / "empty_ion.mzml"
+        bad_mzml.write_text(
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<mzML xmlns="http://psi.hupo.org/ms/mzml" version="1.1.0">\n'
+            ' <run id="run1">\n'
+            '  <spectrumList count="1">\n'
+            '   <spectrum index="0" id="scan=1" defaultArrayLength="0">\n'
+            '    <cvParam cvRef="MS" accession="MS:1000511" '
+            'name="ms level" value="2"/>\n'
+            '    <scanList count="1"><scan/></scanList>\n'
+            '    <precursorList count="1"><precursor>'
+            '<selectedIonList count="0"/>'
+            "</precursor></precursorList>\n"
+            '    <binaryDataArrayList count="0"/>\n'
+            "   </spectrum>\n"
+            "  </spectrumList>\n"
+            " </run>\n"
+            "</mzML>\n"
+        )
+        assert list(mzml_io.get_spectra(str(bad_mzml))) == []

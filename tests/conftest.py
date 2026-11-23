@@ -8,122 +8,66 @@ import lance
 import numpy as np
 import pyarrow as pa
 import pytest
-import spectrum_utils.spectrum as sus
 
-from falcon.cluster import similarity
-
-SPECTRUM_SCHEMA = pa.schema(
-    [
-        pa.field("identifier", pa.string()),
-        pa.field("precursor_mz", pa.float32()),
-        pa.field("precursor_charge", pa.int8()),
-        pa.field("mz", pa.list_(pa.float32())),
-        pa.field("intensity", pa.list_(pa.float32())),
-        pa.field("retention_time", pa.float32()),
-    ]
-)
+from falcon.config import load_config
+from falcon.staging import SPECTRUM_SCHEMA
+from falcon.types import ConsensusTuple, SpectrumTuple
 
 
-@pytest.fixture
-def simple_spectrum():
-    """A valid MsmsSpectrum for testing preprocessing."""
-    return sus.MsmsSpectrum(
-        "test:scan:1",
-        precursor_mz=500.0,
-        precursor_charge=2,
-        mz=np.array(
-            [110.0, 200.0, 300.0, 400.0, 450.0, 480.0, 490.0],
-            dtype=np.float32,
-        ),
-        intensity=np.array(
-            [100.0, 200.0, 50.0, 300.0, 150.0, 80.0, 10.0],
-            dtype=np.float32,
-        ),
-        retention_time=120.0,
+def make_spectrum_tuple(
+    mz,
+    intensity,
+    precursor_mz=500.0,
+    charge=2,
+    normalize=True,
+):
+    """Build a ``SpectrumTuple`` with float32 arrays and optional L2 norm."""
+    mz_arr = np.asarray(mz, dtype=np.float32)
+    int_arr = np.asarray(intensity, dtype=np.float32)
+    if normalize and int_arr.size > 0:
+        norm = np.linalg.norm(int_arr)
+        if norm > 0:
+            int_arr = int_arr / norm
+    return SpectrumTuple(
+        precursor_mz=np.float32(precursor_mz),
+        precursor_charge=charge,
+        mz=mz_arr,
+        intensity=int_arr,
     )
 
 
-@pytest.fixture
-def narrow_spectrum():
-    """Spectrum with a narrow m/z range (rejected by min_mz_range)."""
-    return sus.MsmsSpectrum(
-        "test:scan:2",
-        precursor_mz=500.0,
-        precursor_charge=2,
-        mz=np.array([200.0, 200.5, 201.0, 201.5, 202.0], dtype=np.float32),
-        intensity=np.array(
-            [100.0, 200.0, 50.0, 300.0, 150.0], dtype=np.float32
-        ),
-        retention_time=130.0,
+def make_consensus_record(
+    precursor_mz=500.0,
+    charge=2,
+    mz=(100.0, 200.0, 300.0),
+    intensity=(0.5, 1.0, 0.25),
+    rt=120.0,
+    cluster_id=0,
+):
+    """Build a toy ``ConsensusTuple`` with canonical float32/int32 dtypes."""
+    norm_charge = np.int32(charge) if isinstance(charge, int) else charge
+    return ConsensusTuple(
+        precursor_mz=np.float32(precursor_mz),
+        precursor_charge=norm_charge,
+        mz=np.asarray(mz, dtype=np.float32),
+        intensity=np.asarray(intensity, dtype=np.float32),
+        retention_time=np.float32(rt),
+        cluster_id=np.int32(cluster_id),
     )
 
 
-@pytest.fixture
-def few_peaks_spectrum():
-    """Spectrum with too few peaks (rejected by min_peaks)."""
-    return sus.MsmsSpectrum(
-        "test:scan:3",
-        precursor_mz=500.0,
-        precursor_charge=2,
-        mz=np.array([200.0, 400.0], dtype=np.float32),
-        intensity=np.array([100.0, 200.0], dtype=np.float32),
-        retention_time=140.0,
-    )
-
-
-@pytest.fixture
-def no_charge_spectrum():
-    """A spectrum without a charge state."""
-    return sus.MsmsSpectrum(
-        "test:scan:4",
-        precursor_mz=500.0,
-        precursor_charge=None,
-        mz=np.array(
-            [110.0, 200.0, 300.0, 400.0, 450.0, 480.0, 490.0],
-            dtype=np.float32,
-        ),
-        intensity=np.array(
-            [100.0, 200.0, 50.0, 300.0, 150.0, 80.0, 10.0],
-            dtype=np.float32,
-        ),
-        retention_time=150.0,
-    )
-
-
-@pytest.fixture
-def spectrum_tuple_pair():
-    """A pair of identical L2-normalized SpectrumTuples."""
-    int1 = np.array([0.5, 0.6, 0.7], dtype=np.float32)
-    int1 = int1 / np.linalg.norm(int1)
-    int2 = int1.copy()
-    mz = np.array([100.0, 101.0, 102.0], dtype=np.float32)
-    spec1 = similarity.SpectrumTuple(
-        precursor_mz=100.0, precursor_charge=2, mz=mz, intensity=int1
-    )
-    spec2 = similarity.SpectrumTuple(
-        precursor_mz=100.0, precursor_charge=2, mz=mz.copy(), intensity=int2
-    )
-    return spec1, spec2
-
-
-@pytest.fixture
-def orthogonal_spectrum_tuple_pair():
-    """Pair of SpectrumTuples with disjoint peaks (distance 1.0)."""
-    int1 = np.array([1.0, 0.0], dtype=np.float32)
-    int2 = np.array([1.0, 0.0], dtype=np.float32)
-    spec1 = similarity.SpectrumTuple(
-        precursor_mz=100.0,
-        precursor_charge=2,
-        mz=np.array([100.0, 101.0], dtype=np.float32),
-        intensity=int1,
-    )
-    spec2 = similarity.SpectrumTuple(
-        precursor_mz=100.0,
-        precursor_charge=2,
-        mz=np.array([200.0, 201.0], dtype=np.float32),
-        intensity=int2,
-    )
-    return spec1, spec2
+def make_falcon_config(
+    input_filenames=("in.mgf",),
+    output_filename="out",
+    **sections,
+):
+    """Build a validated ``FalconConfig`` with optional section overrides."""
+    io_section = {
+        "input_filenames": list(input_filenames),
+        "output_filename": str(output_filename),
+        **sections.pop("io", {}),
+    }
+    return load_config(overrides={"io": io_section, **sections})
 
 
 @pytest.fixture
@@ -142,7 +86,7 @@ def mock_spectra():
             )
             intensity = intensity / np.linalg.norm(intensity)
             spectra.append(
-                similarity.SpectrumTuple(
+                SpectrumTuple(
                     precursor_mz=np.float32(mz_base),
                     precursor_charge=charge,
                     mz=mz,
@@ -179,15 +123,27 @@ def make_spectrum_row(
 
 
 @pytest.fixture
-def spectrum_schema():
-    """Return the PyArrow schema for staged Lance spectrum tables."""
-    return SPECTRUM_SCHEMA
-
-
-@pytest.fixture
 def spectrum_row():
     """Expose ``make_spectrum_row`` as a fixture."""
     return make_spectrum_row
+
+
+@pytest.fixture
+def spec_factory():
+    """Expose ``make_spectrum_tuple`` as a fixture."""
+    return make_spectrum_tuple
+
+
+@pytest.fixture
+def consensus_factory():
+    """Expose ``make_consensus_record`` as a fixture."""
+    return make_consensus_record
+
+
+@pytest.fixture
+def config_factory():
+    """Expose ``make_falcon_config`` as a fixture."""
+    return make_falcon_config
 
 
 @pytest.fixture
@@ -210,12 +166,7 @@ def mzxml_writer():
 
 @pytest.fixture
 def lance_dataset(tmp_path):
-    """Factory fixture writing rows to a Lance dataset.
-
-    The dataset path mirrors the production layout
-    (``spectra_charge_<charge>.lance``) so clustering derives the
-    charge label from the URI.
-    """
+    """Factory fixture writing rows to a Lance dataset."""
 
     def _make(rows, charge=2, name=None):
         filename = name or f"spectra_charge_{charge}.lance"
@@ -267,12 +218,7 @@ def write_mgf(path: Path, entries: list[str]) -> Path:
 
 
 def write_toy_mzml(path: Path, spectra_specs: list[dict]) -> Path:
-    """Write a minimal valid mzML file from spectrum descriptors.
-
-    Each descriptor dict may include ``scan``, ``ms_level``,
-    ``precursor_mz``, ``charge``, ``rt``, ``mz``, ``intensity``, and
-    optional ``id_str``.
-    """
+    """Write a minimal valid mzML file from spectrum descriptors."""
     blocks = []
     for idx, spec in enumerate(spectra_specs):
         scan_nr = spec.get("scan", idx + 1)
@@ -290,7 +236,6 @@ def write_toy_mzml(path: Path, spectra_specs: list[dict]) -> Path:
             struct.pack(f"<{len(intensities)}d", *intensities)
         ).decode("ascii")
 
-        scan_xml = ""
         if "rt" in spec and spec["rt"] is not None:
             scan_xml = (
                 '    <scanList count="1"><scan>'

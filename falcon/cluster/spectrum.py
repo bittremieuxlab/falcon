@@ -1,25 +1,17 @@
-"""Spectrum quality filtering, normalization, and m/z bin bounds."""
+"""Spectrum filtering, normalization, and preprocessing factory."""
 
-import math
-from typing import TypedDict
+from __future__ import annotations
 
-import numba as nb
+import functools
+from collections.abc import Callable
+
 import numpy as np
 import spectrum_utils.spectrum as sus
 
-
-class ProcessedSpectrum(TypedDict):
-    """Preprocessed spectrum record staged into a Lance dataset."""
-
-    identifier: str
-    precursor_mz: float
-    precursor_charge: int | None
-    mz: np.ndarray
-    intensity: np.ndarray
-    retention_time: float | None
+from ..config.models import FalconConfig
+from ..types import ProcessedSpectrum, mz_bin_bounds
 
 
-@nb.njit(cache=True)
 def _check_spectrum_valid(
     spectrum_mz: np.ndarray, min_peaks: int, min_mz_range: float
 ) -> bool:
@@ -43,14 +35,14 @@ def _check_spectrum_valid(
         ``True`` if the spectrum passes both quality gates, ``False``
         otherwise.
     """
+    n_peaks = len(spectrum_mz)
     return (
-        len(spectrum_mz) > 0
-        and len(spectrum_mz) >= min_peaks
-        and spectrum_mz[-1] - spectrum_mz[0] >= min_mz_range
+        n_peaks > 0
+        and n_peaks >= min_peaks
+        and float(spectrum_mz[-1] - spectrum_mz[0]) >= min_mz_range
     )
 
 
-@nb.njit(cache=True)
 def _norm_intensity(spectrum_intensity: np.ndarray) -> np.ndarray:
     """
     L2-normalize spectrum peak intensities to unit Euclidean norm.
@@ -63,9 +55,10 @@ def _norm_intensity(spectrum_intensity: np.ndarray) -> np.ndarray:
     Returns
     -------
     np.ndarray
-        Unit-norm peak intensities.
+        Unit-norm peak intensities preserving float32 dtype.
     """
-    return spectrum_intensity / np.linalg.norm(spectrum_intensity)
+    norm = np.linalg.norm(spectrum_intensity)
+    return spectrum_intensity / norm
 
 
 def process_spectrum(
@@ -129,14 +122,16 @@ def process_spectrum(
 
     if remove_precursor_tolerance is not None:
         # Temporarily assign charge 1 so spectrum_utils can compute the
-        # precursor window, then restore missing charge afterward.
+        # precursor window, always restoring None even on error.
         if none_charge:
             spectrum.precursor_charge = 1
-        spectrum = spectrum.remove_precursor_peak(
-            remove_precursor_tolerance, "Da", 0
-        )
-        if none_charge:
-            spectrum.precursor_charge = None
+        try:
+            spectrum = spectrum.remove_precursor_peak(
+                remove_precursor_tolerance, "Da", 0
+            )
+        finally:
+            if none_charge:
+                spectrum.precursor_charge = None
         if not _check_spectrum_valid(spectrum.mz, min_peaks, min_mz_range):
             return None
 
@@ -146,6 +141,8 @@ def process_spectrum(
         if not _check_spectrum_valid(spectrum.mz, min_peaks, min_mz_range):
             return None
 
+    # spectrum_utils 0.3.5 treats an explicit max_rank=None as invalid
+    # for rank scaling (uses kwargs.get('max_rank', len(intensity))).
     if max_peaks_used is not None:
         spectrum = spectrum.scale_intensity(scaling, max_rank=max_peaks_used)
     else:
@@ -162,29 +159,37 @@ def process_spectrum(
     }
 
 
-@nb.njit("Tuple((u4, f4, f4))(f4, f4, f4)", cache=True)
-def get_dim(
-    min_mz: float, max_mz: float, bin_size: float
-) -> tuple[int, float, float]:
+def build_process_spectrum(
+    config: FalconConfig,
+) -> Callable[[sus.MsmsSpectrum], ProcessedSpectrum | None]:
     """
-    Compute aligned m/z bin boundaries and total bin count.
+    Build the configured single-spectrum preprocessing callable.
+
+    Aligns ``config.preprocessing.min_mz`` and ``max_mz`` outward to the
+    ``config.clustering.fragment_tol`` grid via ``mz_bin_bounds``.
 
     Parameters
     ----------
-    min_mz : float
-        Lower bound of the mass range (inclusive).
-    max_mz : float
-        Upper bound of the mass range (inclusive).
-    bin_size : float
-        Bin width in Da.
+    config : FalconConfig
+        Validated run configuration.
 
     Returns
     -------
-    tuple[int, float, float]
-        ``(n_bins, start_dim, end_dim)`` where ``start_dim`` is the
-        largest multiple of ``bin_size`` at or below ``min_mz`` and
-        ``end_dim`` is the smallest multiple strictly above ``max_mz``.
+    Callable[[MsmsSpectrum], ProcessedSpectrum | None]
+        Configured preprocessing function ready for joblib workers.
     """
-    start_dim = min_mz - min_mz % bin_size
-    end_dim = max_mz + bin_size - max_mz % bin_size
-    return math.ceil((end_dim - start_dim) / bin_size), start_dim, end_dim
+    prep = config.preprocessing
+    _, min_mz, max_mz = mz_bin_bounds(
+        prep.min_mz, prep.max_mz, config.clustering.fragment_tol
+    )
+    return functools.partial(
+        process_spectrum,
+        min_peaks=prep.min_peaks,
+        min_mz_range=prep.min_mz_range,
+        mz_min=min_mz,
+        mz_max=max_mz,
+        remove_precursor_tolerance=prep.remove_precursor_tol,
+        min_intensity=prep.min_intensity,
+        max_peaks_used=prep.max_peaks_used,
+        scaling=None if prep.scaling == "off" else prep.scaling,
+    )

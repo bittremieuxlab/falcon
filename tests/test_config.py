@@ -1,7 +1,6 @@
 """Unit tests for falcon.config."""
 
 import json
-import os
 import tomllib
 from pathlib import Path
 
@@ -9,7 +8,6 @@ import pytest
 from pydantic import ValidationError
 
 from falcon.config import (
-    STAGING_CACHE_SCHEMA_VERSION,
     AverageConsensusConfig,
     ClusteringConfig,
     ConfigError,
@@ -21,9 +19,6 @@ from falcon.config import (
     PrecursorTolerance,
     PreprocessingConfig,
     build_json_schema,
-    build_staging_manifest,
-    deserialize_cached_buckets,
-    diff_staging_manifests,
     load_config,
     load_settings,
     load_toml_file,
@@ -822,110 +817,13 @@ class TestSerializationSchemaAndStaging:
         assert '"const": "none"' in serialized
         assert '"const": "auto"' in serialized
 
-    def test_staging_manifest_and_diff_detects_only_staging_changes(
-        self, tmp_path
-    ):
-        f1 = tmp_path / "a.mgf"
-        f2 = tmp_path / "b.mgf"
-        f1.write_text("data1", encoding="utf-8")
-        f2.write_text("data2", encoding="utf-8")
-
-        base_cfg = FalconConfig(
-            io=IOConfig(
-                input_filenames=(str(f1),),
-                output_filename=tmp_path / "out1",
-            )
+    def test_io_config_output_path_properties(self, tmp_path):
+        io_cfg = IOConfig(
+            input_filenames=("in.mgf",),
+            output_filename=tmp_path / "run_v1.2",
         )
-        base_manifest = build_staging_manifest(
-            base_cfg, [f1], buckets=[(2,), ("unknown",), "other"]
-        )
-        assert base_manifest["schema_version"] == STAGING_CACHE_SCHEMA_VERSION
-        assert base_manifest["buckets"] == [[2], ["unknown"], "other"]
-        assert deserialize_cached_buckets(base_manifest["buckets"]) == [
-            (2,),
-            ("unknown",),
-            "other",
-        ]
-
-        # Clustering/consensus/output changes must NOT invalidate cache.
-        sweep_cfg = FalconConfig(
-            io=IOConfig(
-                input_filenames=(str(f1),),
-                output_filename=tmp_path / "out2",
-                export_representatives=True,
-            ),
-            clustering=ClusteringConfig(
-                distance_threshold=0.25,
-                linkage="average",
-                rt_tol=10.0,
-                min_matched_peaks=6,
-                batch_size=512,
-            ),
-            consensus=AverageConsensusConfig(),
-        )
-        assert (
-            diff_staging_manifests(
-                base_manifest, build_staging_manifest(sweep_cfg, [f1])
-            )
-            == []
-        )
-
-        # Preprocessing change invalidates cache.
-        prep_cfg = FalconConfig(
-            io=base_cfg.io,
-            preprocessing=PreprocessingConfig(min_mz=50.0),
-        )
-        assert diff_staging_manifests(
-            base_manifest, build_staging_manifest(prep_cfg, [f1])
-        ) == ["preprocessing"]
-
-        # fragment_tol change invalidates cache (affects get_dim bounds).
-        frag_cfg = FalconConfig(
-            io=base_cfg.io,
-            clustering=ClusteringConfig(fragment_tol=0.02),
-        )
-        assert diff_staging_manifests(
-            base_manifest, build_staging_manifest(frag_cfg, [f1])
-        ) == ["fragment_tol"]
-
-        # precursor_charge_buckets change invalidates cache.
-        bucket_cfg = FalconConfig(
-            io=base_cfg.io,
-            clustering=ClusteringConfig(precursor_charge_buckets=((2,),)),
-        )
-        assert diff_staging_manifests(
-            base_manifest, build_staging_manifest(bucket_cfg, [f1])
-        ) == ["precursor_charge_buckets"]
-
-        # Different input list invalidates cache.
-        assert diff_staging_manifests(
-            base_manifest, build_staging_manifest(base_cfg, [f1, f2])
-        ) == ["inputs"]
-
-        # Modified input file contents (size / mtime) invalidates cache.
-        f1.write_text("modified_longer_content", encoding="utf-8")
-        st = os.stat(f1)
-        os.utime(f1, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
-        assert diff_staging_manifests(
-            base_manifest, build_staging_manifest(base_cfg, [f1])
-        ) == ["inputs"]
-
-        # Corrupted / non-dict / wrong schema version manifests fail.
-        assert diff_staging_manifests(["legacy"], base_manifest) == [
-            "schema_version"
-        ]
-        bad_ver = {**base_manifest, "schema_version": 999}
-        assert diff_staging_manifests(bad_ver, base_manifest) == [
-            "schema_version"
-        ]
-
-    def test_deserialize_cached_buckets_rejects_corrupted_entries(self):
-        with pytest.raises(ValueError, match="buckets"):
-            deserialize_cached_buckets("not-a-list")
-        with pytest.raises(ValueError, match="bucket"):
-            deserialize_cached_buckets([123])
-        with pytest.raises(ValueError, match="bucket"):
-            deserialize_cached_buckets([[True]])
+        assert io_cfg.csv_path == tmp_path / "run_v1.2.csv"
+        assert io_cfg.mgf_path == tmp_path / "run_v1.2.mgf"
 
     def test_metabolomics_example_config_loads_cleanly(self):
         repo_root = Path(__file__).resolve().parents[1]

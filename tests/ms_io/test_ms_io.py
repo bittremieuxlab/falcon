@@ -1,4 +1,4 @@
-"""Unit tests for falcon.ms_io.ms_io format dispatch."""
+"""Unit tests for falcon.ms_io format dispatch."""
 
 import os
 import shutil
@@ -6,8 +6,8 @@ import shutil
 import numpy as np
 import pytest
 
-from falcon.cluster.consensus import ConsensusTuple
-from falcon.ms_io import ms_io
+from falcon import ms_io
+from falcon.types import ConsensusTuple
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
 
@@ -72,7 +72,6 @@ class TestWriteSpectraDispatch:
             intensity=np.array([0.5, 1.0], dtype=np.float32),
             retention_time=np.float32(42.0),
             cluster_id=np.int32(7),
-            mz_split=np.int32(0),
         )
         out = tmp_path / f"reps{ext}"
         ms_io.write_spectra(str(out), [rep])

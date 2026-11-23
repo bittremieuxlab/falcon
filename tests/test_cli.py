@@ -7,11 +7,15 @@ from pydantic import ValidationError
 
 from falcon import __version__
 from falcon.cli import (
-    CliResult,
+    DumpSchemaAction,
+    PrintConfigAction,
+    RunAction,
     build_parser,
     format_validation_error,
     parse_cli,
-    write_saved_config,
+)
+from falcon.cli import (
+    main as falcon_main,
 )
 from falcon.config import (
     AverageConsensusConfig,
@@ -21,15 +25,14 @@ from falcon.config import (
     MedoidConsensusConfig,
     PrecursorTolerance,
     load_config,
+    write_saved_config,
 )
 
 
 class TestCliPositionalAndIO:
     def test_positional_inputs_and_dotted_output_prefix(self):
         result = parse_cli(["a.mgf", "b.mzml", "dir/run_v1.2"])
-        assert isinstance(result, CliResult)
-        assert result.action == "run"
-        assert result.config is not None
+        assert isinstance(result, RunAction)
         assert result.config.io.input_filenames == ("a.mgf", "b.mzml")
         assert result.config.io.output_filename == Path("dir/run_v1.2")
         assert result.save_config is None
@@ -286,16 +289,13 @@ class TestCliUtilityActionsAndErrorFormatting:
             "[clustering]\nmin_matched_peaks = 6\n", encoding="utf-8"
         )
         res = parse_cli(["-c", str(overlay), "--print-config"])
-        assert res.action == "print_config"
-        assert res.config is None
+        assert isinstance(res, PrintConfigAction)
         assert isinstance(res.settings, FalconSettings)
         assert res.settings.clustering.min_matched_peaks == 6
 
     def test_dump_schema_action(self):
         res = parse_cli(["--dump-schema"])
-        assert res.action == "dump_schema"
-        assert res.config is None
-        assert res.settings is None
+        assert isinstance(res, DumpSchemaAction)
 
     def test_mutually_exclusive_utility_flags_rejected(self, tmp_path, capsys):
         with pytest.raises(SystemExit) as exc_info:
@@ -318,8 +318,7 @@ class TestCliUtilityActionsAndErrorFormatting:
     def test_save_config_and_directory_rejection(self, tmp_path, capsys):
         dest = tmp_path / "saved.toml"
         res = parse_cli(["in.mgf", "out", "--save-config", str(dest)])
-        assert res.action == "run"
-        assert res.config is not None
+        assert isinstance(res, RunAction)
         assert res.save_config == dest
         write_saved_config(res.config, dest)
         assert load_config(config_files=[dest]) == res.config
@@ -416,8 +415,6 @@ class TestCliUtilityActionsAndErrorFormatting:
     def test_main_returns_2_when_save_config_unwritable(
         self, tmp_path, capsys
     ):
-        from falcon.falcon import main as falcon_main
-
         dest = tmp_path / "no_such_dir" / "saved.toml"
         rc = falcon_main(["in.mgf", "out", "--save-config", str(dest)])
         assert rc == 2
@@ -428,7 +425,7 @@ class TestSaveConfigInputAliasProtection:
     def test_main_rejects_direct_and_relative_input_alias_before_writing(
         self, tmp_path, capsys, monkeypatch
     ):
-        from falcon import falcon as falcon_mod
+        from falcon import pipeline
 
         input_file = tmp_path / "sample.mgf"
         original = "BEGIN IONS\nPEPMASS=500.0\nEND IONS\n"
@@ -437,10 +434,10 @@ class TestSaveConfigInputAliasProtection:
         def _fail_run(_cfg):
             raise AssertionError("run() must not execute on alias error")
 
-        monkeypatch.setattr(falcon_mod, "run", _fail_run)
+        monkeypatch.setattr(pipeline, "run", _fail_run)
 
         # Direct path alias.
-        rc = falcon_mod.main(
+        rc = falcon_main(
             [
                 str(input_file),
                 str(tmp_path / "out"),
@@ -456,7 +453,7 @@ class TestSaveConfigInputAliasProtection:
         sub = tmp_path / "sub"
         sub.mkdir()
         rel_alias = sub / ".." / "sample.mgf"
-        rc2 = falcon_mod.main(
+        rc2 = falcon_main(
             [
                 str(input_file),
                 str(tmp_path / "out"),
@@ -471,7 +468,7 @@ class TestSaveConfigInputAliasProtection:
     def test_main_rejects_glob_selected_input_alias_before_writing(
         self, tmp_path, capsys, monkeypatch
     ):
-        from falcon import falcon as falcon_mod
+        from falcon import pipeline
 
         data_dir = tmp_path / "data"
         data_dir.mkdir()
@@ -483,10 +480,10 @@ class TestSaveConfigInputAliasProtection:
         def _fail_run(_cfg):
             raise AssertionError("run() must not execute on alias error")
 
-        monkeypatch.setattr(falcon_mod, "run", _fail_run)
+        monkeypatch.setattr(pipeline, "run", _fail_run)
 
         # CLI glob selecting b.mgf.
-        rc = falcon_mod.main(
+        rc = falcon_main(
             [
                 str(data_dir / "*.mgf"),
                 str(tmp_path / "out"),
@@ -506,9 +503,7 @@ class TestSaveConfigInputAliasProtection:
             f'output_filename = "{tmp_path / "out"}"\n',
             encoding="utf-8",
         )
-        rc2 = falcon_mod.main(
-            ["-c", str(run_toml), "--save-config", str(spec_a)]
-        )
+        rc2 = falcon_main(["-c", str(run_toml), "--save-config", str(spec_a)])
         assert rc2 == 2
         assert "aliases input file" in capsys.readouterr().err
         assert spec_a.read_text(encoding="utf-8") == "MGF_A\n"
@@ -518,7 +513,7 @@ class TestSaveConfigInputAliasProtection:
     ):
         import os
 
-        from falcon import falcon as falcon_mod
+        from falcon import pipeline
 
         real_mgf = tmp_path / "real.mgf"
         real_mgf.write_text("REAL_MGF\n", encoding="utf-8")
@@ -530,10 +525,10 @@ class TestSaveConfigInputAliasProtection:
         def _fail_run(_cfg):
             raise AssertionError("run() must not execute on alias error")
 
-        monkeypatch.setattr(falcon_mod, "run", _fail_run)
+        monkeypatch.setattr(pipeline, "run", _fail_run)
 
         for dest in (sym_dest, hard_dest):
-            rc = falcon_mod.main(
+            rc = falcon_main(
                 [
                     str(real_mgf),
                     str(tmp_path / "out"),
@@ -548,7 +543,7 @@ class TestSaveConfigInputAliasProtection:
         # Reverse direction: symlinked input, real path as save target.
         sym_in = tmp_path / "in_link.mgf"
         sym_in.symlink_to(real_mgf)
-        rc_rev = falcon_mod.main(
+        rc_rev = falcon_main(
             [
                 str(sym_in),
                 str(tmp_path / "out"),
@@ -563,8 +558,6 @@ class TestSaveConfigInputAliasProtection:
     def test_rejects_nonexistent_literal_input_and_symlink_loop(
         self, tmp_path, capsys
     ):
-        from falcon.falcon import main as falcon_main
-
         missing = tmp_path / "missing.mgf"
         rc = falcon_main(
             [
@@ -596,7 +589,7 @@ class TestSaveConfigInputAliasProtection:
     def test_distinct_destinations_remain_valid_with_glob_inputs(
         self, tmp_path, monkeypatch
     ):
-        from falcon import falcon as falcon_mod
+        from falcon import pipeline
 
         data_dir = tmp_path / "data"
         data_dir.mkdir()
@@ -607,10 +600,10 @@ class TestSaveConfigInputAliasProtection:
         existing_dest = tmp_path / "existing.toml"
         existing_dest.write_text("# old\n", encoding="utf-8")
 
-        monkeypatch.setattr(falcon_mod, "run", lambda _cfg: 0)
+        monkeypatch.setattr(pipeline, "run", lambda _cfg: 0)
 
         for dest in (new_dest, existing_dest):
-            rc = falcon_mod.main(
+            rc = falcon_main(
                 [
                     str(data_dir / "*.mgf"),
                     str(tmp_path / "out"),

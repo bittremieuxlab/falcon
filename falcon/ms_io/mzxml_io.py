@@ -1,8 +1,11 @@
 """mzXML MS/MS spectrum reader."""
 
+from __future__ import annotations
+
 import logging
+import os
 from collections.abc import Iterator
-from typing import IO, Any, cast
+from typing import IO, Any
 
 import pyteomics.mzxml
 import spectrum_utils.spectrum as sus
@@ -13,13 +16,15 @@ from . import reader_utils
 logger = logging.getLogger("falcon")
 
 
-def get_spectra(source: IO[Any] | str) -> Iterator[sus.MsmsSpectrum]:
+def get_spectra(
+    source: IO[Any] | str | os.PathLike[str],
+) -> Iterator[sus.MsmsSpectrum]:
     """
     Read MS/MS spectra (MS level > 1) from an mzXML file or stream.
 
     Parameters
     ----------
-    source : IO[Any] | str
+    source : IO[Any] | str | os.PathLike[str]
         Path or open file object for the mzXML source.
 
     Yields
@@ -28,22 +33,25 @@ def get_spectra(source: IO[Any] | str) -> Iterator[sus.MsmsSpectrum]:
         Parsed MS/MS spectra with ``<stem>:scan:<number>`` identifiers;
         malformed spectra are logged and skipped.
     """
-    with pyteomics.mzxml.MzXML(source) as f_in:
+    mzxml_source: IO[Any] | str = (
+        os.fspath(source) if isinstance(source, os.PathLike) else source
+    )
+    with pyteomics.mzxml.MzXML(mzxml_source) as f_in:
         filename = reader_utils.base_filename(source, f_in)
         try:
             for spectrum_dict in f_in:
-                if int(spectrum_dict.get("msLevel", -1)) > 1:
-                    # Build a USI-style identifier from the scan number.
+                try:
+                    if int(spectrum_dict.get("msLevel", -1)) <= 1:
+                        continue
                     scan_nr = int(spectrum_dict["id"])
                     spectrum_dict["id"] = f"{filename}:scan:{scan_nr}"
-                    try:
-                        yield _parse_spectrum(spectrum_dict)
-                    except (ValueError, KeyError) as e:
-                        reader_utils.log_skipped_spectrum(
-                            source, spectrum_dict["id"], e
-                        )
-        except LxmlError as e:
-            logger.warning("Failed to read file %s: %s", source, e)
+                    yield _parse_spectrum(spectrum_dict)
+                except reader_utils.PARSE_EXCEPTIONS as exc:
+                    reader_utils.log_skipped_spectrum(
+                        source, spectrum_dict.get("id"), exc
+                    )
+        except LxmlError as exc:
+            logger.warning("Failed to read file %s: %s", source, exc)
 
 
 def _parse_spectrum(spectrum_dict: dict[str, Any]) -> sus.MsmsSpectrum:
@@ -68,21 +76,19 @@ def _parse_spectrum(spectrum_dict: dict[str, Any]) -> sus.MsmsSpectrum:
     intensity_array = spectrum_dict["intensity array"]
     retention_time = spectrum_dict.get("retentionTime", float("nan"))
 
-    precursor_mz = spectrum_dict["precursorMz"][0]["precursorMz"]
-    if "precursorCharge" in spectrum_dict["precursorMz"][0]:
-        precursor_charge = int(
-            spectrum_dict["precursorMz"][0]["precursorCharge"]
-        )
-    else:
-        precursor_charge = None
+    precursor = spectrum_dict["precursorMz"][0]
+    precursor_mz = precursor["precursorMz"]
+    precursor_charge = (
+        int(precursor["precursorCharge"])
+        if "precursorCharge" in precursor
+        else None
+    )
 
-    # spectrum_utils 0.3.5 types precursor_charge as int; None is valid.
-    return sus.MsmsSpectrum(
+    return reader_utils.build_msms_spectrum(
         spectrum_id,
         precursor_mz,
-        cast(int, precursor_charge),
+        precursor_charge,
         mz_array,
         intensity_array,
-        None,
         retention_time,
     )

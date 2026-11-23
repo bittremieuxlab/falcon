@@ -19,7 +19,7 @@ if TYPE_CHECKING:
         load_config,
         load_settings,
     )
-    from .falcon import run
+    from .pipeline import run
 
 __all__ = [
     "FalconConfig",
@@ -43,7 +43,7 @@ def __getattr__(name: str) -> Any:
 
         return getattr(config, name)
     if name == "run":
-        from .falcon import run
+        from .pipeline import run
 
         return run
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

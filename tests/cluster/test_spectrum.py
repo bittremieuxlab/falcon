@@ -1,7 +1,5 @@
 """Unit tests for falcon.cluster.spectrum."""
 
-import math
-
 import numpy as np
 import pytest
 import spectrum_utils.spectrum as sus
@@ -25,11 +23,6 @@ def _make_msms(
         intensity=np.asarray(intensity, dtype=np.float32),
         retention_time=retention_time,
     )
-
-
-# ----------------------------------------------------------------------
-# _check_spectrum_valid
-# ----------------------------------------------------------------------
 
 
 class TestCheckSpectrumValid:
@@ -59,16 +52,10 @@ class TestCheckSpectrumValid:
         [(1, 0.0), (0, 0.0), (0, -1e38)],
     )
     def test_empty_spectrum_always_invalid(self, min_peaks, min_mz_range):
-        """Empty peak arrays must return False without indexing OOB."""
         empty = np.array([], dtype=np.float32)
         assert not spectrum._check_spectrum_valid(
             empty, min_peaks=min_peaks, min_mz_range=min_mz_range
         )
-
-
-# ----------------------------------------------------------------------
-# _norm_intensity
-# ----------------------------------------------------------------------
 
 
 class TestNormIntensity:
@@ -84,51 +71,17 @@ class TestNormIntensity:
         np.testing.assert_allclose(normed, [1.0], rtol=1e-6)
 
 
-# ----------------------------------------------------------------------
-# get_dim
-# ----------------------------------------------------------------------
-
-
-class TestGetDim:
-    def test_aligned_boundaries(self):
-        n_bins, start, end = spectrum.get_dim(
-            np.float32(100.0), np.float32(200.0), np.float32(1.0)
-        )
-        assert n_bins == 101
-        assert start == pytest.approx(100.0)
-        assert end == pytest.approx(201.0)
-
-    def test_non_aligned_boundaries(self):
-        n_bins, start, end = spectrum.get_dim(
-            np.float32(101.0), np.float32(1500.0), np.float32(0.05)
-        )
-        assert start <= 101.0
-        assert end > 1500.0
-        assert n_bins == math.ceil((end - start) / 0.05)
-
-    def test_equal_bounds_produce_one_bin(self):
-        n_bins, start, end = spectrum.get_dim(
-            np.float32(250.0), np.float32(250.0), np.float32(0.5)
-        )
-        assert n_bins == 1
-        assert start == pytest.approx(250.0)
-        assert end == pytest.approx(250.5)
-
-
-# ----------------------------------------------------------------------
-# process_spectrum
-# ----------------------------------------------------------------------
-
-
 class TestProcessSpectrum:
-    def test_valid_spectrum_preserves_metadata_and_normalizes(
-        self, simple_spectrum
-    ):
-        raw_intensities = simple_spectrum.intensity.copy()
+    def test_valid_spectrum_preserves_metadata_and_normalizes(self):
+        spec = _make_msms(
+            mz=[110.0, 200.0, 300.0, 400.0, 450.0, 480.0, 490.0],
+            intensity=[100.0, 200.0, 50.0, 300.0, 150.0, 80.0, 10.0],
+        )
+        raw_intensities = spec.intensity.copy()
         expected = raw_intensities / np.linalg.norm(raw_intensities)
 
         result = spectrum.process_spectrum(
-            simple_spectrum,
+            spec,
             min_peaks=5,
             min_mz_range=250.0,
             mz_min=100.0,
@@ -144,12 +97,15 @@ class TestProcessSpectrum:
             1.0, abs=1e-6
         )
 
-    def test_rejects_after_mz_range_gate(
-        self, few_peaks_spectrum, narrow_spectrum
-    ):
+    def test_rejects_after_mz_range_gate(self):
+        few = _make_msms(mz=[200.0, 400.0], intensity=[100.0, 200.0])
+        narrow = _make_msms(
+            mz=[200.0, 200.5, 201.0, 201.5, 202.0],
+            intensity=[100.0, 200.0, 50.0, 300.0, 150.0],
+        )
         assert (
             spectrum.process_spectrum(
-                few_peaks_spectrum,
+                few,
                 min_peaks=5,
                 min_mz_range=10.0,
                 mz_min=100.0,
@@ -159,7 +115,7 @@ class TestProcessSpectrum:
         )
         assert (
             spectrum.process_spectrum(
-                narrow_spectrum,
+                narrow,
                 min_peaks=3,
                 min_mz_range=250.0,
                 mz_min=100.0,
@@ -186,8 +142,6 @@ class TestProcessSpectrum:
         )
 
     def test_precursor_removal_strips_only_peaks_within_tolerance(self):
-        # Peaks at 499.0 and 500.5 lie within 1.5 Da of precursor 500.0;
-        # peak at 498.0 lies outside (2.0 Da away) and must survive.
         spec = _make_msms(
             mz=[110.0, 200.0, 300.0, 498.0, 499.0, 500.5, 600.0],
             intensity=[100.0, 200.0, 300.0, 150.0, 400.0, 500.0, 250.0],
@@ -208,7 +162,6 @@ class TestProcessSpectrum:
         )
 
     def test_precursor_removal_can_trigger_quality_gate_rejection(self):
-        # 5 peaks initially, 2 on the precursor -> only 3 remain.
         spec = _make_msms(
             mz=[110.0, 250.0, 499.5, 500.5, 600.0],
             intensity=[100.0, 200.0, 300.0, 300.0, 250.0],
@@ -242,7 +195,6 @@ class TestProcessSpectrum:
         assert result["precursor_charge"] is None
         assert 500.0 not in result["mz"]
 
-        # Charge is restored even when precursor removal rejects.
         spec_reject = _make_msms(
             mz=[110.0, 499.8, 500.2, 600.0],
             intensity=[100.0, 200.0, 200.0, 150.0],
@@ -265,7 +217,6 @@ class TestProcessSpectrum:
             mz=[110.0, 200.0, 300.0, 400.0, 450.0, 480.0],
             intensity=[1000.0, 5.0, 800.0, 900.0, 700.0, 600.0],
         )
-        # 5.0 is 0.5% of base peak 1000.0 -> removed; top 4 kept.
         result = spectrum.process_spectrum(
             spec,
             min_peaks=3,
@@ -277,7 +228,6 @@ class TestProcessSpectrum:
         np.testing.assert_allclose(result["mz"], [110.0, 300.0, 400.0, 450.0])
 
     def test_intensity_filter_rejection_and_all_zero_intensities(self):
-        # Only 2 peaks survive the 10% base-peak cutoff (< min_peaks=4).
         spec = _make_msms(
             mz=[100.0, 200.0, 300.0, 400.0, 500.0],
             intensity=[1000.0, 1.0, 1.0, 1.0, 900.0],
@@ -365,3 +315,20 @@ class TestProcessSpectrum:
         assert result is not None
         expected = raw_expected / np.linalg.norm(raw_expected)
         np.testing.assert_allclose(result["intensity"], expected, rtol=1e-5)
+
+
+class TestBuildProcessSpectrum:
+    def test_maps_scaling_off_to_none_and_applies_bin_bounds(
+        self, config_factory
+    ):
+        cfg_off = config_factory(
+            preprocessing={"scaling": "off", "min_mz": 101.03}
+        )
+        proc = spectrum.build_process_spectrum(cfg_off)
+        assert proc.keywords["scaling"] is None
+        assert proc.keywords["mz_min"] <= 101.03
+        assert proc.keywords["mz_max"] > 1500.0
+
+        cfg_root = config_factory(preprocessing={"scaling": "root"})
+        proc_root = spectrum.build_process_spectrum(cfg_root)
+        assert proc_root.keywords["scaling"] == "root"

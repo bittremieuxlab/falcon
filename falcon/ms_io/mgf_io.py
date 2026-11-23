@@ -1,24 +1,28 @@
 """MGF spectrum reader and representative-spectrum writer."""
 
+from __future__ import annotations
+
 import math
 import os
 import re
 from collections.abc import Iterable, Iterator
-from typing import IO, Any, cast
+from pathlib import Path
+from typing import IO, Any
 
-import numba as nb
 import numpy as np
 import pyteomics.mgf
 import spectrum_utils.spectrum as sus
 
-from ..cluster import cluster
+from ..types import ConsensusTuple
 from . import reader_utils
 
 # Matches standard Universal Spectrum Identifiers (USIs).
 USI_PATTERN = re.compile(r"^mzspec:[^:\s]+:[^:\s]+:(scan:\d+|\d+)(:[^:\s]+)?$")
 
 
-def get_spectra(source: IO[Any] | str) -> Iterator[sus.MsmsSpectrum]:
+def get_spectra(
+    source: IO[Any] | str | os.PathLike[str],
+) -> Iterator[sus.MsmsSpectrum]:
     """
     Read MS/MS spectra from an MGF file or stream.
 
@@ -28,7 +32,7 @@ def get_spectra(source: IO[Any] | str) -> Iterator[sus.MsmsSpectrum]:
 
     Parameters
     ----------
-    source : IO[Any] | str
+    source : IO[Any] | str | os.PathLike[str]
         Path or open file object for the MGF source.
 
     Yields
@@ -36,16 +40,19 @@ def get_spectra(source: IO[Any] | str) -> Iterator[sus.MsmsSpectrum]:
     MsmsSpectrum
         Parsed MS/MS spectra; malformed entries are logged and skipped.
     """
-    with pyteomics.mgf.MGF(source) as f_in:
+    mgf_source: IO[Any] | str = (
+        os.fspath(source) if isinstance(source, os.PathLike) else source
+    )
+    with pyteomics.mgf.MGF(mgf_source) as f_in:
         base = reader_utils.base_filename(source, f_in)
 
         for spectrum_i, spectrum_dict in enumerate(f_in):
             params = spectrum_dict.get("params", {})
 
-            # Prefer embedded FILENAME param over the on-disk filename.
-            filename = os.path.splitext(
-                os.path.basename(params.get("filename", base))
-            )[0]
+            # Prefer embedded FILENAME param over the on-disk stem;
+            # avoid re-stripping `base` so dotted filenames stay intact.
+            raw_filename = params.get("filename")
+            filename = Path(raw_filename).stem if raw_filename else base
 
             if "title" not in params or not (
                 USI_PATTERN.match(params["title"])
@@ -61,11 +68,10 @@ def get_spectra(source: IO[Any] | str) -> Iterator[sus.MsmsSpectrum]:
 
             try:
                 yield _parse_spectrum(spectrum_dict)
-            except (ValueError, KeyError, TypeError, IndexError) as e:
+            except reader_utils.PARSE_EXCEPTIONS as exc:
                 reader_utils.log_skipped_spectrum(
-                    source, params.get("title"), e
+                    source, params.get("title"), exc
                 )
-                continue
 
 
 def _parse_spectrum(spectrum_dict: dict[str, Any]) -> sus.MsmsSpectrum:
@@ -84,46 +90,39 @@ def _parse_spectrum(spectrum_dict: dict[str, Any]) -> sus.MsmsSpectrum:
         Parsed spectrum; missing charge is ``None`` and missing RT is
         ``NaN``.
     """
-    identifier = spectrum_dict["params"]["title"]
-
+    params = spectrum_dict["params"]
+    identifier = params["title"]
     mz_array = spectrum_dict["m/z array"]
     intensity_array = spectrum_dict["intensity array"]
-    retention_time = float(
-        spectrum_dict["params"].get("rtinseconds", float("nan"))
-    )
+    retention_time = float(params.get("rtinseconds", float("nan")))
 
-    precursor_mz = float(spectrum_dict["params"]["pepmass"][0])
-    if "charge" in spectrum_dict["params"]:
-        precursor_charge = int(spectrum_dict["params"]["charge"][0])
-    else:
-        precursor_charge = None
+    precursor_mz = float(params["pepmass"][0])
+    precursor_charge = int(params["charge"][0]) if "charge" in params else None
 
-    # spectrum_utils 0.3.5 types precursor_charge as int; None is valid.
-    return sus.MsmsSpectrum(
+    return reader_utils.build_msms_spectrum(
         identifier,
         precursor_mz,
-        cast(int, precursor_charge),
+        precursor_charge,
         mz_array,
         intensity_array,
-        None,
         retention_time,
     )
 
 
 def write_spectra(
-    filename: str, spectra: Iterable[cluster.ConsensusTuple]
+    filename: str | os.PathLike[str], spectra: Iterable[ConsensusTuple]
 ) -> None:
     """
     Write representative spectra to an MGF file.
 
     Parameters
     ----------
-    filename : str
+    filename : str | os.PathLike[str]
         Destination MGF file path.
     spectra : Iterable[ConsensusTuple]
         Representative spectra to serialize.
     """
-    with open(filename, "w") as f_out:
+    with Path(filename).open("w", encoding="utf-8") as f_out:
         pyteomics.mgf.write(
             _spectra_to_dicts(spectra),
             f_out,
@@ -132,7 +131,7 @@ def write_spectra(
 
 
 def _spectra_to_dicts(
-    spectra: Iterable[cluster.ConsensusTuple],
+    spectra: Iterable[ConsensusTuple],
 ) -> Iterator[dict[str, Any]]:
     """
     Convert representative spectra to Pyteomics MGF dictionaries.
@@ -169,7 +168,6 @@ def _spectra_to_dicts(
         }
 
 
-@nb.njit(cache=True, fastmath=True)
 def _scale_intensities(intensity: np.ndarray) -> np.ndarray:
     """
     Rescale positive peak intensities so the base peak equals 1000.
@@ -185,7 +183,9 @@ def _scale_intensities(intensity: np.ndarray) -> np.ndarray:
         Rescaled intensities, or ``intensity`` unchanged if empty or
         non-positive.
     """
-    max_i = np.max(intensity) if intensity.size else np.float32(0.0)
+    if intensity.size == 0:
+        return intensity
+    max_i = float(np.max(intensity))
     if max_i <= 0.0:
         return intensity
-    return intensity * (np.float32(1000.0) / max_i)
+    return intensity * np.float32(1000.0 / max_i)

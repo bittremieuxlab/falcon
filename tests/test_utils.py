@@ -1,10 +1,8 @@
 """Unit tests for falcon.utils and package metadata."""
 
 import logging
-import random
 import sys
 
-import numpy as np
 import pytest
 
 import falcon
@@ -38,27 +36,6 @@ class TestPackageMetadata:
         assert falcon.__version__
 
 
-class TestSetSeeds:
-    def test_reproduces_python_and_numpy_sequences(self):
-        utils.set_seeds(123)
-        py_first = [random.random() for _ in range(5)]  # noqa: S311
-        np_first = np.random.rand(5)
-
-        utils.set_seeds(123)
-        py_second = [random.random() for _ in range(5)]  # noqa: S311
-        np_second = np.random.rand(5)
-
-        assert py_first == py_second
-        np.testing.assert_array_equal(np_first, np_second)
-
-    def test_different_seeds_diverge(self):
-        utils.set_seeds(1)
-        a = (random.random(), float(np.random.rand()))  # noqa: S311
-        utils.set_seeds(2)
-        b = (random.random(), float(np.random.rand()))  # noqa: S311
-        assert a != b
-
-
 class TestConfigureLogger:
     def test_attaches_stderr_handler_when_root_empty(
         self, isolated_root_logger
@@ -89,3 +66,27 @@ class TestConfigureLogger:
         utils.configure_logger()
 
         assert root.handlers == [existing]
+
+
+class TestResolvePathAndFormatHms:
+    def test_resolve_path_handles_existing_missing_and_symlink_loop(
+        self, tmp_path
+    ):
+        existing = tmp_path / "file.txt"
+        existing.write_text("ok", encoding="utf-8")
+        assert utils.resolve_path(existing) == existing.resolve()
+
+        missing = tmp_path / "does_not_exist.txt"
+        assert utils.resolve_path(missing) == missing.resolve(strict=False)
+
+        loop = tmp_path / "loop"
+        loop.symlink_to(loop)
+        with pytest.raises((OSError, RuntimeError)):
+            utils.resolve_path(loop)
+
+    @pytest.mark.parametrize(
+        ("seconds", "expected"),
+        [(0, "0:00:00"), (59.9, "0:00:59"), (3661, "1:01:01")],
+    )
+    def test_format_hms(self, seconds, expected):
+        assert utils.format_hms(seconds) == expected

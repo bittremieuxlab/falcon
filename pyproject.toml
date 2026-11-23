@@ -45,7 +45,7 @@ Repository = "https://github.com/bittremieuxlab/falcon"
 Issues = "https://github.com/bittremieuxlab/falcon/issues"
 
 [project.scripts]
-falcon = "falcon.falcon:main"
+falcon = "falcon.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["falcon*"]
