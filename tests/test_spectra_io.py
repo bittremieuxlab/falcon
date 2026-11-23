@@ -3,6 +3,7 @@
 import functools
 import queue
 import threading
+from pathlib import Path
 
 import lance
 import numpy as np
@@ -11,6 +12,7 @@ import pytest
 
 from falcon import spectra_io
 from falcon.cluster import spectrum
+from falcon.config import FalconConfig, IOConfig
 
 
 def _make_spec(identifier, charge):
@@ -48,6 +50,7 @@ def _run_write_worker(
         charge_to_bucket,
         catch_other_charges,
         auto_bucket,
+        work_dir,
     )
 
     spectra_dir = work_dir / "spectra"
@@ -60,17 +63,35 @@ def _run_write_worker(
 
 
 @pytest.fixture
-def configured_work_dir(tmp_path, reset_global_config):
-    """Initialize global config with a temp work_dir for staging."""
+def staging_work_dir(tmp_path):
+    """Create a temporary working directory with a ``spectra`` folder."""
     (tmp_path / "spectra").mkdir()
-    reset_global_config.parse(["dummy.mgf", str(tmp_path / "out")])
-    reset_global_config.work_dir = str(tmp_path)
     return tmp_path
 
 
 # ----------------------------------------------------------------------
-# bucket_key_to_str and lock registry
+# Input glob resolution, bucket_key_to_str, and lock registry
 # ----------------------------------------------------------------------
+
+
+class TestResolveInputFiles:
+    def test_expands_globs_sorted_deterministically_and_preserves_duplicates(
+        self, tmp_path
+    ):
+        (tmp_path / "b.mgf").write_text("")
+        (tmp_path / "a.mgf").write_text("")
+        resolved = spectra_io.resolve_input_files(
+            [str(tmp_path / "*.mgf"), str(tmp_path / "a.mgf")]
+        )
+        assert resolved == [
+            tmp_path / "a.mgf",
+            tmp_path / "b.mgf",
+            tmp_path / "a.mgf",
+        ]
+
+    def test_unmatched_glob_raises_file_not_found(self, tmp_path):
+        with pytest.raises(FileNotFoundError, match="No input peak files"):
+            spectra_io.resolve_input_files([str(tmp_path / "missing_*.mgf")])
 
 
 class TestBucketKeyToStr:
@@ -125,17 +146,10 @@ class TestPerChargeLockRegistry:
 
 class TestWriteToDataset:
     def test_creates_and_appends_at_explicit_work_dir(
-        self, tmp_path, reset_global_config, spectrum_schema
+        self, tmp_path, spectrum_schema
     ):
-        """_write_to_dataset must honor its work_dir argument directly,
-        independent of global config.work_dir.
-        """
         explicit_dir = tmp_path / "target"
         (explicit_dir / "spectra").mkdir(parents=True)
-        other_dir = tmp_path / "other"
-        (other_dir / "spectra").mkdir(parents=True)
-        reset_global_config.parse(["dummy.mgf", str(tmp_path / "out")])
-        reset_global_config.work_dir = str(other_dir)
 
         lock = threading.Lock()
         count1 = spectra_io._write_to_dataset(
@@ -143,37 +157,20 @@ class TestWriteToDataset:
             (2,),
             lock,
             spectrum_schema,
-            str(explicit_dir),
+            explicit_dir,
         )
         count2 = spectra_io._write_to_dataset(
             [_make_spec("s3", 2)],
             (2,),
             lock,
             spectrum_schema,
-            str(explicit_dir),
+            explicit_dir,
         )
         assert count1 == 2
         assert count2 == 1
         target_ds = explicit_dir / "spectra" / "spectra_charge_2.lance"
         assert target_ds.exists()
         assert lance.dataset(str(target_ds)).count_rows() == 3
-        assert not (other_dir / "spectra" / "spectra_charge_2.lance").exists()
-
-    def test_works_when_global_config_uninitialized(
-        self, tmp_path, reset_global_config, spectrum_schema
-    ):
-        reset_global_config._namespace = None
-        (tmp_path / "spectra").mkdir()
-        lock = threading.Lock()
-        count = spectra_io._write_to_dataset(
-            [_make_spec("s1", 2)],
-            (2,),
-            lock,
-            spectrum_schema,
-            str(tmp_path),
-        )
-        assert count == 1
-        assert (tmp_path / "spectra" / "spectra_charge_2.lance").exists()
 
 
 # ----------------------------------------------------------------------
@@ -183,7 +180,7 @@ class TestWriteToDataset:
 
 class TestChargeRouting:
     def test_explicit_single_multi_unknown_and_other_routing(
-        self, configured_work_dir, spectrum_schema
+        self, staging_work_dir, spectrum_schema
     ):
         charge_to_bucket = {
             1: (1,),
@@ -202,7 +199,7 @@ class TestChargeRouting:
             spectra,
             charge_to_bucket,
             catch_other_charges=True,
-            work_dir=configured_work_dir,
+            work_dir=staging_work_dir,
             schema=spectrum_schema,
         )
         assert counts == {
@@ -213,19 +210,19 @@ class TestChargeRouting:
         }
 
     def test_unmapped_charge_dropped_without_other(
-        self, configured_work_dir, spectrum_schema
+        self, staging_work_dir, spectrum_schema
     ):
         counts = _run_write_worker(
             [_make_spec("x", 3), _make_spec("u", None)],
             charge_to_bucket={1: (1,)},
             catch_other_charges=False,
-            work_dir=configured_work_dir,
+            work_dir=staging_work_dir,
             schema=spectrum_schema,
         )
         assert counts == {}
 
     def test_auto_bucket_isolates_all_charges_including_negative_and_unknown(
-        self, configured_work_dir, spectrum_schema
+        self, staging_work_dir, spectrum_schema
     ):
         spectra = [
             _make_spec("a", 1),
@@ -238,7 +235,7 @@ class TestChargeRouting:
             spectra,
             charge_to_bucket={},
             catch_other_charges=False,
-            work_dir=configured_work_dir,
+            work_dir=staging_work_dir,
             schema=spectrum_schema,
             auto_bucket=True,
         )
@@ -250,12 +247,10 @@ class TestChargeRouting:
         }
 
     def test_batch_flush_threshold_writes_all_rows_across_flushes(
-        self, configured_work_dir, spectrum_schema, monkeypatch
+        self, staging_work_dir, spectrum_schema, monkeypatch
     ):
         """Mid-stream flushes at batch size plus final sentinel."""
         monkeypatch.setattr(spectra_io, "_LANCE_WRITE_BATCH_SIZE", 3)
-        # Charge 2: 6 rows (2 full batches, empty on sentinel).
-        # Charge 1: 4 rows (1 batch + 1 remainder on sentinel).
         spectra = [
             *(_make_spec(f"c2_{i}", 2) for i in range(6)),
             *(_make_spec(f"c1_{i}", 1) for i in range(4)),
@@ -264,7 +259,7 @@ class TestChargeRouting:
             spectra,
             charge_to_bucket={},
             catch_other_charges=False,
-            work_dir=configured_work_dir,
+            work_dir=staging_work_dir,
             schema=spectrum_schema,
             auto_bucket=True,
         )
@@ -281,7 +276,7 @@ class TestChargeRouting:
 
 class TestDiscoverAutoBuckets:
     def test_sorts_numeric_ascending_unknown_last_and_ignores_other_files(
-        self, configured_work_dir, spectrum_schema
+        self, staging_work_dir, spectrum_schema
     ):
         _run_write_worker(
             [
@@ -292,13 +287,12 @@ class TestDiscoverAutoBuckets:
             ],
             charge_to_bucket={},
             catch_other_charges=False,
-            work_dir=configured_work_dir,
+            work_dir=staging_work_dir,
             schema=spectrum_schema,
             auto_bucket=True,
         )
-        spectra_dir = configured_work_dir / "spectra"
-        # Non-bucket artifacts must be ignored.
-        (spectra_dir / "charges.joblib").write_bytes(b"placeholder")
+        spectra_dir = staging_work_dir / "spectra"
+        (spectra_dir / "staging_cache.json").write_text("{}")
         (spectra_dir / "notes.txt").write_text("ignore")
 
         assert spectra_io._discover_auto_buckets(str(spectra_dir)) == [
@@ -338,7 +332,7 @@ class TestReadAndPrepareSpectra:
         assert rejected == 1
 
     def test_prepare_spectra_explicit_buckets_skips_empty_and_rejects_overlap(
-        self, configured_work_dir, mgf_writer
+        self, staging_work_dir, mgf_writer
     ):
         format_mgf_spectrum, write_mgf = mgf_writer
         peaks = [
@@ -349,47 +343,52 @@ class TestReadAndPrepareSpectra:
             (550.0, 250.0),
         ]
         mgf = write_mgf(
-            configured_work_dir / "sample.mgf",
+            staging_work_dir / "sample.mgf",
             [
                 format_mgf_spectrum(peaks, 500.0, charge=2, scan=1),
                 format_mgf_spectrum(peaks, 500.0, charge=4, scan=2),
             ],
         )
-        spectra_io.config.input_filenames = [str(mgf)]
         proc = functools.partial(
             spectrum.process_spectrum, min_peaks=5, min_mz_range=250.0
         )
 
-        # Bucket {1} has no spectra and should be skipped; charge 4 goes
-        # to "other".
-        valid = spectra_io._prepare_spectra(proc, [{1}, {2, 3}, "other"])
-        assert valid == [{2, 3}, "other"]
+        # Bucket (1,) has no spectra and is skipped; charge 4 goes to "other".
+        valid = spectra_io._prepare_spectra(
+            [mgf], staging_work_dir, proc, [(1,), (2, 3), "other"]
+        )
+        assert valid == [(2, 3), "other"]
 
-        # Overlapping charges passed programmatically raise ValueError.
         with pytest.raises(ValueError, match="more than one bucket"):
-            spectra_io._prepare_spectra(proc, [{1, 2}, {2, 3}])
+            spectra_io._prepare_spectra(
+                [mgf], staging_work_dir, proc, [{1, 2}, {2, 3}]
+            )
 
-        # Duplicate "other" passed programmatically raises ValueError.
         with pytest.raises(ValueError, match="other"):
-            spectra_io._prepare_spectra(proc, [{1}, "other", "other"])
+            spectra_io._prepare_spectra(
+                [mgf], staging_work_dir, proc, [{1}, "other", "other"]
+            )
 
-    def test_prepare_spectra_unmatched_glob_raises_file_not_found(
-        self, configured_work_dir
+    def test_prepare_spectra_empty_input_list_raises_file_not_found(
+        self, staging_work_dir
     ):
-        spectra_io.config.input_filenames = [
-            str(configured_work_dir / "no_match_*.mgf")
-        ]
         proc = functools.partial(
             spectrum.process_spectrum, min_peaks=5, min_mz_range=250.0
         )
         with pytest.raises(FileNotFoundError, match="No input peak files"):
-            spectra_io._prepare_spectra(proc, None)
+            spectra_io._prepare_spectra([], staging_work_dir, proc, None)
 
 
 class TestWriteClusterInfo:
-    def test_writes_metadata_comments_and_parseable_csv(
-        self, configured_work_dir
+    def test_writes_metadata_comments_parseable_csv_and_dotted_prefix(
+        self, staging_work_dir
     ):
+        cfg = FalconConfig(
+            io=IOConfig(
+                input_filenames=("in.mgf",),
+                output_filename=staging_work_dir / "run_v1.2",
+            )
+        )
         df = pd.DataFrame(
             {
                 "identifier": ["f:scan:1", "f:scan:2"],
@@ -399,12 +398,16 @@ class TestWriteClusterInfo:
                 "cluster": [0, 0],
             }
         )
-        spectra_io._write_cluster_info(df)
-        csv_path = configured_work_dir / "out.csv"
+        spectra_io._write_cluster_info(df, cfg, staging_work_dir)
+        csv_path = Path(f"{cfg.io.output_filename}.csv")
+        assert csv_path == staging_work_dir / "run_v1.2.csv"
         raw_lines = csv_path.read_text().splitlines()
         assert raw_lines[0].startswith("# falcon version ")
         assert any(
-            line.startswith("# linkage = complete") for line in raw_lines
+            line == "# clustering.linkage = complete" for line in raw_lines
+        )
+        assert any(
+            line == f"# io.work_dir = {staging_work_dir}" for line in raw_lines
         )
         parsed = pd.read_csv(csv_path, comment="#")
         assert list(parsed.columns) == [

@@ -1,20 +1,37 @@
 """Unit tests for falcon.falcon orchestration helpers."""
 
+import json
 import logging
 import os
 
-import joblib
 import numpy as np
 import pandas as pd
 import pytest
 
 from falcon import falcon as falcon_mod
 from falcon.cluster.consensus import ConsensusTuple
+from falcon.config import (
+    AverageConsensusConfig,
+    ClusteringConfig,
+    MedoidConsensusConfig,
+    PreprocessingConfig,
+    build_staging_manifest,
+    load_config,
+)
 
 
-def _parse_global(reset_global_config, args):
-    reset_global_config.parse(args)
-    return reset_global_config
+def make_falcon_config(
+    input_filenames=("in.mgf",),
+    output_filename="out",
+    **sections,
+):
+    """Build a validated ``FalconConfig`` with optional section overrides."""
+    io_section = {
+        "input_filenames": list(input_filenames),
+        "output_filename": str(output_filename),
+        **sections.pop("io", {}),
+    }
+    return load_config(overrides={"io": io_section, **sections})
 
 
 # ----------------------------------------------------------------------
@@ -23,226 +40,317 @@ def _parse_global(reset_global_config, args):
 
 
 class TestSetupWorkDir:
-    def test_creates_temp_dir_when_work_dir_omitted(self, reset_global_config):
-        cfg = _parse_global(reset_global_config, ["in.mgf", "out"])
-        rm_work_dir = falcon_mod._setup_work_dir()
+    def test_creates_temp_dir_without_mutating_config(self):
+        cfg = make_falcon_config()
+        work_dir, rm_work_dir = falcon_mod._setup_work_dir(cfg.io.work_dir)
         try:
             assert rm_work_dir is True
-            assert os.path.isdir(cfg.work_dir)
-            assert os.path.isdir(os.path.join(cfg.work_dir, "spectra"))
+            assert cfg.io.work_dir is None
+            assert work_dir.is_dir()
+            assert (work_dir / "spectra").is_dir()
         finally:
-            os.rmdir(os.path.join(cfg.work_dir, "spectra"))
-            os.rmdir(cfg.work_dir)
+            (work_dir / "spectra").rmdir()
+            work_dir.rmdir()
 
-    def test_explicit_work_dir_new_and_existing_warns(
-        self, tmp_path, reset_global_config, caplog
-    ):
+    def test_explicit_work_dir_new_and_existing_warns(self, tmp_path, caplog):
         wd = tmp_path / "work"
-        _parse_global(
-            reset_global_config, ["in.mgf", "out", "--work_dir", str(wd)]
-        )
-        assert falcon_mod._setup_work_dir() is False
+        work_dir, rm_work_dir = falcon_mod._setup_work_dir(wd)
+        assert work_dir == wd
+        assert rm_work_dir is False
         assert (wd / "spectra").is_dir()
 
-        # Re-running against an existing work_dir logs a warning.
         with caplog.at_level(logging.WARNING, logger="falcon"):
-            assert falcon_mod._setup_work_dir() is False
+            work_dir2, rm2 = falcon_mod._setup_work_dir(wd)
+        assert work_dir2 == wd
+        assert rm2 is False
         assert any("already exists" in r.message for r in caplog.records)
 
 
 class TestValidateOutputs:
-    def test_allows_run_when_outputs_do_not_exist(
-        self, tmp_path, reset_global_config
-    ):
-        _parse_global(
-            reset_global_config, ["in.mgf", str(tmp_path / "results")]
-        )
-        assert falcon_mod._validate_outputs() is False
+    def test_allows_run_when_outputs_do_not_exist(self, tmp_path):
+        cfg = make_falcon_config(output_filename=tmp_path / "results")
+        assert falcon_mod._validate_outputs(cfg.io) is False
 
     @pytest.mark.parametrize("existing_ext", ["csv", "mgf"])
     def test_aborts_without_overwrite_preserving_existing_file(
-        self, tmp_path, reset_global_config, existing_ext
+        self, tmp_path, existing_ext
     ):
-        prefix = tmp_path / "results"
-        existing = tmp_path / f"results.{existing_ext}"
+        prefix = tmp_path / "run_v1.2"
+        existing = tmp_path / f"run_v1.2.{existing_ext}"
         existing.write_text("keep")
-        _parse_global(reset_global_config, ["in.mgf", str(prefix)])
+        cfg = make_falcon_config(output_filename=prefix)
 
-        assert falcon_mod._validate_outputs() is True
+        assert falcon_mod._validate_outputs(cfg.io) is True
         assert existing.read_text() == "keep"
 
-    def test_removes_both_csv_and_mgf_when_overwrite_enabled(
-        self, tmp_path, reset_global_config
-    ):
-        prefix = tmp_path / "results"
-        csv_file = tmp_path / "results.csv"
-        mgf_file = tmp_path / "results.mgf"
+    def test_removes_both_csv_and_mgf_when_overwrite_enabled(self, tmp_path):
+        prefix = tmp_path / "run_v1.2"
+        csv_file = tmp_path / "run_v1.2.csv"
+        mgf_file = tmp_path / "run_v1.2.mgf"
         csv_file.write_text("old csv")
         mgf_file.write_text("old mgf")
-        _parse_global(
-            reset_global_config, ["in.mgf", str(prefix), "--overwrite"]
+        cfg = make_falcon_config(
+            output_filename=prefix, io={"overwrite": True}
         )
 
-        assert falcon_mod._validate_outputs() is False
+        assert falcon_mod._validate_outputs(cfg.io) is False
         assert not csv_file.exists()
         assert not mgf_file.exists()
 
 
 class TestWarnAggressiveOutlierCutoffs:
-    def test_warns_only_for_average_when_both_cutoffs_below_one(
-        self, reset_global_config, caplog
-    ):
-        _parse_global(
-            reset_global_config,
-            [
-                "in.mgf",
-                "out",
-                "--consensus_method",
-                "average",
-                "--outlier_cutoff_lower",
-                "0.5",
-                "--outlier_cutoff_upper",
-                "0.8",
-            ],
+    def test_warns_only_for_average_when_both_cutoffs_below_one(self, caplog):
+        cons = AverageConsensusConfig(
+            outlier_cutoff_lower=0.5, outlier_cutoff_upper=0.8
         )
         with caplog.at_level(logging.WARNING, logger="falcon"):
-            falcon_mod._warn_aggressive_outlier_cutoffs()
+            falcon_mod._warn_aggressive_outlier_cutoffs(cons)
         assert any("less than 1" in r.message for r in caplog.records)
 
     @pytest.mark.parametrize(
-        "extra_args",
+        "cons",
         [
-            [
-                "--consensus_method",
-                "medoid",
-                "--outlier_cutoff_lower",
-                "0.5",
-                "--outlier_cutoff_upper",
-                "0.5",
-            ],
-            [
-                "--consensus_method",
-                "average",
-                "--outlier_cutoff_lower",
-                "0.5",
-                "--outlier_cutoff_upper",
-                "1.0",
-            ],
+            MedoidConsensusConfig(),
+            AverageConsensusConfig(
+                outlier_cutoff_lower=0.5, outlier_cutoff_upper=1.0
+            ),
+            AverageConsensusConfig(
+                outlier_cutoff_lower=1.0, outlier_cutoff_upper=0.5
+            ),
         ],
     )
-    def test_no_warning_outside_aggressive_average_regime(
-        self, reset_global_config, caplog, extra_args
-    ):
-        _parse_global(reset_global_config, ["in.mgf", "out", *extra_args])
+    def test_no_warning_outside_aggressive_average_regime(self, caplog, cons):
         with caplog.at_level(logging.WARNING, logger="falcon"):
-            falcon_mod._warn_aggressive_outlier_cutoffs()
+            falcon_mod._warn_aggressive_outlier_cutoffs(cons)
         assert caplog.records == []
 
 
 class TestBuildProcessSpectrum:
-    def test_maps_scaling_off_to_none_and_applies_get_dim_bounds(
-        self, reset_global_config
-    ):
-        _parse_global(
-            reset_global_config,
-            ["in.mgf", "out", "--scaling", "off", "--min_mz", "101"],
+    def test_maps_scaling_off_to_none_and_applies_get_dim_bounds(self):
+        cfg_off = make_falcon_config(
+            preprocessing={"scaling": "off", "min_mz": 101.0}
         )
-        proc = falcon_mod._build_process_spectrum()
+        proc = falcon_mod._build_process_spectrum(cfg_off)
         assert proc.keywords["scaling"] is None
         assert proc.keywords["mz_min"] <= 101.0
 
-        _parse_global(
-            reset_global_config, ["in.mgf", "out", "--scaling", "root"]
-        )
-        proc_root = falcon_mod._build_process_spectrum()
+        cfg_root = make_falcon_config(preprocessing={"scaling": "root"})
+        proc_root = falcon_mod._build_process_spectrum(cfg_root)
         assert proc_root.keywords["scaling"] == "root"
 
 
 # ----------------------------------------------------------------------
-# Bucket cache reuse, mismatch, and overwrite clearing
+# Staging cache reuse, mismatch, legacy protection, and overwrite
 # ----------------------------------------------------------------------
 
 
 class TestLoadOrPrepareBuckets:
-    def test_reuses_matching_cache_without_repreparing(
-        self, tmp_path, reset_global_config, monkeypatch
+    def test_reuses_matching_cache_across_clustering_and_consensus_changes(
+        self, tmp_path, monkeypatch
     ):
+        input_file = tmp_path / "in.mgf"
+        input_file.write_text("dummy")
         spectra_dir = tmp_path / "spectra"
         spectra_dir.mkdir()
-        joblib.dump(
-            {"config": [{1}, {2}], "buckets": [{1}, {2}]},
-            spectra_dir / "charges.joblib",
+
+        orig_cfg = make_falcon_config(
+            input_filenames=[str(input_file)],
+            output_filename=tmp_path / "out1",
+            io={"work_dir": str(tmp_path)},
+            clustering={"precursor_charge_buckets": [[1], [2]]},
         )
-        _parse_global(
-            reset_global_config,
-            [
-                "in.mgf",
-                "out",
-                "--work_dir",
-                str(tmp_path),
-                "--precursor_charge_buckets",
-                "[1]",
-                "[2]",
-            ],
+        manifest = build_staging_manifest(
+            orig_cfg, [input_file], buckets=[(1,), (2,)]
+        )
+        (spectra_dir / "staging_cache.json").write_text(
+            json.dumps(manifest), encoding="utf-8"
+        )
+
+        # Sweep clustering/consensus/output settings; cache must be reused.
+        sweep_cfg = make_falcon_config(
+            input_filenames=[str(input_file)],
+            output_filename=tmp_path / "out2",
+            io={"work_dir": str(tmp_path), "export_representatives": True},
+            clustering={
+                "precursor_charge_buckets": [[1], [2]],
+                "distance_threshold": 0.25,
+                "linkage": "average",
+                "rt_tol": 15.0,
+            },
+            consensus={"method": "average"},
         )
 
         def _fail(*_args, **_kwargs):
             raise AssertionError("_prepare_spectra should not be called")
 
         monkeypatch.setattr(falcon_mod, "_prepare_spectra", _fail)
-        assert falcon_mod._load_or_prepare_buckets(lambda s: None) == [
-            {1},
-            {2},
-        ]
+        assert falcon_mod._load_or_prepare_buckets(
+            sweep_cfg, tmp_path, lambda s: None
+        ) == [(1,), (2,)]
 
     @pytest.mark.parametrize(
-        "cached_payload",
+        ("override_sections", "expected_section"),
         [
-            # Mismatched config vs None.
-            {"config": [{1}], "buckets": [{1}]},
-            # Legacy list cache without config key.
-            [(1,), (2,)],
+            ({"preprocessing": {"min_mz": 50.0}}, "preprocessing"),
+            ({"clustering": {"fragment_tol": 0.02}}, "fragment_tol"),
+            (
+                {"clustering": {"precursor_charge_buckets": [[1]]}},
+                "precursor_charge_buckets",
+            ),
         ],
     )
-    def test_mismatched_or_legacy_cache_raises_value_error(
-        self, tmp_path, reset_global_config, cached_payload
+    def test_mismatched_staging_config_raises_with_section_name(
+        self, tmp_path, override_sections, expected_section
     ):
+        input_file = tmp_path / "in.mgf"
+        input_file.write_text("dummy")
         spectra_dir = tmp_path / "spectra"
         spectra_dir.mkdir()
-        joblib.dump(cached_payload, spectra_dir / "charges.joblib")
-        _parse_global(
-            reset_global_config,
-            ["in.mgf", "out", "--work_dir", str(tmp_path)],
-        )
-        with pytest.raises(ValueError, match="Cached charge buckets"):
-            falcon_mod._load_or_prepare_buckets(lambda s: None)
 
-    def test_overwrite_clears_cached_directories_and_files(
-        self, tmp_path, reset_global_config, monkeypatch
+        orig_cfg = make_falcon_config(
+            input_filenames=[str(input_file)],
+            output_filename=tmp_path / "out",
+            io={"work_dir": str(tmp_path)},
+        )
+        manifest = build_staging_manifest(
+            orig_cfg, [input_file], buckets=[(2,)]
+        )
+        (spectra_dir / "staging_cache.json").write_text(
+            json.dumps(manifest), encoding="utf-8"
+        )
+
+        changed_cfg = make_falcon_config(
+            input_filenames=[str(input_file)],
+            output_filename=tmp_path / "out",
+            io={"work_dir": str(tmp_path)},
+            **override_sections,
+        )
+        with pytest.raises(ValueError, match=expected_section):
+            falcon_mod._load_or_prepare_buckets(
+                changed_cfg, tmp_path, lambda s: None
+            )
+
+    def test_modified_input_file_invalidates_staging_cache(self, tmp_path):
+        input_file = tmp_path / "in.mgf"
+        input_file.write_text("v1")
+        spectra_dir = tmp_path / "spectra"
+        spectra_dir.mkdir()
+
+        cfg = make_falcon_config(
+            input_filenames=[str(input_file)],
+            output_filename=tmp_path / "out",
+            io={"work_dir": str(tmp_path)},
+        )
+        manifest = build_staging_manifest(cfg, [input_file], buckets=[(2,)])
+        (spectra_dir / "staging_cache.json").write_text(
+            json.dumps(manifest), encoding="utf-8"
+        )
+
+        input_file.write_text("v2_modified")
+        st = os.stat(input_file)
+        os.utime(input_file, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
+
+        with pytest.raises(ValueError, match="inputs"):
+            falcon_mod._load_or_prepare_buckets(cfg, tmp_path, lambda s: None)
+
+    @pytest.mark.parametrize(
+        "corrupt_content",
+        [
+            "{not valid json",
+            json.dumps({"schema_version": 999, "buckets": []}),
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "inputs": [],
+                    "preprocessing": PreprocessingConfig().model_dump(
+                        mode="json"
+                    ),
+                    "fragment_tol": 0.05,
+                    "precursor_charge_buckets": None,
+                    "buckets": "bad",
+                }
+            ),
+        ],
+    )
+    def test_corrupted_staging_cache_json_raises_value_error(
+        self, tmp_path, corrupt_content
     ):
+        input_file = tmp_path / "in.mgf"
+        input_file.write_text("v1")
+        spectra_dir = tmp_path / "spectra"
+        spectra_dir.mkdir()
+        (spectra_dir / "staging_cache.json").write_text(
+            corrupt_content, encoding="utf-8"
+        )
+        cfg = make_falcon_config(
+            input_filenames=[str(input_file)],
+            output_filename=tmp_path / "out",
+            io={"work_dir": str(tmp_path)},
+        )
+        with pytest.raises(ValueError, match="cache"):
+            falcon_mod._load_or_prepare_buckets(cfg, tmp_path, lambda s: None)
+
+    @pytest.mark.parametrize(
+        "stale_name", ["charges.joblib", "spectra_charge_2.lance"]
+    )
+    def test_unverified_legacy_or_orphaned_cache_raises_without_overwrite(
+        self, tmp_path, stale_name
+    ):
+        input_file = tmp_path / "in.mgf"
+        input_file.write_text("v1")
+        spectra_dir = tmp_path / "spectra"
+        spectra_dir.mkdir()
+        stale_path = spectra_dir / stale_name
+        if stale_name.endswith(".lance"):
+            stale_path.mkdir()
+        else:
+            stale_path.write_bytes(b"legacy")
+
+        cfg = make_falcon_config(
+            input_filenames=[str(input_file)],
+            output_filename=tmp_path / "out",
+            io={"work_dir": str(tmp_path)},
+        )
+        with pytest.raises(ValueError, match="overwrite"):
+            falcon_mod._load_or_prepare_buckets(cfg, tmp_path, lambda s: None)
+
+    def test_overwrite_clears_cached_directories_and_writes_json_manifest(
+        self, tmp_path, monkeypatch
+    ):
+        input_file = tmp_path / "in.mgf"
+        input_file.write_text("v1")
         spectra_dir = tmp_path / "spectra"
         stale_dir = spectra_dir / "spectra_charge_99.lance"
         stale_dir.mkdir(parents=True)
         (stale_dir / "data").write_text("stale")
         (spectra_dir / "charges.joblib").write_text("stale")
 
-        _parse_global(
-            reset_global_config,
-            ["in.mgf", "out", "--work_dir", str(tmp_path), "--overwrite"],
+        cfg = make_falcon_config(
+            input_filenames=[str(input_file)],
+            output_filename=tmp_path / "out",
+            io={"work_dir": str(tmp_path), "overwrite": True},
         )
         monkeypatch.setattr(
-            falcon_mod, "_prepare_spectra", lambda _proc, _buckets: [(2,)]
+            falcon_mod,
+            "_prepare_spectra",
+            lambda _inputs, _wd, _proc, _buckets: [(2,)],
         )
 
-        buckets = falcon_mod._load_or_prepare_buckets(lambda s: None)
+        buckets = falcon_mod._load_or_prepare_buckets(
+            cfg, tmp_path, lambda s: None
+        )
         assert buckets == [(2,)]
         assert not stale_dir.exists()
-        saved = joblib.load(spectra_dir / "charges.joblib")
-        assert saved == {"config": None, "buckets": [(2,)]}
+        assert not (spectra_dir / "charges.joblib").exists()
+        saved = json.loads(
+            (spectra_dir / "staging_cache.json").read_text(encoding="utf-8")
+        )
+        assert saved["buckets"] == [[2]]
+        assert saved["precursor_charge_buckets"] is None
 
 
 # ----------------------------------------------------------------------
-# _run_clustering and _export_results
+# _run_clustering, _export_results, and programmatic run()
 # ----------------------------------------------------------------------
 
 
@@ -250,35 +358,25 @@ class TestRunClusteringAndExportResults:
     def test_run_clustering_passes_average_params_and_skips_empty_buckets(
         self,
         tmp_path,
-        reset_global_config,
         lance_dataset,
         spectrum_row,
         monkeypatch,
     ):
         spectra_dir = tmp_path / "spectra"
         spectra_dir.mkdir()
-        # Create an empty bucket (charge 1) and a populated one (2).
         lance_dataset([], name="spectra/spectra_charge_1.lance")
         lance_dataset(
             [spectrum_row("s:1", 500.0, [100.0, 200.0], [1.0, 1.0], 2, 10.0)],
             name="spectra/spectra_charge_2.lance",
         )
-        _parse_global(
-            reset_global_config,
-            [
-                "in.mgf",
-                "out",
-                "--work_dir",
-                str(tmp_path),
-                "--consensus_method",
-                "average",
-                "--fragment_tol",
-                "0.05",
-                "--outlier_cutoff_lower",
-                "2.0",
-                "--outlier_cutoff_upper",
-                "2.5",
-            ],
+        cfg = make_falcon_config(
+            io={"work_dir": str(tmp_path)},
+            clustering={"fragment_tol": 0.05},
+            consensus={
+                "method": "average",
+                "outlier_cutoff_lower": 2.0,
+                "outlier_cutoff_upper": 2.5,
+            },
         )
 
         captured = {}
@@ -292,7 +390,9 @@ class TestRunClusteringAndExportResults:
             falcon_mod.cluster, "generate_clusters_multi", _fake_multi
         )
 
-        datasets, results = falcon_mod._run_clustering([(1,), (2,)])
+        datasets, results = falcon_mod._run_clustering(
+            cfg, tmp_path, [(1,), (2,)]
+        )
         assert len(datasets) == 1
         assert datasets[0].count_rows() == 1
         assert len(results) == 1
@@ -305,7 +405,7 @@ class TestRunClusteringAndExportResults:
         }
 
     def test_export_results_offsets_buckets_and_natural_sorts_identifiers(
-        self, tmp_path, reset_global_config, lance_dataset, spectrum_row
+        self, tmp_path, lance_dataset, spectrum_row
     ):
         ds1 = lance_dataset(
             [
@@ -344,13 +444,14 @@ class TestRunClusteringAndExportResults:
             np.int32(0),
             np.int32(0),
         )
-        out_prefix = tmp_path / "out"
-        _parse_global(
-            reset_global_config,
-            ["in.mgf", str(out_prefix), "--export_representatives"],
+        out_prefix = tmp_path / "run_v1.2"
+        cfg = make_falcon_config(
+            output_filename=out_prefix, io={"export_representatives": True}
         )
 
         falcon_mod._export_results(
+            cfg,
+            tmp_path,
             [ds1, ds2],
             [
                 (np.array([0, 0], dtype=np.int32), [rep1]),
@@ -359,7 +460,6 @@ class TestRunClusteringAndExportResults:
         )
 
         df = pd.read_csv(f"{out_prefix}.csv", comment="#")
-        # Natural sort puts scan:1, scan:2, scan:10 (not lex order).
         assert list(df["identifier"]) == [
             "run:scan:1",
             "run:scan:2",
@@ -368,19 +468,18 @@ class TestRunClusteringAndExportResults:
         by_id = df.set_index("identifier")["cluster"].to_dict()
         assert by_id["run:scan:2"] == by_id["run:scan:10"] == 0
         assert by_id["run:scan:1"] == 1
-        mgf_text = (tmp_path / "out.mgf").read_text()
+        mgf_text = (tmp_path / "run_v1.2.mgf").read_text()
         assert "TITLE=falcon:cluster:0" in mgf_text
         assert "TITLE=falcon:cluster:1" in mgf_text
 
     def test_export_results_empty_inputs_writes_empty_csv_and_mgf(
-        self, tmp_path, reset_global_config
+        self, tmp_path
     ):
         out_prefix = tmp_path / "empty_out"
-        _parse_global(
-            reset_global_config,
-            ["in.mgf", str(out_prefix), "--export_representatives"],
+        cfg = make_falcon_config(
+            output_filename=out_prefix, io={"export_representatives": True}
         )
-        falcon_mod._export_results([], [])
+        falcon_mod._export_results(cfg, tmp_path, [], [])
         df = pd.read_csv(f"{out_prefix}.csv", comment="#")
         assert len(df) == 0
         assert list(df.columns) == [
@@ -393,16 +492,47 @@ class TestRunClusteringAndExportResults:
         assert (tmp_path / "empty_out.mgf").is_file()
 
     def test_export_results_propagates_writer_thread_exceptions(
-        self, tmp_path, reset_global_config, lance_dataset, spectrum_row
+        self, tmp_path, lance_dataset, spectrum_row
     ):
         ds = lance_dataset(
             [spectrum_row("s:1", 500.0, [100.0, 200.0], [1.0, 1.0], 2, 10.0)],
             charge=2,
         )
         bad_prefix = tmp_path / "nonexistent_dir" / "out"
-        _parse_global(reset_global_config, ["in.mgf", str(bad_prefix)])
+        cfg = make_falcon_config(output_filename=bad_prefix)
 
         with pytest.raises(FileNotFoundError):
             falcon_mod._export_results(
-                [ds], [(np.array([0], dtype=np.int32), [])]
+                cfg, tmp_path, [ds], [(np.array([0], dtype=np.int32), [])]
             )
+
+    def test_programmatic_run_does_not_shutdown_logging(
+        self, tmp_path, mgf_writer, monkeypatch
+    ):
+        format_mgf_spectrum, write_mgf = mgf_writer
+        peaks = [
+            (150.0, 100.0),
+            (250.0, 200.0),
+            (350.0, 150.0),
+            (450.0, 300.0),
+            (550.0, 250.0),
+        ]
+        mgf = write_mgf(
+            tmp_path / "prog.mgf",
+            [format_mgf_spectrum(peaks, 500.0, charge=2, scan=1, rt=10.0)],
+        )
+        shutdown_called = False
+
+        def _spy_shutdown():
+            nonlocal shutdown_called
+            shutdown_called = True
+
+        monkeypatch.setattr(logging, "shutdown", _spy_shutdown)
+        cfg = make_falcon_config(
+            input_filenames=[str(mgf)],
+            output_filename=tmp_path / "prog_out",
+            clustering=ClusteringConfig(distance_threshold=0.1).model_dump(),
+        )
+        assert falcon_mod.run(cfg) == 0
+        assert shutdown_called is False
+        assert (tmp_path / "prog_out.csv").is_file()
