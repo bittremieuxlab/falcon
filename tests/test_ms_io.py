@@ -1,6 +1,5 @@
-"""Tests for falcon.ms_io — P4: I/O dispatch and file reading/writing."""
+"""Tests for falcon.ms_io."""
 
-import os
 import math
 
 import numpy as np
@@ -8,9 +7,9 @@ import pytest
 
 from falcon.ms_io import ms_io
 
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 # ms_io.get_spectra dispatch
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 
 
 class TestGetSpectraDispatch:
@@ -42,9 +41,9 @@ class TestGetSpectraDispatch:
         assert len(spectra) == 1
 
 
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 # ms_io.write_spectra
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 
 
 class TestWriteSpectra:
@@ -54,9 +53,9 @@ class TestWriteSpectra:
             ms_io.write_spectra(str(tmp_path / "out.mzml"), [])
 
 
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 # MGF round-trip
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 
 
 class TestMgfRoundtrip:
@@ -85,9 +84,9 @@ class TestMgfRoundtrip:
         assert len(s.mz) == 3
 
 
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 # MGF read specifics
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 
 
 class TestMgfRead:
@@ -116,11 +115,7 @@ class TestMgfRead:
         """Handle spectra without charge state."""
         mgf = tmp_path / "nocharge.mgf"
         mgf.write_text(
-            "BEGIN IONS\n"
-            "PEPMASS=400.0\n"
-            "100.0 50\n"
-            "200.0 100\n"
-            "END IONS\n"
+            "BEGIN IONS\nPEPMASS=400.0\n100.0 50\n200.0 100\nEND IONS\n"
         )
         from falcon.ms_io import mgf_io
 
@@ -146,7 +141,7 @@ class TestMgfRead:
         assert "scan:42" in spectra[0].identifier
 
     def test_missing_rt_is_nan(self, tmp_path):
-        """A spectrum without RTINSECONDS should parse RT as NaN (not -1/0)."""
+        """Missing RTINSECONDS should parse RT as NaN (not -1/0)."""
         mgf = tmp_path / "nort.mgf"
         mgf.write_text(
             "BEGIN IONS\n"
@@ -164,7 +159,7 @@ class TestMgfRead:
         assert math.isnan(spectra[0].retention_time)
 
     def test_cluster_title_preserved(self, tmp_path):
-        """A '<filename>:cluster:<id>' title should be passed through as-is."""
+        """A '<filename>:cluster:<id>' title passes through as-is."""
         mgf = tmp_path / "myrun.mgf"
         mgf.write_text(
             "BEGIN IONS\n"
@@ -182,7 +177,7 @@ class TestMgfRead:
         assert spectra[0].identifier == "myrun:cluster:7"
 
     def test_usi_title_preserved(self, tmp_path):
-        """A valid USI title (mzspec:...) should be passed through as-is."""
+        """A valid USI title (mzspec:...) passes through as-is."""
         mgf = tmp_path / "run.mgf"
         mgf.write_text(
             "BEGIN IONS\n"
@@ -200,7 +195,7 @@ class TestMgfRead:
         assert spectra[0].identifier == "mzspec:PXD000000:run:scan:9"
 
     def test_scan_singular_fallback(self, tmp_path):
-        """A 'SCAN' (singular) param should be used when 'SCANS' is absent."""
+        """A singular 'SCAN' param is used when 'SCANS' is absent."""
         mgf = tmp_path / "sng.mgf"
         mgf.write_text(
             "BEGIN IONS\n"
@@ -218,7 +213,7 @@ class TestMgfRead:
         assert spectra[0].identifier == "sng:scan:77"
 
     def test_index_fallback(self, tmp_path):
-        """Without a title/scans/scan, the identifier falls back to the index."""
+        """Without title/scans/scan, identifier uses the index."""
         mgf = tmp_path / "idx.mgf"
         mgf.write_text(
             "BEGIN IONS\n"
@@ -243,7 +238,7 @@ class TestMgfRead:
         ]
 
     def test_non_usi_title_replaced(self, tmp_path):
-        """A plain title (not a USI, not a cluster title) is replaced."""
+        """A plain title (neither USI nor cluster) is replaced."""
         mgf = tmp_path / "foo.mgf"
         mgf.write_text(
             "BEGIN IONS\n"
@@ -262,7 +257,7 @@ class TestMgfRead:
         assert spectra[0].identifier == "foo:index:0"
 
     def test_filename_param_override(self, tmp_path):
-        """A 'FILENAME' param overrides the on-disk file name in identifiers."""
+        """A 'FILENAME' param overrides the on-disk file name."""
         mgf = tmp_path / "ondisk.mgf"
         mgf.write_text(
             "BEGIN IONS\n"
@@ -318,7 +313,7 @@ class TestMgfRead:
         assert spectra[0].precursor_charge == -3
 
     def test_multiple_spectra_with_malformed_skipped(self, tmp_path):
-        """A spectrum that fails to parse is skipped; valid ones still read."""
+        """Malformed spectra are skipped; valid ones are still read."""
         mgf = tmp_path / "multi.mgf"
         mgf.write_text(
             "BEGIN IONS\n"
@@ -352,9 +347,9 @@ class TestMgfRead:
         ]
 
 
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 # MGF write (_spectra_to_dicts) — optional fields
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 
 
 class TestSpectraToDicts:
@@ -421,9 +416,9 @@ class TestSpectraToDicts:
         assert math.isnan(spectra[0].retention_time)
 
 
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 # _scale_intensities
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 
 
 class TestScaleIntensities:

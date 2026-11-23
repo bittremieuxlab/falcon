@@ -1,6 +1,7 @@
+"""Memory-mapped condensed pairwise cosine distance matrix kernels."""
+
 import os
 import tempfile
-from typing import List, Tuple
 
 import numba as nb
 import numpy as np
@@ -9,31 +10,38 @@ from . import similarity
 
 
 def compute_condensed_distance_matrix(
-    spec_tuples: List[similarity.SpectrumTuple],
+    spec_tuples: list[similarity.SpectrumTuple],
     fragment_mz_tol: float,
     min_matches: int,
 ) -> np.ndarray:
     """
-    Compute the condensed pairwise distance matrix for the given spectra.
+    Compute the float32 condensed pairwise cosine distance matrix.
+
+    Allocates an on-disk NumPy memmap in the system temp directory,
+    unlinks the path immediately on POSIX so space is reclaimed when the
+    memmap is garbage-collected, and fills it in parallel via Numba.
 
     Parameters
     ----------
-    spec_tuples : List[similarity.SpectrumTuple]
-        The spectra to compute the pairwise distance matrix for.
+    spec_tuples : list[SpectrumTuple]
+        Preprocessed spectra to compare pairwise.
     fragment_mz_tol : float
-        The fragment m/z tolerance.
+        Fragment m/z matching tolerance (in Da).
     min_matches : int
-        The minimum number of matched peaks to consider the spectra similar.
+        Minimum matched fragment peaks required; pairs below this gate
+        receive distance ``1.0``.
 
     Returns
     -------
     np.ndarray
-        The condensed pairwise distance matrix.
+        Float32 condensed upper-triangle distance vector of length
+        ``n * (n - 1) // 2``.
     """
     n = len(spec_tuples)
-    pdist_file = tempfile.NamedTemporaryFile(suffix=".npy", delete=False)
-    pdist_filename = pdist_file.name
-    pdist_file.close()  # Close the file so that it can be opened by memmap
+    with tempfile.NamedTemporaryFile(
+        suffix=".npy", delete=False
+    ) as pdist_file:
+        pdist_filename = pdist_file.name
 
     condensed_dist_matrix = np.lib.format.open_memmap(
         pdist_filename,
@@ -41,12 +49,8 @@ def compute_condensed_distance_matrix(
         dtype=np.float32,
         shape=(n * (n - 1) // 2,),
     )
-    # Unlink the backing file now that it is mapped. On POSIX the inode (and its
-    # data) stays alive until this memmap is released (e.g. the `del pdist` in
-    # `_cluster_mz_interval`), after which the OS reclaims the space
-    # automatically. Without this the temp file is never removed and leaks for
-    # the lifetime of the process, accumulating one file per m/z interval and
-    # potentially filling the disk on large datasets.
+    # Unlink immediately after mapping: on POSIX the inode lives until
+    # the memmap is released, preventing temp-file leaks across splits.
     os.unlink(pdist_filename)
 
     _condensed_distance_matrix_parallel(
@@ -59,30 +63,29 @@ def compute_condensed_distance_matrix(
     return condensed_dist_matrix
 
 
-def open_shared_condensed(n: int) -> Tuple[str, np.ndarray]:
+def open_shared_condensed(n: int) -> tuple[str, np.memmap]:
     """
-    Create a named, on-disk condensed distance matrix that several processes
-    can fill concurrently.
+    Create a named memmapped condensed distance matrix for tiling.
 
-    Unlike `compute_condensed_distance_matrix`, the backing file is NOT unlinked
-    here: tile workers and the finalize step open it by name in separate
-    processes, so the caller is responsible for unlinking it once every opener
-    is done (see `generate_clusters_multi`).
+    Unlike ``compute_condensed_distance_matrix``, the backing file stays
+    named on disk so multiple worker processes can open it by path; the
+    caller must unlink the file after all workers finish.
 
     Parameters
     ----------
     n : int
-        The number of spectra in the interval.
+        Number of spectra in the interval.
 
     Returns
     -------
-    Tuple[str, np.ndarray]
-        The backing file path and the writable memmap of shape
+    tuple[str, np.memmap]
+        Backing ``.npy`` file path and writable float32 memmap of shape
         ``(n * (n - 1) // 2,)``.
     """
-    pdist_file = tempfile.NamedTemporaryFile(suffix=".npy", delete=False)
-    pdist_filename = pdist_file.name
-    pdist_file.close()
+    with tempfile.NamedTemporaryFile(
+        suffix=".npy", delete=False
+    ) as pdist_file:
+        pdist_filename = pdist_file.name
     condensed_dist_matrix = np.lib.format.open_memmap(
         pdist_filename,
         mode="w+",
@@ -95,23 +98,35 @@ def open_shared_condensed(n: int) -> Tuple[str, np.ndarray]:
 @nb.njit
 def _condensed_rows(
     condensed_dist_matrix: np.ndarray,
-    spec_tuples: List[similarity.SpectrumTuple],
+    spec_tuples: list[similarity.SpectrumTuple],
     r0: int,
     r1: int,
     fragment_mz_tol: float,
     min_matches: int,
 ) -> None:
     """
-    Fill the condensed-distance entries for rows ``[r0, r1)`` of the upper
-    triangle (pairs ``(i, j)`` with ``r0 <= i < r1`` and ``i < j < n``).
+    Fill condensed distance entries for rows ``[r0, r1)``.
 
-    This computes one contiguous row-band of the same matrix produced by
-    `_condensed_distance_matrix_parallel`, writing into the shared memmap at the
-    canonical `condensed_index` positions. It is intentionally serial (no
-    `prange`): parallelism comes from dispatching many of these as independent
-    pool tasks, one worker each, so workers stay single-threaded and don't
-    oversubscribe. Each pair is computed exactly once and identically to the
-    full build, so the assembled matrix is bit-for-bit identical.
+    Computes pairs ``(i, j)`` with ``r0 <= i < r1`` and ``i < j < n``
+    serially (no ``prange``) because parallelism comes from running
+    disjoint row-band tiles across separate worker processes. Results
+    are bit-for-bit identical to ``_condensed_distance_matrix_parallel``
+    in full-matrix mode.
+
+    Parameters
+    ----------
+    condensed_dist_matrix : np.ndarray
+        Shared float32 condensed distance buffer written in place.
+    spec_tuples : list[SpectrumTuple]
+        All spectra in the interval in canonical order.
+    r0 : int
+        Start row index (inclusive).
+    r1 : int
+        Stop row index (exclusive).
+    fragment_mz_tol : float
+        Fragment m/z matching tolerance (in Da).
+    min_matches : int
+        Minimum matched peaks required for nonzero similarity.
     """
     n = len(spec_tuples)
     for i in range(r0, r1):
@@ -128,23 +143,23 @@ def _condensed_rows(
 @nb.njit(parallel=True)
 def _condensed_distance_matrix_parallel(
     condensed_dist_matrix: np.ndarray,
-    spec_tuples: List[similarity.SpectrumTuple],
+    spec_tuples: list[similarity.SpectrumTuple],
     fragment_mz_tol: float,
     min_matches: int,
 ) -> None:
     """
-    Compute the condensed pairwise distance matrix for the given spectra.
+    Fill the full condensed pairwise distance matrix in parallel.
 
     Parameters
     ----------
     condensed_dist_matrix : np.ndarray
-        The condensed pairwise distance matrix.
-    spec_tuples : List[similarity.SpectrumTuple]
-        The spectra to compute the pairwise distance matrix for.
+        Preallocated float32 condensed distance buffer written in place.
+    spec_tuples : list[SpectrumTuple]
+        Spectra to compare pairwise.
     fragment_mz_tol : float
-        The fragment m/z tolerance.
+        Fragment m/z matching tolerance (in Da).
     min_matches : int
-        The minimum number of matched peaks to consider the spectra similar.
+        Minimum matched peaks required for nonzero similarity.
     """
     n = len(spec_tuples)
 
@@ -165,21 +180,28 @@ def _condensed_distance_matrix_parallel(
 @nb.njit
 def condensed_index(i: int, j: int, n: int) -> int:
     """
-    Get the index of the condensed distance matrix.
+    Map a pair ``(i, j)`` to its SciPy condensed distance matrix index.
+
+    Symmetric in ``i`` and ``j``; indices are swapped when ``i > j``.
 
     Parameters
     ----------
     i : int
-        The row index.
+        First spectrum index (``0 <= i < n``).
     j : int
-        The column index.
+        Second spectrum index (``0 <= j < n``, ``j != i``).
     n : int
-        The number of spectra.
+        Total number of spectra (``n > 0``).
 
     Returns
     -------
     int
-        The index of the condensed distance matrix.
+        Flat 0-based index into the condensed upper-triangle array.
+
+    Raises
+    ------
+    ValueError
+        If ``n <= 0``, ``i == j``, or either index is out of ``[0, n)``.
     """
     if n <= 0:
         raise ValueError("Number of spectra must be greater than 0")

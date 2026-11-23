@@ -1,12 +1,15 @@
-import pytest
+"""Tests for falcon.cluster.distance_matrix."""
+
 import numpy as np
-from falcon.cluster import distance_matrix, cluster
+import pytest
+
+from falcon.cluster import cluster, distance_matrix
 from falcon.cluster.similarity import SpectrumTuple
 
 
 class TestCondensedIndex:
     def test_condensed_index_basic(self):
-        """Test basic cases where the condensed index is computed correctly."""
+        """Basic cases compute the condensed index correctly."""
         assert distance_matrix.condensed_index(0, 1, 5) == 0
         assert distance_matrix.condensed_index(0, 2, 5) == 1
         assert distance_matrix.condensed_index(1, 3, 5) == 5
@@ -30,19 +33,23 @@ class TestCondensedIndex:
             distance_matrix.condensed_index(2, 2, 5)
 
     def test_condensed_index_out_of_bounds(self):
-        """Test cases where i or j is out of range (negative or >= n)."""
-        with pytest.raises(ValueError):
+        """Out-of-range i or j (negative or >= n) raise ValueError."""
+        with pytest.raises(ValueError, match="Indices must be non-negative"):
             distance_matrix.condensed_index(-1, 2, 5)
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="Index out of bounds"):
             distance_matrix.condensed_index(2, 5, 5)
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="Index out of bounds"):
             distance_matrix.condensed_index(5, 2, 5)
 
     def test_condensed_index_invalid_n(self):
         """Test cases where n is invalid."""
-        with pytest.raises(ValueError):
+        with pytest.raises(
+            ValueError, match="Number of spectra must be greater than 0"
+        ):
             distance_matrix.condensed_index(0, 1, 0)
-        with pytest.raises(ValueError):
+        with pytest.raises(
+            ValueError, match="Number of spectra must be greater than 0"
+        ):
             distance_matrix.condensed_index(0, 1, -1)
 
     def test_condensed_index_large_matrix(self):
@@ -70,9 +77,9 @@ class TestComputeCondensedDistanceMatrix:
         assert pdist[0] > 0.99
 
     def test_min_matches_filter(self, spectrum_tuple_pair):
-        """Pairs with fewer matched peaks than min_matches should get distance 1."""
+        """Pairs below min_matches peaks receive distance 1."""
         spec1, spec2 = spectrum_tuple_pair
-        # spec1 and spec2 have 3 peaks each; setting min_matches=100 should force dist=1
+        # spec1/spec2 have 3 peaks each; min_matches=100 forces dist=1.
         pdist = distance_matrix.compute_condensed_distance_matrix(
             [spec1, spec2], fragment_mz_tol=0.5, min_matches=100
         )
@@ -80,7 +87,7 @@ class TestComputeCondensedDistanceMatrix:
 
 
 def _random_spectra(n, rng, n_peaks=30, mz_max=200.0):
-    """Random spectra with overlapping peaks so cosine distances vary."""
+    """Generate random spectra with overlapping peaks."""
     specs = []
     for _ in range(n):
         mz = np.sort(rng.uniform(0.0, mz_max, n_peaks)).astype(np.float32)
@@ -93,7 +100,7 @@ def _random_spectra(n, rng, n_peaks=30, mz_max=200.0):
 
 
 class TestTiledCondensed:
-    """The tiled distance build must reproduce the full matrix bit-for-bit."""
+    """Tiled distance construction matches the full matrix exactly."""
 
     @pytest.mark.parametrize("min_matches", [0, 3])
     @pytest.mark.parametrize("n_tiles", [1, 7])
@@ -108,18 +115,22 @@ class TestTiledCondensed:
                 spectra, frag, min_matches
             )
         )
-        # Sanity: the interval has genuine (non-trivial) distances to compare.
+        # Sanity: the interval has non-trivial distances to compare.
         assert (ref < 0.99).any()
 
         out = np.full(n * (n - 1) // 2, np.nan, np.float32)
         bounds = cluster._interval_row_bounds(n, n_tiles)
         # Row-bands must cover [0, n) exactly once (no gap, no overlap).
-        assert bounds[0][0] == 0 and bounds[-1][1] == n
-        assert all(bounds[i][1] == bounds[i + 1][0] for i in range(len(bounds) - 1))
+        assert bounds[0][0] == 0
+        assert bounds[-1][1] == n
+        assert all(
+            bounds[i][1] == bounds[i + 1][0] for i in range(len(bounds) - 1)
+        )
         for r0, r1 in bounds:
             distance_matrix._condensed_rows(
                 out, spectra, r0, r1, frag, min_matches
             )
 
-        assert not np.isnan(out).any()  # every pair written exactly once
+        # Every pair must be written exactly once.
+        assert not np.isnan(out).any()
         assert np.array_equal(out, ref)

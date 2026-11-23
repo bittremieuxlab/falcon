@@ -1,37 +1,39 @@
+"""mzML MS/MS spectrum reader."""
+
 import logging
-from typing import Dict, IO, Iterable, Union
+from collections.abc import Iterator
+from typing import IO, Any, cast
 
 import pyteomics.mzml
 import spectrum_utils.spectrum as sus
 from lxml.etree import LxmlError
 
-from ..config import config
 from . import reader_utils
 
 logger = logging.getLogger("falcon")
 
 
-def get_spectra(source: Union[IO, str]) -> Iterable[sus.MsmsSpectrum]:
+def get_spectra(source: IO[Any] | str) -> Iterator[sus.MsmsSpectrum]:
     """
-    Get the MS/MS spectra from the given mzML file.
+    Read MS/MS spectra (MS level > 1) from an mzML file or stream.
 
     Parameters
     ----------
-    source : Union[IO, str]
-        The mzML source (file name or open file object) from which the spectra
-        are read.
+    source : IO[Any] | str
+        Path or open file object for the mzML source.
 
-    Returns
-    -------
-    Iterable[MsmsSpectrum]
-        An iterator over the spectra in the given file.
+    Yields
+    ------
+    MsmsSpectrum
+        Parsed MS/MS spectra with ``<stem>:scan:<number>`` identifiers;
+        spectra lacking ``scan=`` or failing to parse are skipped.
     """
     with pyteomics.mzml.MzML(source) as f_in:
         filename = reader_utils.base_filename(source, f_in)
         try:
             for spectrum_dict in f_in:
                 if int(spectrum_dict.get("ms level", -1)) > 1:
-                    # USI-inspired cluster identifier.
+                    # Build a USI-style identifier from the scan number.
                     scan_idx = spectrum_dict["id"].find("scan=")
                     if scan_idx == -1:
                         logger.warning(
@@ -53,19 +55,22 @@ def get_spectra(source: Union[IO, str]) -> Iterable[sus.MsmsSpectrum]:
             logger.warning("Failed to read file %s: %s", source, e)
 
 
-def _parse_spectrum(spectrum_dict: Dict) -> sus.MsmsSpectrum:
+def _parse_spectrum(spectrum_dict: dict[str, Any]) -> sus.MsmsSpectrum:
     """
-    Parse the Pyteomics cluster dict.
+    Parse a Pyteomics mzML spectrum dictionary into an ``MsmsSpectrum``.
+
+    Uses the first precursor and selected ion, falling back from
+    ``charge state`` to ``possible charge state`` before ``None``.
 
     Parameters
     ----------
-    spectrum_dict : Dict
-        The Pyteomics cluster dict to be parsed.
+    spectrum_dict : dict[str, Any]
+        Pyteomics mzML spectrum entry.
 
     Returns
     -------
     MsmsSpectrum
-        The parsed cluster.
+        Parsed spectrum; missing RT is stored as ``NaN``.
     """
     spectrum_id = spectrum_dict["id"]
     mz_array = spectrum_dict["m/z array"]
@@ -84,10 +89,11 @@ def _parse_spectrum(spectrum_dict: Dict) -> sus.MsmsSpectrum:
     else:
         precursor_charge = None
 
+    # spectrum_utils 0.3.5 types precursor_charge as int; None is valid.
     return sus.MsmsSpectrum(
         spectrum_id,
         precursor_mz,
-        precursor_charge,
+        cast(int, precursor_charge),
         mz_array,
         intensity_array,
         None,

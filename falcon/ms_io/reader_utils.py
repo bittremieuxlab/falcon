@@ -1,35 +1,36 @@
-"""Shared helpers for the per-format spectrum readers (mgf/mzml/mzxml).
+"""Shared helpers for the per-format spectrum readers.
 
-These intentionally live in a leaf module that imports none of the readers, so
-the readers can import it without creating a cycle with ``ms_io``.
+These helpers live in a leaf module that imports none of the format
+readers so readers can import them without creating a cycle with
+``ms_io``.
 """
 
 import logging
 import os
-from typing import IO, Union
+from typing import IO, Any
 
 logger = logging.getLogger("falcon")
 
 
-def base_filename(source: Union[IO, str], reader) -> str:
+def base_filename(source: IO[Any] | str, reader: Any) -> str:
     """
-    Derive the base file name (no directory, no extension) used to build
-    USI-style spectrum identifiers.
+    Derive a base filename without directory or extension.
 
-    Works for both path strings and open file objects; the latter fall back to
-    the ``name`` attribute of the source or of the pyteomics ``reader``.
+    Used to build USI-style spectrum identifiers. Accepts both path
+    strings and open file objects; for file objects, falls back to the
+    ``name`` attribute of ``source`` or of the Pyteomics ``reader``.
 
     Parameters
     ----------
-    source : Union[IO, str]
-        The source passed to ``get_spectra`` (a path or an open file object).
-    reader
-        The open pyteomics reader, used as a secondary source of a ``name``.
+    source : IO[Any] | str
+        Peak file path or open file object passed to ``get_spectra``.
+    reader : Any
+        Open Pyteomics reader used as a fallback source for ``name``.
 
     Returns
     -------
     str
-        The base file name, or ``"unknown"`` when no name can be determined.
+        Base filename stem, or ``"unknown"`` when no name is available.
     """
     if isinstance(source, str):
         name = source
@@ -41,14 +42,23 @@ def base_filename(source: Union[IO, str], reader) -> str:
 
 
 def log_skipped_spectrum(
-    source: Union[IO, str], identifier, exc: Exception
+    source: IO[Any] | str, identifier: Any, exc: Exception
 ) -> None:
     """
-    Record that a single spectrum could not be parsed and is being skipped.
+    Log a skipped unparsable spectrum at debug level.
 
-    Logged at ``debug`` rather than ``warning``: a file may contain millions of
-    spectra and a per-spectrum warning would flood the log. A failure to read a
-    whole file remains a ``warning`` in the individual readers.
+    Debug logging avoids flooding stderr when large files contain many
+    malformed spectra; whole-file read failures remain warnings in the
+    individual format readers.
+
+    Parameters
+    ----------
+    source : IO[Any] | str
+        Peak file path or open file object being read.
+    identifier : Any
+        Spectrum identifier or title if available.
+    exc : Exception
+        Parsing exception that caused the spectrum to be skipped.
     """
     logger.debug(
         "Skipping unparsable spectrum %s in %s: %s", identifier, source, exc

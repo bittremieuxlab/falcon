@@ -1,9 +1,8 @@
 """Shared test fixtures for falcon tests."""
 
 import numpy as np
-import spectrum_utils.spectrum as sus
-
 import pytest
+import spectrum_utils.spectrum as sus
 
 from falcon.cluster import similarity
 
@@ -27,7 +26,7 @@ def simple_spectrum():
 
 @pytest.fixture
 def narrow_spectrum():
-    """A spectrum with a narrow m/z range (should be rejected by min_mz_range)."""
+    """Spectrum with a narrow m/z range (rejected by min_mz_range)."""
     return sus.MsmsSpectrum(
         "test:scan:2",
         precursor_mz=500.0,
@@ -42,7 +41,7 @@ def narrow_spectrum():
 
 @pytest.fixture
 def few_peaks_spectrum():
-    """A spectrum with too few peaks (should be rejected by min_peaks)."""
+    """Spectrum with too few peaks (rejected by min_peaks)."""
     return sus.MsmsSpectrum(
         "test:scan:3",
         precursor_mz=500.0,
@@ -94,7 +93,7 @@ def spectrum_tuple_pair():
 
 @pytest.fixture
 def orthogonal_spectrum_tuple_pair():
-    """A pair of SpectrumTuples with non-overlapping peaks (distance ~1)."""
+    """Pair of SpectrumTuples with disjoint peaks (distance ~1)."""
     int1 = np.array([1.0, 0.0], dtype=np.float32)
     int2 = np.array([1.0, 0.0], dtype=np.float32)
     spec1 = similarity.SpectrumTuple(
@@ -114,11 +113,11 @@ def orthogonal_spectrum_tuple_pair():
 
 @pytest.fixture
 def mock_spectra():
-    """Factory fixture to create a list of SpectrumTuples with similar peaks."""
+    """Factory fixture creating SpectrumTuples with similar peaks."""
 
     def _make(n, mz_base=100.0, mz_step=1.0, n_peaks=3):
         spectra = []
-        for i in range(n):
+        for _ in range(n):
             mz = np.array(
                 [mz_base + j * mz_step for j in range(n_peaks)],
                 dtype=np.float32,
@@ -148,7 +147,7 @@ def make_spectrum_row(
     precursor_charge=2,
     retention_time=0.0,
 ):
-    """Build a single Lance row dict for a spectrum (L2-normalized intensity)."""
+    """Build a single Lance row dict for a spectrum (L2-normalized)."""
     mz = np.asarray(mz, dtype=np.float32)
     intensity = np.asarray(intensity, dtype=np.float32)
     intensity = intensity / np.linalg.norm(intensity)
@@ -170,14 +169,14 @@ def spectrum_row():
 
 @pytest.fixture
 def lance_dataset(tmp_path):
-    """Factory fixture that writes rows to a Lance dataset and returns it.
+    """Factory fixture writing rows to a Lance dataset.
 
     The dataset path mirrors the production layout
-    (``spectra_charge_<charge>.lance``) so ``generate_clusters`` can derive the
-    charge from the URI.
+    (``spectra_charge_<charge>.lance``) so ``generate_clusters`` can
+    derive the charge from the URI.
     """
-    import pyarrow as pa
     import lance
+    import pyarrow as pa
 
     schema = pa.schema(
         [
