@@ -153,7 +153,8 @@ For untargeted metabolomics or top-down data, layer a sparse TOML override file 
 
 - `min_peaks` (`--min-peaks`) and `min_mz_range` (`--min-mz-range`): Discard spectra with fewer than `min_peaks` peaks (`>= 1`) or a smaller _m_/_z_ span than `min_mz_range` (`>= 0`, `<= max_mz - min_mz`).
   Defaults are `5` peaks and `250.0` _m_/_z_.
-- `min_mz` (`--min-mz`) and `max_mz` (`--max-mz`): Minimum (`>= 0`) and maximum (`> min_mz`) peak _m_/_z_ values (inclusive).
+- `min_mz` (`--min-mz`) and `max_mz` (`--max-mz`): Minimum (`>= 0`) and maximum (`> min_mz`) peak _m_/_z_ values.
+  Before filtering, Falcon aligns both bounds outward to the `fragment_tol` grid (`min_mz` downward and `max_mz` upward), so retained peaks may fall outside the configured bounds.
   Defaults are `101.0` and `1500.0` _m_/_z_.
 - `remove_precursor_tol` (`--remove-precursor-tol`): Window in Da (`> 0`, or `"none"` to disable) around the precursor _m_/_z_ within which peaks are removed.
   Default is `1.5`.
