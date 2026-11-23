@@ -288,7 +288,7 @@ def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
 
 
 def _has_unverified_staging_files(spectra_dir: Path) -> bool:
-    """Return True if ``spectra_dir`` holds unmanifested cache artifacts."""
+    """Return True if ``spectra_dir`` has unmanifested cache files."""
     for entry in spectra_dir.iterdir():
         if entry.name == "charges.joblib" or entry.name.endswith(".lance"):
             return True
@@ -366,7 +366,7 @@ def _load_or_prepare_buckets(
             "--overwrite or a different --work-dir."
         )
 
-    # Stage fresh Lance datasets and write provenance manifest atomically.
+    # Stage fresh Lance datasets and write cache manifest atomically.
     charge_buckets = _prepare_spectra(
         resolved_inputs,
         work_dir,

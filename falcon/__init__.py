@@ -32,7 +32,7 @@ __all__ = [
 
 
 def __getattr__(name: str) -> Any:
-    """Lazily expose configuration and pipeline APIs at package level."""
+    """Lazily expose configuration and pipeline APIs at module level."""
     if name in {
         "FalconConfig",
         "FalconSettings",

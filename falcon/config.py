@@ -1,4 +1,4 @@
-"""Strict, hierarchical configuration models and validation for Falcon."""
+"""Strict hierarchical configuration models and loaders for Falcon."""
 
 from __future__ import annotations
 
@@ -35,11 +35,11 @@ ChargeBucket = tuple[ChargeValue, ...] | Literal["other"]
 
 
 class ConfigError(ValueError):
-    """Raised when configuration files or layer structures are invalid."""
+    """Raised when configuration files or layers are invalid."""
 
 
 class _AllowSentinelSchema:
-    """Pydantic schema annotation adding a TOML string sentinel literal."""
+    """Pydantic annotation adding a TOML string sentinel literal."""
 
     def __init__(self, sentinel: str) -> None:
         self.sentinel = sentinel
@@ -104,7 +104,7 @@ def _parse_optional_output_prefix(value: Any) -> Path | None:
 
 
 def _parse_input_filenames(value: Any) -> tuple[str, ...]:
-    """Validate a non-empty sequence of non-blank input file patterns."""
+    """Validate a non-empty sequence of non-blank input patterns."""
     if not isinstance(value, (list, tuple)):
         raise ValueError("input_filenames must be a list or tuple of strings")
     if len(value) == 0:
@@ -127,7 +127,7 @@ def _parse_optional_input_filenames(value: Any) -> tuple[str, ...] | None:
 
 
 def _charge_sort_key(value: ChargeValue) -> tuple[bool, int | str]:
-    """Sort numeric charges ascending before the ``"unknown"`` sentinel."""
+    """Sort numeric charges ascending before ``"unknown"``."""
     return (isinstance(value, str), value)
 
 
@@ -371,7 +371,7 @@ class IOConfig(_BaseIOConfig):
 
 
 class _BaseFalconConfig(BaseModel):
-    """Shared scientific configuration sections and cross-section checks."""
+    """Shared scientific config sections and cross-section checks."""
 
     model_config = _STRICT_MODEL_CONFIG
 
@@ -434,7 +434,7 @@ class FalconConfig(_BaseFalconConfig):
     io: IOConfig
 
     def to_toml(self, *, work_dir: Path | None = None) -> str:
-        """Serialize resolved configuration as deterministic TOML text."""
+        """Serialize resolved config as deterministic TOML text."""
         return _format_toml(self, work_dir=work_dir)
 
     def to_metadata_lines(self, *, work_dir: Path | None = None) -> list[str]:
@@ -452,7 +452,7 @@ def merge_config_dicts(
     override: Mapping[str, Any],
 ) -> dict[str, Any]:
     """
-    Recursively merge two configuration mappings without mutating inputs.
+    Recursively merge two config mappings without mutating inputs.
 
     Lists and scalar values replace lower-layer entries atomically.
     When ``override`` switches ``consensus.method`` to a different
@@ -490,7 +490,7 @@ def merge_config_dicts(
 
 
 def _parse_extends_entries(raw_extends: Any, source: Path) -> list[str]:
-    """Validate and normalize a TOML ``extends`` value into path strings."""
+    """Validate and normalize a TOML ``extends`` value into paths."""
     if isinstance(raw_extends, str):
         if not raw_extends.strip():
             raise ConfigError(
@@ -679,7 +679,7 @@ def load_config(
 
 
 def _toml_literal(value: Any) -> str:
-    """Format a validated scalar or nested list as a TOML value literal."""
+    """Format a validated scalar or nested list as a TOML literal."""
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, int):
@@ -700,7 +700,7 @@ def _format_toml(
     *,
     work_dir: Path | None = None,
 ) -> str:
-    """Render a validated configuration as canonical round-trippable TOML."""
+    """Render a validated config as canonical round-trippable TOML."""
     effective_work_dir = cfg.io.work_dir if work_dir is None else work_dir
     lines: list[str] = ["[io]"]
     if cfg.io.input_filenames is not None:
@@ -802,7 +802,7 @@ def _format_metadata_lines(
     *,
     work_dir: Path | None = None,
 ) -> list[str]:
-    """Return canonical metadata lines for startup logs and CSV headers."""
+    """Return canonical metadata lines for logs and CSV headers."""
     effective_work_dir = cfg.io.work_dir if work_dir is None else work_dir
     prep = cfg.preprocessing
     clust = cfg.clustering
@@ -849,7 +849,7 @@ def _format_metadata_lines(
 
 def build_json_schema() -> dict[str, Any]:
     """
-    Build a JSON Schema compatible with sparse hierarchical TOML configs.
+    Build a JSON Schema for sparse hierarchical TOML configs.
 
     Includes optional top-level ``extends`` (single path or list of
     paths) alongside optional ``[io]`` paths and TOML string sentinels
@@ -893,7 +893,7 @@ def build_json_schema() -> dict[str, Any]:
 def _serialize_buckets(
     buckets: Sequence[Any] | None,
 ) -> list[list[int | str] | str] | None:
-    """Convert charge bucket keys into deterministic JSON-safe structures."""
+    """Convert charge bucket keys into deterministic JSON structures."""
     if buckets is None:
         return None
     serialized: list[list[int | str] | str] = []
@@ -997,7 +997,7 @@ def diff_staging_manifests(
 
 def deserialize_cached_buckets(raw_buckets: Any) -> list[ChargeBucket]:
     """
-    Validate and deserialize staged bucket keys from ``staging_cache.json``.
+    Validate and deserialize bucket keys from ``staging_cache.json``.
 
     Parameters
     ----------

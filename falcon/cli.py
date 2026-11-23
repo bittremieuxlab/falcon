@@ -84,7 +84,7 @@ def _cli_optional_float(raw: str) -> float | str:
 
 
 def _cli_optional_int(raw: str) -> int | str:
-    """Parse an integer CLI argument or the ``"none"`` disable sentinel."""
+    """Parse an int CLI argument or the ``"none"`` disable sentinel."""
     if raw == "none":
         return "none"
     return _cli_int(raw)
@@ -444,7 +444,7 @@ def format_validation_error(exc: ValidationError) -> str:
 
 
 def _extract_cli_overrides(ns: dict[str, Any]) -> dict[str, Any]:
-    """Build a sparse nested config override dict from parsed CLI args."""
+    """Build a sparse nested override dict from parsed CLI args."""
     io_ov: dict[str, Any] = {}
     prep_ov: dict[str, Any] = {}
     clust_ov: dict[str, Any] = {}
@@ -540,12 +540,13 @@ def parse_cli(args: Sequence[str] | None = None) -> CliResult:
     Parameters
     ----------
     args : Sequence[str] | None, default=None
-        Optional CLI argument list. When ``None``, reads ``sys.argv[1:]``.
+        Optional CLI argument list. When ``None``, reads
+        ``sys.argv[1:]``.
 
     Returns
     -------
     CliResult
-        Action descriptor and validated configuration or settings object.
+        Action descriptor and validated configuration or settings.
     """
     parser = build_parser()
     parsed = parser.parse_args(list(args) if args is not None else None)
