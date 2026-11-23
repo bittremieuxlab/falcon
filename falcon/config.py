@@ -609,7 +609,10 @@ def _resolve_layers(
     overrides: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Merge explicit TOML files left-to-right, then apply overrides."""
-    merged: dict[str, Any] = {}
+    # Seed the default consensus discriminator so partial consensus
+    # overrides (or empty [consensus] tables) resolve against medoid
+    # rather than failing with a missing-discriminator error.
+    merged: dict[str, Any] = {"consensus": {"method": "medoid"}}
     for cfg_file in config_files:
         layer = load_toml_file(Path(cfg_file))
         merged = merge_config_dicts(merged, layer)
