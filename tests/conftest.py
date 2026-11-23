@@ -11,7 +11,6 @@ import pytest
 import spectrum_utils.spectrum as sus
 
 from falcon.cluster import similarity
-from falcon.config import config as _global_config
 
 SPECTRUM_SCHEMA = pa.schema(
     [
@@ -23,15 +22,6 @@ SPECTRUM_SCHEMA = pa.schema(
         pa.field("retention_time", pa.float32()),
     ]
 )
-
-
-@pytest.fixture
-def reset_global_config():
-    """Restore global ``falcon.config.config`` state after a test."""
-    prev_namespace = _global_config._namespace
-    yield _global_config
-    _global_config._namespace = prev_namespace
-    _global_config.__dict__.pop("work_dir", None)
 
 
 @pytest.fixture

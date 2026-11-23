@@ -1,9 +1,12 @@
 """Read peak files, stage Lance datasets, and write CSV assignments.
 
 This module implements the spectrum and Lance IO layer orchestrated by
-``falcon.py``: parallel peak-file reading, charge-bucket routing,
-per-charge Lance dataset staging, and cluster-assignment CSV export.
+``falcon.py``: deterministic input glob expansion, parallel peak-file
+reading, charge-bucket routing, per-charge Lance dataset staging, and
+cluster-assignment CSV export.
 """
+
+from __future__ import annotations
 
 import collections
 import glob
@@ -14,6 +17,7 @@ import os
 import queue
 import threading
 from collections.abc import Callable, Mapping, Sequence
+from pathlib import Path
 from typing import Any
 
 import joblib
@@ -22,9 +26,8 @@ import pandas as pd
 import pyarrow as pa
 import spectrum_utils.spectrum as sus
 
-from . import __version__
 from .cluster.spectrum import ProcessedSpectrum
-from .config import config
+from .config import FalconConfig
 from .ms_io import ms_io
 
 logger = logging.getLogger("falcon")
@@ -39,21 +42,60 @@ _LANCE_WRITE_BATCH_SIZE = 10_000
 _MAX_SPECTRA_IN_MEMORY = 1_000_000
 
 
+def resolve_input_files(patterns: Sequence[str]) -> list[Path]:
+    """
+    Expand input peak-file glob patterns in deterministic sorted order.
+
+    Matches within each pattern are sorted lexicographically so staging
+    order and cache provenance do not depend on filesystem iteration
+    order. Repeated matches across patterns are preserved.
+
+    Parameters
+    ----------
+    patterns : Sequence[str]
+        File paths or glob patterns from ``config.io.input_filenames``.
+
+    Returns
+    -------
+    list[Path]
+        Expanded peak file paths.
+
+    Raises
+    ------
+    FileNotFoundError
+        If no files match any supplied pattern.
+    """
+    resolved = [
+        Path(fn) for pattern in patterns for fn in sorted(glob.glob(pattern))
+    ]
+    if not resolved:
+        raise FileNotFoundError(
+            f"No input peak files matched: {list(patterns)}"
+        )
+    return resolved
+
+
 def _prepare_spectra(
+    input_filenames: Sequence[str | os.PathLike[str]],
+    work_dir: str | os.PathLike[str],
     process_spectrum: Callable[[sus.MsmsSpectrum], ProcessedSpectrum | None],
-    charge_buckets: list[BucketKey] | None,
+    charge_buckets: Sequence[BucketKey] | None,
 ) -> list[BucketKey]:
     """
     Read, preprocess, and stage spectra in per-charge Lance datasets.
 
     Parameters
     ----------
+    input_filenames : Sequence[str | os.PathLike[str]]
+        Resolved peak file paths to read.
+    work_dir : str | os.PathLike[str]
+        Working directory containing the ``spectra`` staging subfolder.
     process_spectrum : Callable
         Preprocessing function returning a ``ProcessedSpectrum`` or
         ``None`` if the spectrum fails quality gates.
-    charge_buckets : list[BucketKey] | None
-        Explicit charge groupings (sets of charges/``"unknown"`` or
-        ``"other"``), or ``None`` for auto mode (one bucket per
+    charge_buckets : Sequence[BucketKey] | None
+        Explicit charge groupings (tuples/sets of charges/``"unknown"``
+        or ``"other"``), or ``None`` for auto mode (one bucket per
         observed charge).
 
     Returns
@@ -62,18 +104,12 @@ def _prepare_spectra(
         Charge buckets for which a non-missing Lance dataset was
         created.
     """
-    input_filenames = [
-        fn for pattern in config.input_filenames for fn in glob.glob(pattern)
-    ]
-    if not input_filenames:
-        raise FileNotFoundError(
-            f"No input peak files matched: {config.input_filenames}"
-        )
-    logger.info(
-        "Reading spectra from %d peak file(s)...", len(input_filenames)
-    )
+    resolved_files = [os.fspath(fn) for fn in input_filenames]
+    if not resolved_files:
+        raise FileNotFoundError("No input peak files supplied")
+    logger.info("Reading spectra from %d peak file(s)...", len(resolved_files))
     # Use at most one worker per input file up to the CPU count.
-    max_file_workers = min(len(input_filenames), multiprocessing.cpu_count())
+    max_file_workers = min(len(resolved_files), multiprocessing.cpu_count())
     # Bound buffered spectra to avoid excessive staging memory usage.
     spectra_queue: queue.Queue[ProcessedSpectrum | None] = queue.Queue(
         maxsize=_MAX_SPECTRA_IN_MEMORY
@@ -115,6 +151,7 @@ def _prepare_spectra(
                 )
                 charge_to_bucket[charge] = bucket_tuple
 
+    work_dir_str = os.fspath(work_dir)
     lance_writers = multiprocessing.pool.ThreadPool(
         max_file_workers,
         _write_spectra_lance,
@@ -125,6 +162,7 @@ def _prepare_spectra(
             charge_to_bucket,
             catch_other_charges,
             auto_bucket,
+            work_dir_str,
         ),
     )
     # Stream processed file results into the queue as workers finish
@@ -134,7 +172,7 @@ def _prepare_spectra(
         n_jobs=max_file_workers, return_as="generator_unordered"
     )(
         joblib.delayed(_read_spectra)(file, process_spectrum)
-        for file in input_filenames
+        for file in resolved_files
     ):
         low_quality_counter += lqc
         for spec in file_spectra:
@@ -146,7 +184,7 @@ def _prepare_spectra(
     lance_writers.join()
 
     # Count surviving spectra across all created Lance datasets.
-    lance_dir = os.path.join(config.work_dir, "spectra")
+    lance_dir = os.path.join(work_dir_str, "spectra")
     # In auto mode, buckets are discovered from the written datasets.
     candidate_buckets: Sequence[BucketKey] = (
         _discover_auto_buckets(lance_dir)
@@ -168,14 +206,14 @@ def _prepare_spectra(
     logger.info(
         "Read %d spectra from %d peak file(s)",
         n_spectra,
-        len(input_filenames),
+        len(resolved_files),
     )
     logger.info("Skipped %d low-quality spectra", low_quality_counter)
     return valid_buckets
 
 
 def _discover_auto_buckets(
-    lance_dir: str,
+    lance_dir: str | os.PathLike[str],
 ) -> list[tuple[int | str, ...]]:
     """
     Discover per-charge buckets created in auto mode.
@@ -186,7 +224,7 @@ def _discover_auto_buckets(
 
     Parameters
     ----------
-    lance_dir : str
+    lance_dir : str | os.PathLike[str]
         Directory containing the per-charge Lance datasets.
 
     Returns
@@ -211,7 +249,7 @@ def _discover_auto_buckets(
 def _create_lance_dataset(
     charge_bucket: BucketKey,
     schema: pa.Schema,
-    work_dir: str | None = None,
+    work_dir: str | os.PathLike[str],
 ) -> lance.LanceDataset:
     """
     Create an empty Lance dataset for a charge bucket.
@@ -222,18 +260,16 @@ def _create_lance_dataset(
         Charge bucket key identifying the dataset path.
     schema : pa.Schema
         PyArrow schema of the Lance table.
-    work_dir : str | None, default=None
+    work_dir : str | os.PathLike[str]
         Working directory containing the ``spectra`` staging folder.
-        Defaults to ``config.work_dir`` when ``None``.
 
     Returns
     -------
     lance.LanceDataset
         The newly created empty Lance dataset.
     """
-    base_dir = config.work_dir if work_dir is None else work_dir
     lance_path = os.path.join(
-        base_dir,
+        os.fspath(work_dir),
         "spectra",
         f"spectra_charge{bucket_key_to_str(charge_bucket)}.lance",
     )
@@ -319,11 +355,12 @@ class _PerChargeLockRegistry:
 
 def _write_spectra_lance(
     spectra_queue: queue.Queue[ProcessedSpectrum | None],
-    lance_locks: "_PerChargeLockRegistry",
+    lance_locks: _PerChargeLockRegistry,
     schema: pa.Schema,
     charge_to_bucket: dict[int | str, tuple[int | str, ...]],
     catch_other_charges: bool,
     auto_bucket: bool,
+    work_dir: str | os.PathLike[str],
 ) -> None:
     """
     Consume preprocessed spectra from a queue and write Lance datasets.
@@ -345,7 +382,10 @@ def _write_spectra_lance(
         Whether every distinct charge gets its own singleton bucket.
         Takes precedence over ``charge_to_bucket`` and
         ``catch_other_charges``.
+    work_dir : str | os.PathLike[str]
+        Working directory containing the ``spectra`` staging folder.
     """
+    work_dir_str = os.fspath(work_dir)
     spec_to_write: dict[BucketKey, list[ProcessedSpectrum]] = (
         collections.defaultdict(list)
     )
@@ -361,7 +401,7 @@ def _write_spectra_lance(
                     bucket_key,
                     lance_locks.get(bucket_key),
                     schema,
-                    config.work_dir,
+                    work_dir_str,
                 )
                 spec_to_write[bucket_key].clear()
             return
@@ -386,7 +426,7 @@ def _write_spectra_lance(
                     bucket_key,
                     lance_locks.get(bucket_key),
                     schema,
-                    config.work_dir,
+                    work_dir_str,
                 )
                 spec_to_write[bucket_key].clear()
 
@@ -396,7 +436,7 @@ def _write_to_dataset(
     charge_bucket: BucketKey,
     lock: threading.Lock,
     schema: pa.Schema,
-    work_dir: str,
+    work_dir: str | os.PathLike[str],
 ) -> int:
     """
     Append a batch of preprocessed spectra to a Lance dataset.
@@ -411,7 +451,7 @@ def _write_to_dataset(
         Lock synchronizing dataset creation and appends for this bucket.
     schema : pa.Schema
         PyArrow schema of the Lance table.
-    work_dir : str
+    work_dir : str | os.PathLike[str]
         Working directory containing the ``spectra`` staging folder.
 
     Returns
@@ -421,12 +461,13 @@ def _write_to_dataset(
     """
     new_rows = pa.Table.from_pylist(spec_to_write, schema)
     bucket_str = bucket_key_to_str(charge_bucket)
+    work_dir_str = os.fspath(work_dir)
     path = os.path.join(
-        work_dir, "spectra", f"spectra_charge{bucket_str}.lance"
+        work_dir_str, "spectra", f"spectra_charge{bucket_str}.lance"
     )
     with lock:
         if not os.path.exists(path):
-            _create_lance_dataset(charge_bucket, schema, work_dir)
+            _create_lance_dataset(charge_bucket, schema, work_dir_str)
         lance.write_dataset(new_rows, path, mode="append")
     return len(new_rows)
 
@@ -468,7 +509,11 @@ def bucket_key_to_str(bucket_key: BucketKey) -> str:
         raise TypeError(f"Unsupported bucket key type: {type(bucket_key)}")
 
 
-def _write_cluster_info(clusters: pd.DataFrame) -> None:
+def _write_cluster_info(
+    clusters: pd.DataFrame,
+    config: FalconConfig,
+    work_dir: Path,
+) -> None:
     """
     Write configuration header comments and cluster assignments to CSV.
 
@@ -478,47 +523,16 @@ def _write_cluster_info(clusters: pd.DataFrame) -> None:
         Cluster assignment table with columns ``identifier``,
         ``precursor_charge``, ``precursor_mz``, ``retention_time``, and
         ``cluster``.
+    config : FalconConfig
+        Validated run configuration whose metadata is written as ``#``
+        header lines.
+    work_dir : Path
+        Effective working directory (including temporary directory when
+        ``config.io.work_dir`` is ``None``).
     """
-    with open(f"{config.output_filename}.csv", "a") as f_out:
-        # Metadata.
-        f_out.write(f"# falcon version {__version__}\n")
-        f_out.write(f"# work_dir = {config.work_dir}\n")
-        f_out.write(f"# overwrite = {config.overwrite}\n")
-        f_out.write(
-            f"# export_representatives = {config.export_representatives}\n"
-        )
-        f_out.write(
-            f"# precursor_tol = {config.precursor_tol[0]:.2f} "
-            f"{config.precursor_tol[1]}\n"
-        )
-        f_out.write(f"# rt_tol = {config.rt_tol}\n")
-        f_out.write(f"# fragment_tol = {config.fragment_tol:.2f}\n")
-        f_out.write(f"# linkage = {config.linkage}\n")
-        f_out.write(
-            f"# distance_threshold = {config.distance_threshold:.3f}\n"
-        )
-        f_out.write(f"# min_matched_peaks = {config.min_matched_peaks}\n")
-        f_out.write(f"# consensus_method = {config.consensus_method}\n")
-        f_out.write(
-            f"# outlier_cutoff_lower = {config.outlier_cutoff_lower:.2f}\n"
-        )
-        f_out.write(
-            f"# outlier_cutoff_upper = {config.outlier_cutoff_upper:.2f}\n"
-        )
-        f_out.write(f"# batch_size = {config.batch_size}\n")
-        f_out.write(
-            f"# precursor_charge_buckets = {config.precursor_charge_buckets}\n"
-        )
-        f_out.write(f"# min_peaks = {config.min_peaks}\n")
-        f_out.write(f"# min_mz_range = {config.min_mz_range:.2f}\n")
-        f_out.write(f"# min_mz = {config.min_mz:.2f}\n")
-        f_out.write(f"# max_mz = {config.max_mz:.2f}\n")
-        f_out.write(
-            f"# remove_precursor_tol = {config.remove_precursor_tol:.2f}\n"
-        )
-        f_out.write(f"# min_intensity = {config.min_intensity:.2f}\n")
-        f_out.write(f"# max_peaks_used = {config.max_peaks_used}\n")
-        f_out.write(f"# scaling = {config.scaling}\n")
+    csv_path = Path(f"{config.io.output_filename}.csv")
+    with csv_path.open("a", encoding="utf-8") as f_out:
+        for line in config.to_metadata_lines(work_dir=work_dir):
+            f_out.write(f"# {line}\n")
         f_out.write("#\n")
-        # Cluster assignments.
         clusters.to_csv(f_out, index=False, chunksize=1000000)
