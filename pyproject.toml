@@ -98,7 +98,7 @@ select = [
     "W",    # pycodestyle warnings
 ]
 ignore = [
-    "ANN401", # allow explicit Any at dynamic boundaries (e.g. Config, **kwargs)
+    "ANN401", # allow explicit Any at dynamic boundaries (e.g. Pydantic validators, **kwargs)
 ]
 
 [tool.ruff.lint.per-file-ignores]

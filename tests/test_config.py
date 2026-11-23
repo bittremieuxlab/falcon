@@ -838,3 +838,15 @@ class TestSerializationSchemaAndStaging:
             deserialize_cached_buckets([123])
         with pytest.raises(ValueError, match="bucket"):
             deserialize_cached_buckets([[True]])
+
+    def test_metabolomics_example_config_loads_cleanly(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        metab_path = repo_root / "configs" / "metabolomics.toml"
+        settings = load_settings(config_files=[metab_path])
+        assert settings.preprocessing.min_mz == 0.0
+        assert settings.preprocessing.max_mz == 1000.0
+        assert settings.preprocessing.min_mz_range == 150.0
+        assert settings.preprocessing.min_peaks == 5
+        assert settings.clustering.min_matched_peaks == 6
+        assert settings.clustering.fragment_tol == 0.05
+        assert settings.consensus == MedoidConsensusConfig()

@@ -1,0 +1,11 @@
+# Sparse configuration overlay for untargeted metabolomics MS/MS clustering.
+# Layer on top of Falcon's built-in defaults via:
+#   falcon peak/*.mzml results -c configs/metabolomics.toml
+
+[preprocessing]
+min_mz = 0.0
+max_mz = 1000.0
+min_mz_range = 150.0
+
+[clustering]
+min_matched_peaks = 6

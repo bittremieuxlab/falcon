@@ -41,91 +41,125 @@ For development setup, testing, and contribution guidelines, see
 Running _falcon_
 ----------------
 
-_falcon_ can be run from the command line, with settings specified as
-command-line arguments or set in an INI config file. _falcon_ takes peak files
-(in the mzML, mzXML, or MGF format) as input and exports the clustering result
-as a comma-separated file with each MS/MS spectrum and its cluster label on a
-single line. Representative spectra for each cluster can optionally be exported
-to an MGF file.
+_falcon_ can be run from the command line or programmatically from Python.
+Settings are configured hierarchically via built-in defaults, optional TOML configuration files (`-c`/`--config` and `extends`), and command-line flags.
+_falcon_ takes peak files (in the mzML, mzXML, or MGF format) as input and exports the clustering result as a comma-separated file with each MS/MS spectrum and its cluster label on a single line.
+Representative spectra for each cluster can optionally be exported to an MGF file.
 
-Example _falcon_ run with some relevant command-line arguments:
+Example _falcon_ run with command-line arguments:
 
-    falcon peak/*.mzml falcon --export_representatives --precursor_tol 20 ppm --fragment_tol 0.05 --distance_threshold 0.10
+```bash
+falcon peak/*.mzml falcon --export-representatives --precursor-tol 20 ppm --fragment-tol 0.05 --distance-threshold 0.10
+```
 
-This will cluster all MS/MS spectra in mzML files in the `peak` directory with
-the specified settings and write (i) the cluster assignments to the `falcon.csv` file, and (ii) the cluster representatives to the `falcon.mgf` file.
+This clusters all MS/MS spectra in mzML files in the `peak` directory with the specified settings and writes (i) the cluster assignments to `falcon.csv` and (ii) the cluster representatives to `falcon.mgf`.
+
+### Hierarchical TOML configuration
+
+Instead of hardcoding named profiles, _falcon_ layers sparse TOML override files on top of its standard defaults:
+
+1. **Built-in defaults** (bottom-up proteomics baseline).
+2. **Explicit TOML config file(s)** passed via repeatable `-c`/`--config` flags (left-to-right; no config file is auto-loaded from the current directory).
+   Any TOML file may also inherit from one or more parent files using a top-level `extends = "base.toml"` or `extends = ["base.toml", "instrument.toml"]` key (paths resolve relative to the declaring file).
+3. **CLI flags** (highest precedence; omitted flags never overwrite values from TOML files, and boolean flags support `--flag`/`--no-flag`).
+
+For example, [configs/metabolomics.toml](configs/metabolomics.toml) overrides only the fields that differ for untargeted metabolomics:
+
+```toml
+[preprocessing]
+min_mz = 0.0
+max_mz = 1000.0
+min_mz_range = 150.0
+
+[clustering]
+min_matched_peaks = 6
+```
+
+Run with an overlay and per-run CLI overrides:
+
+```bash
+falcon peak/*.mzml results -c configs/metabolomics.toml --distance-threshold 0.15 --save-config run_resolved.toml
+```
+
+Because TOML has no `null` literal, optional fields can be explicitly disabled/reset across layers using `"none"` (for `work_dir`, `rt_tol`, `remove_precursor_tol`, and `max_peaks_used`) or `"auto"` (for `precursor_charge_buckets`).
+
+Useful configuration inspection flags:
+
+- `falcon -c configs/metabolomics.toml --print-config`: print the fully resolved TOML configuration and exit.
+- `falcon ... --save-config resolved.toml`: save the exact resolved TOML before running (replay later via `falcon -c resolved.toml -o new_prefix`).
+- `falcon --dump-schema`: output the JSON Schema for TOML editor validation and autocomplete.
+- `falcon --version`: display the installed _falcon_ version.
+
+### Programmatic Python API
+
+```python
+import falcon
+
+cfg = falcon.load_config(
+    config_files=["configs/metabolomics.toml"],
+    overrides={
+        "io": {
+            "input_filenames": ["peak/*.mzml"],
+            "output_filename": "results",
+        },
+        "clustering": {"distance_threshold": 0.15},
+    },
+)
+falcon.run(cfg)
+```
 
 Important settings
 ------------------
 
-Here we provide information on the most important settings that influence the
-_falcon_ clustering performance. All settings have sensible default values
-which should give good results for a wide variety of datasets.
+Here we provide information on the most important settings that influence _falcon_ clustering performance.
+All settings have sensible default values (organized into `[io]`, `[preprocessing]`, `[clustering]`, and `[consensus]` TOML tables) and are strictly type- and range-validated before execution.
 
-For detailed information on all available settings, run `falcon -h` or
-`falcon --help`.
+For detailed information on all available CLI options, run `falcon -h` or `falcon --help`.
 
-**Spectrum comparison**
+**Spectrum comparison (`[clustering]`)**
 
-- `precursor_tol`: The precursor mass tolerance and unit (in ppm or Dalton) to
-compare spectra to each other. Default is 20 ppm.
-- `rt_tol`: Optional retention time tolerance (in seconds) to restrict
-clustering to spectra with similar retention times. Default is no retention
-time filtering.
-- `fragment_tol`: The fragment mass tolerance (in Dalton) used during spectrum
-comparison. Default is 0.05 Da.
+- `precursor_tol` (`--precursor-tol MASS MODE`): The precursor mass tolerance (`mass >= 0`) and unit (`"ppm"` or `"Da"`).
+  Default is `20 ppm`.
+- `rt_tol` (`--rt-tol`): Optional retention time tolerance (`>= 0`, or `"none"` to disable) to restrict clustering to spectra with similar retention times.
+  Default is disabled (`none`).
+- `fragment_tol` (`--fragment-tol`): The fragment mass tolerance in _m_/_z_ (`> 0`) used during spectrum comparison.
+  Default is `0.05`.
 
-**Clustering**
+**Clustering (`[clustering]`)**
 
-- `linkage`: The linkage criterion for hierarchical clustering. It should be one
-of `single`, `complete`, or `average`. Default is `complete`.
-- `distance_threshold`: The cosine distance threshold at which clusters are cut
-from the hierarchical tree. This parameter crucially governs cluster purity
-(i.e. clusters contain spectra corresponding to only a single peptide).
-Values between 0.05 and 0.15 typically yield pure clusters; values up to 0.30
-can be used for more aggressive merging. Default is 0.10.
-- `min_matched_peaks`: Minimum number of matched fragment peaks required to
-consider two spectra similar. Spectra pairs below this threshold are assigned
-a distance of 1.0. Default is 0; typically set to 6 for metabolomics data.
-- `batch_size`: Maximum number of spectra per precursor _m_/_z_ batch.
-Default is 32768.
-- `precursor_charge_buckets`: Charge state groupings that determine which
-spectra can be clustered together. Each bucket is a list of charges (e.g. `[1]`,
-`[2, 3]`); `unknown` matches spectra with a missing charge and `other` catches
-any charge not matched by a named bucket. By default this option is not set,
-in which case every distinct charge (including missing charges) is caught and
-clustered separately. To group charges instead, pass one bucket per argument,
-e.g. `[1]` `[2]` `[3]` `[4]` `[unknown]` `other`.
+- `linkage` (`--linkage`): The linkage criterion for hierarchical clustering (`single`, `complete`, or `average`).
+  Default is `complete`.
+- `distance_threshold` (`--distance-threshold`): The cosine distance threshold in `(0, 1)` at which clusters are cut from the hierarchical tree.
+  Values between `0.05` and `0.15` typically yield pure clusters; values up to `0.30` can be used for more aggressive merging.
+  Default is `0.10`.
+- `min_matched_peaks` (`--min-matched-peaks`): Minimum number of matched fragment peaks required to consider two spectra similar (`>= 0`, and `<= max_peaks_used` when peak capping is enabled).
+  Default is `0`; typically set to `6` for metabolomics data.
+- `batch_size` (`--batch-size`): Maximum number of spectra per precursor _m_/_z_ batch (`>= 1`).
+  Default is `32768`.
+- `precursor_charge_buckets` (`--precursor-charge-buckets`): Charge state groupings that determine which spectra can be clustered together.
+  In TOML, pass a list of buckets such as `[[1], [2, 3], ["unknown"], "other"]` (or `"auto"` to cluster every observed charge separately, the default).
+  On the CLI, pass one bucket per token such as `'[1]' '[2, 3]' unknown other` or `auto`.
 
-**Consensus spectrum**
+**Consensus spectrum (`[consensus]`)**
 
-- `consensus_method`: Method used to compute the representative spectrum for
-each cluster. Either `medoid` (the spectrum with the lowest average distance
-to all others in the cluster) or `average` (intensity-averaged spectrum with
-optional outlier rejection). Default is `medoid`.
-- `outlier_cutoff_lower` and `outlier_cutoff_upper`: Number of standard
-deviations below/above the median intensity used for outlier rejection when
-`consensus_method=average`. Default is 1.5 for both.
+- `method` (`--consensus-method`): Method used to compute the representative spectrum for each cluster: `medoid` (default) or `average` (intensity-averaged spectrum with iterative sigma clipping).
+- `outlier_cutoff_lower` and `outlier_cutoff_upper` (`--outlier-cutoff-lower`, `--outlier-cutoff-upper`): Positive standard-deviation cutoffs below/above the median intensity used for outlier rejection.
+  Valid only when `consensus.method = "average"`; default is `1.5` for both.
 
-**Spectrum preprocessing**
+**Spectrum preprocessing (`[preprocessing]`)**
 
-There are several options to configure spectrum preprocessing prior to the
-clustering. The default settings are intended for clustering bottom-up
-proteomics data. When analyzing metabolomics or top-down data, these settings
-likely need to be adjusted accordingly.
+The default preprocessing settings target bottom-up proteomics.
+For untargeted metabolomics or top-down data, layer a sparse TOML override file such as [configs/metabolomics.toml](configs/metabolomics.toml).
 
-- `min_peaks` and `min_mz_range`: Discard spectra with fewer than the specified
-number of peaks, or peaks spanning a smaller _m_/_z_ range between the minimum
-and maximum _m_/_z_ value. Default values are minimum 5 peaks and 250 _m_/_z_
-range. It is recommended to reduce these values when clustering metabolomics
-data.
-- `min_mz` and `max_mz`: The minimum and maximum peak _m_/_z_ value,
-respectively. Peaks outside these values will be discarded. Default values are
-101 _m_/_z_ and 1500 _m_/_z_, respectively.
-- `scaling`: Scale the peak intensities by their square root, logarithm, rank,
-or no scaling. Default is no scaling, with square root scaling often giving good
-results as well. Note that the scaling method can influence the cosine threshold
-`distance_threshold`.
+- `min_peaks` (`--min-peaks`) and `min_mz_range` (`--min-mz-range`): Discard spectra with fewer than `min_peaks` peaks (`>= 1`) or a smaller _m_/_z_ span than `min_mz_range` (`>= 0`, `<= max_mz - min_mz`).
+  Defaults are `5` peaks and `250.0` _m_/_z_.
+- `min_mz` (`--min-mz`) and `max_mz` (`--max-mz`): Minimum (`>= 0`) and maximum (`> min_mz`) peak _m_/_z_ values (inclusive).
+  Defaults are `101.0` and `1500.0` _m_/_z_.
+- `remove_precursor_tol` (`--remove-precursor-tol`): Window in Da (`> 0`, or `"none"` to disable) around the precursor _m_/_z_ within which peaks are removed.
+  Default is `1.5`.
+- `min_intensity` (`--min-intensity`) and `max_peaks_used` (`--max-peaks-used`): Relative base-peak intensity floor in `[0, 1)` (default `0.01`) and maximum strongest peaks retained (`>= min_peaks`, or `"none"` to retain all; default `50`).
+- `scaling` (`--scaling`): Scale peak intensities by `root`, `log`, `rank`, or `off` (default).
+  Note that the scaling method can influence the optimal `distance_threshold`.
 
 How does it work?
 -----------------
