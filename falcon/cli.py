@@ -609,6 +609,14 @@ def _expand_input_candidates(patterns: Sequence[str]) -> list[Path]:
     return candidates
 
 
+def _resolve_path(path: Path) -> Path:
+    """Resolve ``path`` strictly, falling back only if missing."""
+    try:
+        return path.resolve(strict=True)
+    except FileNotFoundError:
+        return path.resolve(strict=False)
+
+
 def _paths_alias(
     destination: Path,
     resolved_dest: Path,
@@ -617,7 +625,7 @@ def _paths_alias(
 ) -> bool:
     """Return True if ``destination`` aliases ``candidate``."""
     try:
-        if resolved_dest == candidate.resolve():
+        if resolved_dest == _resolve_path(candidate):
             return True
     except (OSError, RuntimeError):
         return False
@@ -651,7 +659,7 @@ def _validate_save_destination(
             f"{destination}"
         )
     try:
-        resolved_dest = destination.resolve()
+        resolved_dest = _resolve_path(destination)
     except (OSError, RuntimeError) as exc:
         raise ConfigError(
             f"Failed to resolve --save-config path {destination}: {exc}"

@@ -942,7 +942,10 @@ class TestSerializationSchemaAndStaging:
     def test_symlink_loop_raises_config_error(self, tmp_path):
         loop = tmp_path / "loop.toml"
         loop.symlink_to(loop)
-        with pytest.raises(ConfigError, match=r"loop\.toml"):
+        with pytest.raises(
+            ConfigError,
+            match=r"Failed to resolve configuration file.*loop\.toml",
+        ):
             load_toml_file(loop)
 
     def test_literal_dot_slash_none_work_dir_round_trips(self, tmp_path):

@@ -556,7 +556,10 @@ def load_toml_file(
         else ""
     )
     try:
-        resolved = path.resolve()
+        try:
+            resolved = path.resolve(strict=True)
+        except FileNotFoundError:
+            resolved = path.resolve(strict=False)
     except (OSError, RuntimeError) as exc:
         raise ConfigError(
             f"Failed to resolve configuration file {path}{origin}: {exc}"
