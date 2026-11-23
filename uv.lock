@@ -626,7 +626,7 @@ requires-dist = [
     { name = "pylance", specifier = ">=14.0.3" },
     { name = "pyteomics", extras = ["xml"], specifier = ">=4.4.0" },
     { name = "scipy", specifier = ">=1.5.3" },
-    { name = "spectrum-utils", specifier = "==0.3.5" },
+    { name = "spectrum-utils", specifier = "==0.5.0" },
 ]
 
 [package.metadata.requires-dev]
@@ -681,6 +681,29 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/ea/48/5d043913451576248ac026e9659f4fffb5356f7e2556e115fe3941f7fe03/fastcluster-1.3.0-cp313-cp313-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:5c71b7236288b9067d329359639789060e030285e8da2724fcdacd55ae751947", size = 184257, upload-time = "2025-05-06T17:45:26.722Z" },
     { url = "https://files.pythonhosted.org/packages/59/f3/f71552b94a39509b62e72c4a26b6e4440bb9ce6decacf90af2916829e69e/fastcluster-1.3.0-cp313-cp313-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:2dce31ace6f8e08c5400d6e19492fe09aba2b050f78a7aa6943ba2ae50dcd1b0", size = 193944, upload-time = "2025-05-06T17:45:27.866Z" },
     { url = "https://files.pythonhosted.org/packages/b1/64/78709a98a17f33feb960c6547c33e7e4838e49d4998b3a318f255757fe68/fastcluster-1.3.0-cp313-cp313-win_amd64.whl", hash = "sha256:e7c78f0e9e05c6f380d3d018ef5106d4526461abfd764fe7c0a7b53911b36c7d", size = 37354, upload-time = "2025-05-06T17:45:29.056Z" },
+]
+
+[[package]]
+name = "fastobo"
+version = "0.14.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/13/7f/2cb0f2c82de279ef6dfd2121ce7e93fcf59a0202b99b25ea432007dbb02d/fastobo-0.14.2.tar.gz", hash = "sha256:1696a10552fda7bc7fae2100396d0ff55f2cbe293109247d1053d062fb0badf7", size = 1738302, upload-time = "2026-10-21T21:51:28.726Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/06/c3/aabb534d7cb3020c82f910932a8b9ecbaea9981db8d1d89c78829a15d3c4/fastobo-0.14.2-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:f6356e9558c91b8cc97d9fca83003f78cbd4f04a7cc235ee66f6722e85ed20a6", size = 1942339, upload-time = "2026-10-21T21:50:55.24Z" },
+    { url = "https://files.pythonhosted.org/packages/80/6c/80dac0f08946609d3d9fe46aa95d3b426e8aa18926119e1e2bfe853a2101/fastobo-0.14.2-cp311-cp311-macosx_12_0_x86_64.whl", hash = "sha256:0d624f4ea10c904cca5fbe4a415a12b4d705e5cdfd18e31cc4f678f39587dd26", size = 2038486, upload-time = "2026-10-21T21:50:57.002Z" },
+    { url = "https://files.pythonhosted.org/packages/5d/ca/9908827aaf3f6ae7e3a8e9dc5704f12e79a9fd3b4bc5a5d8d2ea88396830/fastobo-0.14.2-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:6450a16378000d9750e030159d756ff92ec33365ba3436d070a92090f45f484f", size = 2077838, upload-time = "2026-10-21T21:50:58.64Z" },
+    { url = "https://files.pythonhosted.org/packages/db/4f/f6ef9538af1af1577b8048ae2b703b0ee066767a1702c6504702ef0ef7a9/fastobo-0.14.2-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:bd2bcff66f1b9ad0060785bd2d4ea19633235343c0f3ef9306a0561d955d0d87", size = 2150388, upload-time = "2026-10-21T21:51:00.656Z" },
+    { url = "https://files.pythonhosted.org/packages/28/05/755007471fb3390f0838192dcfa6a56e120af38081697f28f2a671cb97b7/fastobo-0.14.2-cp311-cp311-win_amd64.whl", hash = "sha256:d3bf8a4133712af5f7e2c7f335e966216d5efcc82db48bc363bd6f0c1cd2db36", size = 2171581, upload-time = "2026-10-21T21:51:02.172Z" },
+    { url = "https://files.pythonhosted.org/packages/44/71/26a251e1ad500831b7828d4063a16da9ea9efa12c4fb3f57839314b29c64/fastobo-0.14.2-cp312-abi3-macosx_11_0_arm64.whl", hash = "sha256:a881155a3fd2656df3c5a774364d9bc8c29ccc6a8d53471cf2770103b45cc3ed", size = 1941262, upload-time = "2026-10-21T21:51:03.729Z" },
+    { url = "https://files.pythonhosted.org/packages/36/a4/d6dc96557e53c45e8853cd86ddeaf9ae2907e6950cd876581e5a0d510c18/fastobo-0.14.2-cp312-abi3-macosx_12_0_x86_64.whl", hash = "sha256:ab1ccafbc0d51c5efd80ac9e852a2e25801ad509d44b977190ec0d305c6669d2", size = 2071779, upload-time = "2026-10-21T21:51:05.245Z" },
+    { url = "https://files.pythonhosted.org/packages/40/ed/27672f523af7cb1d563166e4158946ae45ba1c739afedfd78b36dbf99dcd/fastobo-0.14.2-cp312-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:f823e26e0bcd8c052b4f86409995f18833215b47ee8b38cac416ffa41e5e6053", size = 2072952, upload-time = "2026-10-21T21:51:06.874Z" },
+    { url = "https://files.pythonhosted.org/packages/f0/1e/e02fea18bc28aa481de50e6f1f306a319090caeec08a49e5b49751afec5d/fastobo-0.14.2-cp312-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:7ab6a52b96cbc8677b5e3b963f72e0c87e1e241b1950c75777ecdeb3d8491c21", size = 2144357, upload-time = "2026-10-21T21:51:08.992Z" },
+    { url = "https://files.pythonhosted.org/packages/c4/b2/8e643da91fc1fa9e9cc12e9ca526ca089973224077c98d636067459d2250/fastobo-0.14.2-cp312-abi3-win_amd64.whl", hash = "sha256:ec480f5fcb754bc5455d32bf27476073c0201667f5b438edfa9d873d4c57b9b9", size = 2176574, upload-time = "2026-10-21T21:51:10.594Z" },
+    { url = "https://files.pythonhosted.org/packages/a4/1d/e4d39459813891445696039883dde1d1f44ac11aed7030c00007baa4fb89/fastobo-0.14.2-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:0c05fb3ac400753ea25e3656d4f25894336eb8828bb30c1947fd9aa5cf192237", size = 1931206, upload-time = "2026-10-21T21:51:12.19Z" },
+    { url = "https://files.pythonhosted.org/packages/0d/15/5501097220bb41992c5bb16b595f1c4a52a34862bcd969bd8da42f2c7c02/fastobo-0.14.2-cp314-cp314t-macosx_12_0_x86_64.whl", hash = "sha256:296bd9aa9dbc73e5e1dd145b215806843f693d729bc0193c4062a43284910635", size = 2059863, upload-time = "2026-10-21T21:51:13.861Z" },
+    { url = "https://files.pythonhosted.org/packages/72/3c/3c4142e0f77a3c86a78f14ef10771833839f5082898a0b57cef9cac2d8ed/fastobo-0.14.2-cp314-cp314t-manylinux_2_28_aarch64.whl", hash = "sha256:5e85b5a6b6125002713af6c55792c7fbf468db5070fbbfd42458f12d877b5877", size = 2060629, upload-time = "2026-10-21T21:51:15.515Z" },
+    { url = "https://files.pythonhosted.org/packages/e4/24/f83130eb6e53e371426741bf89dc06982d4c877c1e24b736adcca3afeb4d/fastobo-0.14.2-cp314-cp314t-manylinux_2_28_x86_64.whl", hash = "sha256:102052f91dd1a2e789bada73a13c8045b417ad4fc0514f0073141051788a5142", size = 2131134, upload-time = "2026-10-21T21:51:17.139Z" },
+    { url = "https://files.pythonhosted.org/packages/c3/f3/4471d48648a9173da04d69061d501266fdf4ef25d9c1140f20a7c383caf8/fastobo-0.14.2-cp314-cp314t-win_amd64.whl", hash = "sha256:7521c8b84980e20b55543603183fc9fd27bcde5b400620d9aa504af190808572", size = 2154317, upload-time = "2026-10-21T21:51:18.747Z" },
 ]
 
 [[package]]
@@ -949,6 +972,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/69/25/9aaa4a5e8999693fb0f227c2c0c4b97bd8f0539066408cdff0b89d41b2d5/lance_namespace_urllib3_client-0.13.0.tar.gz", hash = "sha256:1e8a79c6e4e6277033597fd76aa0e2f33d909ca1436c935936e9e569221f43ef", size = 238348, upload-time = "2026-09-14T02:47:04.521Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/60/4c/7b8f0712a7fe1b8655b711342bc4989696635a79e7027ee56ba3cae23e99/lance_namespace_urllib3_client-0.13.0-py3-none-any.whl", hash = "sha256:fb361eb4f6c7f2d1f9e92809609657b73e38241393e9c4516e12d6b6ee643a0a", size = 406848, upload-time = "2026-09-14T02:47:02.715Z" },
+]
+
+[[package]]
+name = "lark"
+version = "1.3.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/da/34/28fff3ab31ccff1fd4f6c7c7b0ceb2b6968d8ea4950663eadcb5720591a0/lark-1.3.1.tar.gz", hash = "sha256:b426a7a6d6d53189d318f2b6236ab5d6429eaf09259f1ca33eb716eed10d2905", size = 382732, upload-time = "2025-10-27T18:25:56.653Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/82/3d/14ce75ef66813643812f3093ab17e46d3a206942ce7376d31ec2d36229e7/lark-1.3.1-py3-none-any.whl", hash = "sha256:c629b661023a014c37da873b4ff58a817398d12635d3bbb2c5a03be7fe5d1e12", size = 113151, upload-time = "2025-10-27T18:25:54.882Z" },
 ]
 
 [[package]]
@@ -2351,18 +2383,21 @@ wheels = [
 
 [[package]]
 name = "spectrum-utils"
-version = "0.3.5"
+version = "0.5.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
+    { name = "fastobo" },
+    { name = "lark" },
     { name = "matplotlib" },
     { name = "numba" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "platformdirs" },
     { name = "pyteomics" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/26/bd/3717d4041eec69f803bfa41ec24485adbba69f7b18ebb01fcf805ddb9efa/spectrum_utils-0.3.5.tar.gz", hash = "sha256:8f908207177dee1faec161942932a0d2bcdb39203b36331eeee3f91c2cd70682", size = 406615, upload-time = "2021-04-01T00:30:42.792Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/41/88/3d44b91e7f96e47e062d45751dc301d460b57afcdb5f6ebd42d78fae19e0/spectrum_utils-0.5.0.tar.gz", hash = "sha256:150455c8a771499f1e5e17f98be7115c6c9263ad3404e562e962d364d2ced951", size = 1870983, upload-time = "2025-11-27T19:27:03.358Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/a1/77/bafade91fd705152f359ffc9ebb0ebb2c67ced48cbc60a5e18fec92caf4f/spectrum_utils-0.3.5-py3-none-any.whl", hash = "sha256:928162eb031590002077c81770f164daf9ebc1e5992c891220414506ae6d8c3e", size = 24185, upload-time = "2021-04-01T00:30:41.443Z" },
+    { url = "https://files.pythonhosted.org/packages/8d/6e/91b355a12c4fa8cd8466ee96722f8dc88a215f7a0bc505c1113cff94de00/spectrum_utils-0.5.0-py3-none-any.whl", hash = "sha256:c935662a6568a552ecccc638daf1b4366e978fce17429527d89a1373cbb68b91", size = 51835, upload-time = "2025-11-27T19:27:01.993Z" },
 ]
 
 [[package]]
