@@ -18,6 +18,8 @@ from falcon.config import (
     PartialIOConfig,
     PrecursorTolerance,
     PreprocessingConfig,
+    sentinel_for_field,
+    validate_file_path,
 )
 
 
@@ -133,6 +135,28 @@ class TestConfigModels:
         assert isinstance(avg.consensus, AverageConsensusConfig)
         assert avg.consensus.outlier_cutoff_lower == 2.0
         assert avg.consensus.outlier_cutoff_upper == 3.0
+
+        # Empty consensus mapping defaults directly to MedoidConsensusConfig.
+        empty_settings = FalconSettings.model_validate({"consensus": {}})
+        assert empty_settings.consensus == MedoidConsensusConfig()
+        io_payload = {"input_filenames": ["a.mgf"], "output_filename": "out"}
+        empty_cfg = FalconConfig.model_validate(
+            {"io": io_payload, "consensus": {}}
+        )
+        assert empty_cfg.consensus == MedoidConsensusConfig()
+
+        # Omitted method with average-only keys still fails cleanly.
+        with pytest.raises(ValidationError):
+            FalconSettings.model_validate(
+                {"consensus": {"outlier_cutoff_lower": 2.0}}
+            )
+        with pytest.raises(ValidationError):
+            FalconConfig.model_validate(
+                {
+                    "io": io_payload,
+                    "consensus": {"outlier_cutoff_lower": 2.0},
+                }
+            )
 
         with pytest.raises(ValidationError):
             FalconSettings.model_validate(
@@ -258,6 +282,24 @@ class TestBoundsAndSentinels:
         with pytest.raises(ValidationError):
             model_cls.model_validate(kwargs)
 
+    @pytest.mark.parametrize(
+        ("model_cls", "field_name", "expected"),
+        [
+            (IOConfig, "work_dir", "none"),
+            (PartialIOConfig, "work_dir", "none"),
+            (PreprocessingConfig, "remove_precursor_tol", "none"),
+            (PreprocessingConfig, "max_peaks_used", "none"),
+            (ClusteringConfig, "rt_tol", "none"),
+            (ClusteringConfig, "precursor_charge_buckets", "auto"),
+            (IOConfig, "overwrite", None),
+            (ClusteringConfig, "fragment_tol", None),
+        ],
+    )
+    def test_sentinel_for_field(self, model_cls, field_name, expected):
+        assert sentinel_for_field(model_cls.model_fields[field_name]) == (
+            expected
+        )
+
 
 class TestIOConfig:
     def test_accepts_list_and_string_paths_preserving_dotted_prefix(self):
@@ -331,6 +373,39 @@ class TestIOConfig:
     def test_invalid_io_paths_rejected(self, payload):
         with pytest.raises(ValidationError):
             IOConfig.model_validate(payload)
+
+    def test_validate_file_path_preserves_label_on_errors(self):
+        assert validate_file_path(
+            "dir/run.toml", label="Config output path"
+        ) == (Path("dir/run.toml"))
+        assert validate_file_path(
+            Path("run.toml"), label="Config output path"
+        ) == Path("run.toml")
+
+        with pytest.raises(
+            ValueError, match="Config output path must not be empty"
+        ):
+            validate_file_path(Path("   "), label="Config output path")
+
+        with pytest.raises(
+            ValueError,
+            match=(
+                r"Expected a path string or Path for Config output path, "
+                r"got int"
+            ),
+        ):
+            validate_file_path(123, label="Config output path")
+
+        with pytest.raises(
+            ValueError, match="Config output path is a directory path"
+        ):
+            validate_file_path("some_dir/", label="Config output path")
+
+        with pytest.raises(
+            ValueError,
+            match="Config output path must include a non-empty file name",
+        ):
+            validate_file_path(Path("."), label="Config output path")
 
 
 class TestChargeBuckets:

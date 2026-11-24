@@ -25,6 +25,19 @@ def _attach_labels(dataset, labels):
     return dict(zip(meta["identifier"], np.asarray(labels), strict=True))
 
 
+def _spy_giant_allocations(monkeypatch) -> list[int]:
+    """Record how many giant intervals each clustering run allocates."""
+    seen: list[int] = []
+    real_alloc = engine.allocate_giant_tiles
+
+    def _spy(raw_giants, *args, **kwargs):
+        seen.append(len(raw_giants))
+        return real_alloc(raw_giants, *args, **kwargs)
+
+    monkeypatch.setattr(engine, "allocate_giant_tiles", _spy)
+    return seen
+
+
 class TestClusteringPipelineIntegration:
     def test_label_alignment_under_sort_key_ties_and_isolated_split(
         self, lance_dataset, spectrum_row, da_clustering_factory
@@ -140,14 +153,7 @@ class TestClusteringPipelineIntegration:
         monkeypatch.setattr(engine, "effective_n_workers", lambda: 4)
         assert len(scheduling.plan_tile_bounds(6, n_workers=4)) >= 2
 
-        seen_giants: list[int] = []
-        real_alloc = engine.allocate_giant_tiles
-
-        def _spy_alloc(raw_giants, *args, **kwargs):
-            seen_giants.append(len(raw_giants))
-            return real_alloc(raw_giants, *args, **kwargs)
-
-        monkeypatch.setattr(engine, "allocate_giant_tiles", _spy_alloc)
+        seen_giants = _spy_giant_allocations(monkeypatch)
 
         for consensus_cfg, memmap_dir in (
             (None, None),
@@ -275,14 +281,7 @@ class TestClusteringPipelineIntegration:
         ds = lance_dataset(rows)
         monkeypatch.setattr(scheduling, "MIN_PAIRS_PER_TILE", 3)
         monkeypatch.setattr(engine, "effective_n_workers", lambda: 2)
-        seen_giants: list[int] = []
-        real_alloc = engine.allocate_giant_tiles
-
-        def _spy_alloc(raw_giants, *args, **kwargs):
-            seen_giants.append(len(raw_giants))
-            return real_alloc(raw_giants, *args, **kwargs)
-
-        monkeypatch.setattr(engine, "allocate_giant_tiles", _spy_alloc)
+        seen_giants = _spy_giant_allocations(monkeypatch)
         res = generate_clusters(
             ds, da_clustering_factory(batch_size=4), MedoidConsensusConfig()
         )

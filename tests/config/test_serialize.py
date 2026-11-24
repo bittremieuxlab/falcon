@@ -24,6 +24,7 @@ from falcon.config import (
     load_settings,
     write_saved_config,
 )
+from falcon.config import serialize as config_serialize
 from falcon.config.serialize import _toml_literal
 
 
@@ -224,38 +225,63 @@ class TestFormatTomlAndMetadata:
         assert "io.work_dir = None" in lines
         assert "consensus.method = medoid" in lines
 
-    def test_format_metadata_lines_sanitizes_control_chars_in_work_dir(self):
-        lines = format_metadata_lines(
-            FalconSettings(), work_dir=Path("wd\ninjected\r\x00dir")
+    def test_format_metadata_lines_sanitizes_control_chars_in_work_dir(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(
+            config_serialize,
+            "__version__",
+            "1.0\ninjected\r\t\b\f\x00\x1b\x7f",
         )
+        lines = format_metadata_lines(
+            FalconSettings(),
+            work_dir=Path("wd\ninjected\r\t\b\f\x00\x1b\x7fdir"),
+        )
+        for line in lines:
+            assert all(ord(ch) >= 0x20 and ord(ch) != 0x7F for ch in line)
+
+        version_line = lines[0]
         work_dir_line = next(
             line for line in lines if line.startswith("io.work_dir = ")
         )
-        assert "\n" not in work_dir_line
-        assert "\r" not in work_dir_line
-        assert "\x00" not in work_dir_line
-        assert "\\n" in work_dir_line
-        assert "\\r" in work_dir_line
-        assert "\\x00" in work_dir_line
+        for target_line in (version_line, work_dir_line):
+            for escaped in (
+                "\\n",
+                "\\r",
+                "\\t",
+                "\\b",
+                "\\f",
+                "\\x00",
+                "\\x1b",
+                "\\x7f",
+            ):
+                assert escaped in target_line
 
 
 class TestJsonSchema:
-    def test_build_json_schema_is_json_serializable_with_extends_and_sentinels(
-        self,
-    ):
-        schema = build_json_schema()
+    @staticmethod
+    def _assert_core_schema_contracts(schema):
         serialized = json.dumps(schema)
         assert isinstance(serialized, str)
-        assert "extends" in schema["properties"]
-        assert "io" in schema["properties"]
-        assert "preprocessing" in schema["properties"]
-        assert "clustering" in schema["properties"]
-        assert "consensus" in schema["properties"]
+        for section in ("io", "preprocessing", "clustering", "consensus"):
+            assert section in schema["properties"]
         assert '"const": "none"' in serialized
         assert '"const": "auto"' in serialized
         # Empty [consensus] table requires anyOf rather than oneOf.
         assert "anyOf" in schema["properties"]["consensus"]
         assert "oneOf" not in schema["properties"]["consensus"]
+
+        # Every config field carries a non-empty description.
+        for def_name, def_schema in schema["$defs"].items():
+            for prop_name, prop_schema in def_schema["properties"].items():
+                desc = prop_schema.get("description")
+                assert isinstance(desc, str), (
+                    f"{def_name}.{prop_name} missing description"
+                )
+                assert desc.strip(), (
+                    f"{def_name}.{prop_name} has blank description"
+                )
+
         io_defs = schema["$defs"]["PartialIOConfig"]["properties"]
         in_array = next(
             b
@@ -264,6 +290,14 @@ class TestJsonSchema:
         )
         assert in_array["minItems"] == 1
         assert in_array["items"]["minLength"] == 1
+        for path_field in ("output_filename", "work_dir"):
+            path_branch = next(
+                b
+                for b in io_defs[path_field]["anyOf"]
+                if b.get("format") == "path"
+            )
+            assert path_branch["minLength"] == 1
+
         buckets_def = schema["$defs"]["ClusteringConfig"]["properties"][
             "precursor_charge_buckets"
         ]
@@ -282,6 +316,15 @@ class TestJsonSchema:
             if b.get("type") == "integer"
         )
         assert (int_elem["minimum"], int_elem["maximum"]) == (-128, 127)
+
+    def test_build_json_schema_and_native_model_schema_constraints(self):
+        native_schema = FalconSettings.model_json_schema()
+        self._assert_core_schema_contracts(native_schema)
+
+        schema = build_json_schema()
+        self._assert_core_schema_contracts(schema)
+        assert "extends" in schema["properties"]
+        assert schema["properties"]["extends"]["description"].strip()
 
 
 class TestWriteSavedConfig:
@@ -403,6 +446,24 @@ class TestWriteSavedConfig:
             with pytest.raises(ConfigError, match="aliases output file"):
                 write_saved_config(cfg, output_target)
             assert not output_target.exists()
+
+    def test_rejects_work_dir_alias(self, tmp_path, config_factory):
+        work_dir = tmp_path / "planned_work_dir"
+        cfg = config_factory(
+            input_filenames=(str(tmp_path / "in.mgf"),),
+            output_filename=tmp_path / "out",
+            io={"work_dir": str(work_dir)},
+        )
+        with pytest.raises(ConfigError, match="aliases working directory"):
+            write_saved_config(cfg, work_dir)
+        assert not work_dir.exists()
+
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        rel_alias = sub / ".." / "planned_work_dir"
+        with pytest.raises(ConfigError, match="aliases working directory"):
+            write_saved_config(cfg, rel_alias)
+        assert not work_dir.exists()
 
     def test_rejects_nonexistent_literal_dangling_symlink_and_symlink_loop(
         self, tmp_path, config_factory

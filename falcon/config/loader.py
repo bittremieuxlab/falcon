@@ -53,24 +53,21 @@ def _merge_config_dicts(
             continue
         val = override[key]
         if isinstance(existing, Mapping) and isinstance(val, Mapping):
+            base_section = existing
             if (
                 top_level
                 and key == "consensus"
                 and val.get("method") == "medoid"
                 and existing.get("method") in (None, "average")
             ):
-                cleaned = {
+                base_section = {
                     k: v
                     for k, v in existing.items()
                     if k not in _AVERAGE_ONLY_KEYS
                 }
-                merged[key] = _merge_config_dicts(
-                    cleaned, val, top_level=False
-                )
-            else:
-                merged[key] = _merge_config_dicts(
-                    existing, val, top_level=False
-                )
+            merged[key] = _merge_config_dicts(
+                base_section, val, top_level=False
+            )
         else:
             merged[key] = _copy_config_value(val)
     for key, val in override.items():
@@ -251,11 +248,6 @@ def _resolve_layers(
         merged = merge_config_dicts(merged, layer)
     if overrides is not None:
         merged = merge_config_dicts(merged, overrides)
-    # Apply default consensus method after merging so extends and
-    # repeatable -c handle partial [consensus] tables identically.
-    consensus = merged.get("consensus")
-    if isinstance(consensus, dict) and "method" not in consensus:
-        consensus["method"] = "medoid"
     return merged
 
 

@@ -12,10 +12,11 @@ import pyteomics.mzxml
 from . import reader_utils
 
 if TYPE_CHECKING:
-    import os
     from collections.abc import Iterator
 
     import spectrum_utils.spectrum as sus
+
+    from .reader_utils import SourceType
 
 logger = logging.getLogger(__name__)
 
@@ -32,15 +33,13 @@ def _extract_scan_nr(spectrum_dict: dict[str, Any]) -> str:
     return str(int(spectrum_dict["id"]))
 
 
-def get_spectra(
-    source: IO[Any] | str | os.PathLike[str],
-) -> Iterator[sus.MsmsSpectrum]:
+def get_spectra(source: SourceType) -> Iterator[sus.MsmsSpectrum]:
     """
     Read MS/MS spectra (MS level > 1) from an mzXML file or stream.
 
     Parameters
     ----------
-    source : IO[Any] | str | os.PathLike[str]
+    source : SourceType
         Path or open file object for the mzXML source.
 
     Returns
@@ -83,28 +82,20 @@ def _parse_spectrum(
     """
     mz_array = spectrum_dict["m/z array"]
     intensity_array = spectrum_dict["intensity array"]
-    raw_rt = spectrum_dict.get("retentionTime")
-    retention_time = (
-        float("nan")
-        if raw_rt is None or (isinstance(raw_rt, str) and not raw_rt.strip())
-        else raw_rt
+    retention_time = reader_utils.parse_optional_rt(
+        spectrum_dict.get("retentionTime")
     )
 
     precursor = spectrum_dict["precursorMz"][0]
     if isinstance(precursor, Mapping):
         precursor_mz = precursor["precursorMz"]
-        raw_charge = precursor.get("precursorCharge")
-        if raw_charge is None or (
-            isinstance(raw_charge, str) and not raw_charge.strip()
-        ):
-            precursor_charge = None
-        else:
-            precursor_charge = int(raw_charge)
+        precursor_charge = reader_utils.parse_optional_charge(
+            precursor.get("precursorCharge"),
+            negative=spectrum_dict.get("polarity") == "-",
+        )
     else:
         precursor_mz = precursor
         precursor_charge = None
-    if precursor_charge is not None and spectrum_dict.get("polarity") == "-":
-        precursor_charge = -abs(precursor_charge)
 
     return reader_utils.build_msms_spectrum(
         identifier,

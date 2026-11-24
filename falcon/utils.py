@@ -11,13 +11,26 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Iterable, Sequence
+
+    import joblib
+
+_PROC_CGROUP_PATH = "/proc/self/cgroup"
+_CGROUP_V2_ROOT = "/sys/fs/cgroup"
+_CGROUP_V1_MEMORY_ROOT = "/sys/fs/cgroup/memory"
+_CGROUP_MEMORY_PATHS: tuple[str, ...] = (
+    "/sys/fs/cgroup/memory.max",
+    "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+)
 
 __all__ = [
     "configure_logger",
+    "effective_memory_bytes",
     "effective_n_workers",
     "expand_input_globs",
+    "find_path_alias",
     "format_hms",
+    "loky_unordered_pool",
     "paths_alias",
     "resolve_path",
 ]
@@ -118,13 +131,65 @@ def paths_alias(
             return True
     except (OSError, RuntimeError, ValueError):
         return False
-    exists = target.exists() if target_exists is None else target_exists
-    if exists and candidate.exists():
+    if target_exists is False:
+        return False
+    try:
+        return os.path.samefile(target, candidate)
+    except (OSError, ValueError):
+        return False
+
+
+def find_path_alias(
+    target: Path,
+    candidates: Iterable[Path],
+    *,
+    resolved_target: Path | None = None,
+    strict: bool = False,
+) -> Path | None:
+    """
+    Return the first candidate in ``candidates`` aliasing ``target``.
+
+    Pre-resolves ``target`` and checks its existence once before
+    testing each candidate via :func:`paths_alias`.
+
+    Parameters
+    ----------
+    target : Path
+        Destination or output path to check.
+    candidates : Iterable[Path]
+        Existing or literal paths to test against ``target``.
+    resolved_target : Path | None, default=None
+        Optional pre-resolved canonical form of ``target``.
+    strict : bool, default=False
+        When ``True``, propagate resolution errors on ``target``
+        instead of returning ``None``.
+
+    Returns
+    -------
+    Path | None
+        First aliasing candidate path, or ``None`` if no candidate
+        aliases ``target``.
+    """
+    if resolved_target is None:
         try:
-            return os.path.samefile(target, candidate)
-        except (OSError, ValueError):
-            return False
-    return False
+            resolved_target = resolve_path(target)
+        except (OSError, RuntimeError, ValueError):
+            if strict:
+                raise
+            return None
+    try:
+        target_exists = target.exists()
+    except (OSError, ValueError):
+        target_exists = False
+    for candidate in candidates:
+        if paths_alias(
+            target,
+            candidate,
+            resolved_target=resolved_target,
+            target_exists=target_exists,
+        ):
+            return candidate
+    return None
 
 
 def expand_input_globs(
@@ -206,3 +271,127 @@ def effective_n_workers() -> int:
     import joblib
 
     return max(1, int(joblib.effective_n_jobs(-1)))
+
+
+def loky_unordered_pool(n_jobs: int) -> joblib.Parallel:
+    """
+    Create a ``loky`` parallel pool streaming unordered results.
+
+    Parameters
+    ----------
+    n_jobs : int
+        Requested worker count (clamped to at least 1).
+
+    Returns
+    -------
+    joblib.Parallel
+        Configured ``loky`` pool with
+        ``return_as="generator_unordered"``.
+    """
+    import joblib
+
+    return joblib.Parallel(
+        n_jobs=max(1, n_jobs),
+        backend="loky",
+        verbose=0,
+        return_as="generator_unordered",
+    )
+
+
+def _read_positive_int(path: Path) -> int | None:
+    """Read a positive decimal integer from ``path``, or ``None``."""
+    try:
+        raw = path.read_text(encoding="ascii").strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+    if raw.isdigit():
+        value = int(raw)
+        if value > 0:
+            return value
+    return None
+
+
+def _collect_limit(
+    candidate: Path, seen: set[Path], limits: list[int]
+) -> None:
+    """Read a positive cgroup limit from ``candidate`` once."""
+    if candidate not in seen:
+        seen.add(candidate)
+        limit = _read_positive_int(candidate)
+        if limit is not None:
+            limits.append(limit)
+
+
+def _walk_cgroup_limits(
+    root: Path,
+    rel_path: str,
+    filename: str,
+    seen: set[Path],
+    limits: list[int],
+) -> None:
+    """Collect finite limits from ``root / rel_path`` up to ``root``."""
+    parts = [p for p in rel_path.split("/") if p and p not in (".", "..")]
+    current = root.joinpath(*parts)
+    while True:
+        _collect_limit(current / filename, seen, limits)
+        if current == root:
+            break
+        current = current.parent
+
+
+def _cgroup_memory_limit() -> int | None:
+    """Return minimum finite Linux cgroup memory limit in bytes."""
+    limits: list[int] = []
+    seen: set[Path] = set()
+    try:
+        proc_text = Path(_PROC_CGROUP_PATH).read_text(
+            encoding="utf-8", errors="surrogateescape"
+        )
+    except (OSError, UnicodeError):
+        proc_text = ""
+    for line in proc_text.splitlines():
+        fields = line.split(":", 2)
+        if len(fields) != 3:
+            continue
+        hierarchy, controllers, rel_path = fields
+        if hierarchy == "0" and controllers == "":
+            _walk_cgroup_limits(
+                Path(_CGROUP_V2_ROOT), rel_path, "memory.max", seen, limits
+            )
+        elif "memory" in controllers.split(","):
+            _walk_cgroup_limits(
+                Path(_CGROUP_V1_MEMORY_ROOT),
+                rel_path,
+                "memory.limit_in_bytes",
+                seen,
+                limits,
+            )
+    for fallback in _CGROUP_MEMORY_PATHS:
+        _collect_limit(Path(fallback), seen, limits)
+    return min(limits) if limits else None
+
+
+def effective_memory_bytes() -> int | None:
+    """
+    Return effective available physical RAM in bytes, or ``None``.
+
+    Combines POSIX ``sysconf`` physical memory with any stricter Linux
+    cgroup v1/v2 memory limits along the current process hierarchy.
+
+    Returns
+    -------
+    int | None
+        Effective memory limit in bytes, or ``None`` if unavailable.
+    """
+    try:
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        phys_pages = os.sysconf("SC_PHYS_PAGES")
+    except (AttributeError, OSError, ValueError):
+        return None
+    if page_size <= 0 or phys_pages <= 0:
+        return None
+    total_ram = int(page_size) * int(phys_pages)
+    cgroup_limit = _cgroup_memory_limit()
+    if cgroup_limit is not None:
+        total_ram = min(total_ram, cgroup_limit)
+    return total_ram

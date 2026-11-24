@@ -14,10 +14,11 @@ import pyteomics.xml
 from . import reader_utils
 
 if TYPE_CHECKING:
-    import os
     from collections.abc import Iterator
 
     import spectrum_utils.spectrum as sus
+
+    from .reader_utils import SourceType
 
 logger = logging.getLogger(__name__)
 
@@ -58,15 +59,13 @@ def _extract_scan_nr(spectrum_dict: dict[str, Any]) -> str | None:
     return match.group(1) if match is not None else None
 
 
-def get_spectra(
-    source: IO[Any] | str | os.PathLike[str],
-) -> Iterator[sus.MsmsSpectrum]:
+def get_spectra(source: SourceType) -> Iterator[sus.MsmsSpectrum]:
     """
     Read MS/MS spectra (MS level > 1) from an mzML file or stream.
 
     Parameters
     ----------
-    source : IO[Any] | str | os.PathLike[str]
+    source : SourceType
         Path or open file object for the mzML source.
 
     Returns
@@ -101,19 +100,6 @@ def get_spectra(
     )
 
 
-def _parse_charge_value(raw_charge: Any) -> int | None:
-    """Extract the first integer charge from a scalar or sequence."""
-    if isinstance(raw_charge, (list, tuple)):
-        if not raw_charge:
-            return None
-        raw_charge = raw_charge[0]
-    if raw_charge is None or (
-        isinstance(raw_charge, str) and not raw_charge.strip()
-    ):
-        return None
-    return int(raw_charge)
-
-
 def _parse_spectrum(
     spectrum_dict: dict[str, Any], identifier: str
 ) -> sus.MsmsSpectrum:
@@ -141,24 +127,19 @@ def _parse_spectrum(
     intensity_array = spectrum_dict["intensity array"]
     scans = (spectrum_dict.get("scanList") or {}).get("scan")
     raw_rt = scans[0].get("scan start time") if scans else None
-    retention_time = (
-        float("nan")
-        if raw_rt is None or (isinstance(raw_rt, str) and not raw_rt.strip())
-        else raw_rt
-    )
+    retention_time = reader_utils.parse_optional_rt(raw_rt)
 
     precursor = spectrum_dict["precursorList"]["precursor"][0]
     precursor_ion = precursor["selectedIonList"]["selectedIon"][0]
     precursor_mz = precursor_ion["selected ion m/z"]
-    precursor_charge: int | None = None
-    if "charge state" in precursor_ion:
-        precursor_charge = _parse_charge_value(precursor_ion["charge state"])
-    if precursor_charge is None and "possible charge state" in precursor_ion:
-        precursor_charge = _parse_charge_value(
-            precursor_ion["possible charge state"]
+    negative = "negative scan" in spectrum_dict
+    precursor_charge = reader_utils.parse_optional_charge(
+        precursor_ion.get("charge state"), negative=negative
+    )
+    if precursor_charge is None:
+        precursor_charge = reader_utils.parse_optional_charge(
+            precursor_ion.get("possible charge state"), negative=negative
         )
-    if precursor_charge is not None and "negative scan" in spectrum_dict:
-        precursor_charge = -abs(precursor_charge)
 
     return reader_utils.build_msms_spectrum(
         identifier,

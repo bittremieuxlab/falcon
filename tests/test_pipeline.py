@@ -1,107 +1,163 @@
 """Unit tests for falcon.pipeline orchestration."""
 
 import logging
-from pathlib import Path
 
 import numpy as np
 import pytest
 
 from falcon import pipeline
-from falcon.config import (
-    AverageConsensusConfig,
-    MedoidConsensusConfig,
-)
 from falcon.types import ClusterResult
 
 
-class TestSetupWorkDir:
-    def test_creates_temp_dir_without_mutating_config(self, config_factory):
-        cfg = config_factory()
-        work_dir, rm_work_dir = pipeline._setup_work_dir(cfg.io.work_dir)
-        try:
-            assert rm_work_dir is True
-            assert cfg.io.work_dir is None
-            assert work_dir.is_dir()
-            assert (work_dir / "spectra").is_dir()
-        finally:
-            (work_dir / "spectra").rmdir()
-            work_dir.rmdir()
+class TestWorkDirLifecycleAndWarnings:
+    def test_creates_and_cleans_temp_dir_without_mutating_config(
+        self, tmp_path, monkeypatch, config_factory, track_mkdtemp
+    ):
+        observed = []
 
-    def test_explicit_work_dir_new_and_existing_warns(self, tmp_path, caplog):
+        def _spy_stage(_cfg, work_dir, _proc):
+            observed.append((work_dir, (work_dir / "spectra").is_dir()))
+            return []
+
+        monkeypatch.setattr(pipeline, "load_or_stage_buckets", _spy_stage)
+        cfg = config_factory(output_filename=tmp_path / "temp_out")
+
+        assert pipeline.run(cfg) == 0
+        assert cfg.io.work_dir is None
+        assert len(track_mkdtemp) == 1
+        assert observed == [(track_mkdtemp[0], True)]
+        assert not track_mkdtemp[0].exists()
+
+    def test_explicit_work_dir_new_and_existing_warns(
+        self, tmp_path, monkeypatch, caplog, config_factory
+    ):
+        monkeypatch.setattr(
+            pipeline, "load_or_stage_buckets", lambda *_a, **_kw: []
+        )
         wd = tmp_path / "work"
-        work_dir, rm_work_dir = pipeline._setup_work_dir(wd)
-        assert work_dir == wd
-        assert rm_work_dir is False
-        assert (wd / "spectra").is_dir()
 
+        # First run creates work_dir/spectra without warning.
+        cfg_new = config_factory(
+            output_filename=tmp_path / "out1",
+            io={"work_dir": str(wd)},
+        )
         with caplog.at_level(logging.WARNING, logger="falcon"):
-            work_dir2, rm2 = pipeline._setup_work_dir(wd)
-        assert work_dir2 == wd
-        assert rm2 is False
+            assert pipeline.run(cfg_new) == 0
+        assert (wd / "spectra").is_dir()
+        assert not any("already exists" in r.message for r in caplog.records)
+
+        # Second run with existing work_dir warns about cache reuse.
+        caplog.clear()
+        cfg_reuse = config_factory(
+            output_filename=tmp_path / "out2",
+            io={"work_dir": str(wd), "overwrite": False},
+        )
+        with caplog.at_level(logging.WARNING, logger="falcon"):
+            assert pipeline.run(cfg_reuse) == 0
         assert any(
             "already exists" in r.message and "reused" in r.message
             for r in caplog.records
         )
 
+        # Third run with overwrite=True warns about overwriting cache.
         caplog.clear()
+        cfg_overwrite = config_factory(
+            output_filename=tmp_path / "out2",
+            io={"work_dir": str(wd), "overwrite": True},
+        )
         with caplog.at_level(logging.WARNING, logger="falcon"):
-            work_dir3, rm3 = pipeline._setup_work_dir(wd, overwrite=True)
-        assert work_dir3 == wd
-        assert rm3 is False
+            assert pipeline.run(cfg_overwrite) == 0
         assert any(
             "already exists" in r.message and "overwritten" in r.message
             for r in caplog.records
         )
 
     def test_explicit_relative_work_dir_is_absolutized(
-        self, tmp_path, monkeypatch
+        self, tmp_path, monkeypatch, config_factory
     ):
+        observed = []
+
+        def _spy_stage(_cfg, work_dir, _proc):
+            observed.append(work_dir)
+            return []
+
         monkeypatch.chdir(tmp_path)
-        work_dir, rm_work_dir = pipeline._setup_work_dir(Path("rel_work"))
-        assert work_dir == tmp_path / "rel_work"
-        assert work_dir.is_absolute()
-        assert rm_work_dir is False
+        monkeypatch.setattr(pipeline, "load_or_stage_buckets", _spy_stage)
+        cfg = config_factory(
+            output_filename=tmp_path / "rel_out",
+            io={"work_dir": "rel_work"},
+        )
+        assert pipeline.run(cfg) == 0
+        assert observed == [tmp_path / "rel_work"]
+        assert observed[0].is_absolute()
         assert (tmp_path / "rel_work" / "spectra").is_dir()
 
     def test_cleans_up_temp_dir_if_spectra_subdir_creation_fails(
-        self, monkeypatch, track_mkdtemp
+        self, tmp_path, monkeypatch, config_factory, track_mkdtemp
     ):
         class _FailDir:
             def mkdir(self, **_kwargs):
                 raise OSError("disk full")
 
         monkeypatch.setattr(pipeline, "spectra_dir", lambda _p: _FailDir())
+        cfg = config_factory(output_filename=tmp_path / "fail_out")
         with pytest.raises(OSError, match="disk full"):
-            pipeline._setup_work_dir(None)
+            pipeline.run(cfg)
         assert len(track_mkdtemp) == 1
         assert not track_mkdtemp[0].exists()
 
-
-class TestWarnAggressiveOutlierCutoffs:
-    def test_warns_only_for_average_when_both_cutoffs_below_one(self, caplog):
-        cons = AverageConsensusConfig(
-            outlier_cutoff_lower=0.5, outlier_cutoff_upper=0.8
+    def test_warns_only_for_average_when_both_outlier_cutoffs_below_one(
+        self, tmp_path, monkeypatch, caplog, config_factory
+    ):
+        monkeypatch.setattr(
+            pipeline, "load_or_stage_buckets", lambda *_a, **_kw: []
+        )
+        cfg = config_factory(
+            output_filename=tmp_path / "aggressive",
+            consensus={
+                "method": "average",
+                "outlier_cutoff_lower": 0.5,
+                "outlier_cutoff_upper": 0.8,
+            },
         )
         with caplog.at_level(logging.WARNING, logger="falcon"):
-            pipeline._warn_aggressive_outlier_cutoffs(cons)
+            assert pipeline.run(cfg) == 0
         assert any("less than 1" in r.message for r in caplog.records)
 
     @pytest.mark.parametrize(
-        "cons",
+        "consensus_section",
         [
-            MedoidConsensusConfig(),
-            AverageConsensusConfig(
-                outlier_cutoff_lower=0.5, outlier_cutoff_upper=1.0
-            ),
-            AverageConsensusConfig(
-                outlier_cutoff_lower=1.0, outlier_cutoff_upper=0.5
-            ),
+            {"method": "medoid"},
+            {
+                "method": "average",
+                "outlier_cutoff_lower": 0.5,
+                "outlier_cutoff_upper": 1.0,
+            },
+            {
+                "method": "average",
+                "outlier_cutoff_lower": 1.0,
+                "outlier_cutoff_upper": 0.5,
+            },
         ],
     )
-    def test_no_warning_outside_aggressive_average_regime(self, caplog, cons):
+    def test_no_outlier_warning_outside_aggressive_average_regime(
+        self,
+        tmp_path,
+        monkeypatch,
+        caplog,
+        config_factory,
+        consensus_section,
+    ):
+        monkeypatch.setattr(
+            pipeline, "load_or_stage_buckets", lambda *_a, **_kw: []
+        )
+        cfg = config_factory(
+            output_filename=tmp_path / "no_warn",
+            consensus=consensus_section,
+        )
         with caplog.at_level(logging.WARNING, logger="falcon"):
-            pipeline._warn_aggressive_outlier_cutoffs(cons)
-        assert caplog.records == []
+            assert pipeline.run(cfg) == 0
+        assert not any("less than 1" in r.message for r in caplog.records)
 
 
 class TestRunClusteringAndPipeline:

@@ -31,6 +31,21 @@ class TestTileThreshold:
         with pytest.raises(ValueError, match="batch_size must be at least 1"):
             scheduling.tile_threshold(bad_batch_size)
 
+    @pytest.mark.parametrize("min_pairs", [1, 2, 3, 5, 6, 8, 6_000_000])
+    def test_effective_tile_threshold_exact_two_tile_boundary(
+        self, min_pairs, monkeypatch
+    ):
+        monkeypatch.setattr(scheduling, "MIN_PAIRS_PER_TILE", min_pairs)
+        thresh = scheduling.effective_tile_threshold(batch_size=2, n_workers=2)
+        assert len(scheduling.plan_tile_bounds(thresh, n_workers=2)) >= 2
+        assert len(scheduling.plan_tile_bounds(thresh - 1, n_workers=2)) == 1
+
+    def test_effective_tile_threshold_disables_tiling_for_single_worker(self):
+        assert scheduling.effective_tile_threshold(8, n_workers=1) == 9
+        assert scheduling.effective_tile_threshold(8, n_workers=0) == 9
+        # With default MIN_PAIRS_PER_TILE, small batch_size cannot split.
+        assert scheduling.effective_tile_threshold(8, n_workers=4) > 8
+
 
 class TestPrecursorMzSplits:
     def test_da_single_and_multiple_splits_with_exact_boundary(self):
@@ -64,37 +79,30 @@ class TestPrecursorMzSplits:
     def test_true_even_chunking_for_internal_and_trailing_oversized_blocks(
         self,
     ):
-        # Continuous block of 4 with batch_size=2 -> [0, 2, 4].
         mzs = np.array([100.0, 100.2, 100.4, 100.5])
         np.testing.assert_array_equal(
             scheduling.precursor_mz_splits(mzs, 0.5, "Da", batch_size=2),
             [0, 2, 4],
         )
 
-        # Internal contiguous block of 4 exceeds batch_size=3 -> evenly
-        # split into (2, 2) rather than greedy (3, 1).
         mzs2 = np.array([100.0, 101.0, 102.0, 103.0, 106.0, 107.0])
         np.testing.assert_array_equal(
             scheduling.precursor_mz_splits(mzs2, 1.0, "Da", batch_size=3),
             [0, 2, 4, 6],
         )
 
-        # Trailing contiguous block of 7 exceeds batch_size=5 -> evenly
-        # split into (4, 3) rather than greedy (5, 2).
         mzs_tail = np.array([100.0, 100.1, 100.2, 100.3, 100.4, 100.5, 100.6])
         np.testing.assert_array_equal(
             scheduling.precursor_mz_splits(mzs_tail, 0.5, "Da", batch_size=5),
             [0, 4, 7],
         )
 
-        # Gap coincides with block_size == batch_size (3).
         mzs3 = np.array([100.0, 100.1, 100.2, 200.0, 200.1])
         np.testing.assert_array_equal(
             scheduling.precursor_mz_splits(mzs3, 0.5, "Da", batch_size=3),
             [0, 3, 5],
         )
 
-        # batch_size=1 splits every element into a singleton interval.
         np.testing.assert_array_equal(
             scheduling.precursor_mz_splits(
                 np.array([100.0, 100.0, 100.0]), 0.5, "Da", batch_size=1
@@ -141,9 +149,6 @@ class TestPrecursorMzSplits:
                 )
 
     def test_ppm_float32_input_matches_float64_linkage_1d_boundary(self):
-        # Float32 gives 19.7346992 ppm while float64 gives 19.7347005;
-        # a midpoint tolerance verifies float64 precision matches
-        # refine.linkage_1d.
         mzs_f32 = np.array([300.0, 300.00592], dtype=np.float32)
         ppm_f32 = float(
             np.float32((mzs_f32[1] - mzs_f32[0]) / mzs_f32[0])
@@ -165,6 +170,58 @@ class TestPrecursorMzSplits:
             )
             == 2
         )
+
+    @pytest.mark.parametrize("mode", ["Da", "ppm"])
+    @pytest.mark.parametrize("batch_size", [1, 3, 7, 25])
+    def test_randomized_invariants_balance_and_gap_soundness(
+        self, mode, batch_size
+    ):
+        rng = np.random.default_rng(42)
+        tol = 0.5 if mode == "Da" else 50.0
+        for _ in range(10):
+            # Mix clustered regions, exact duplicates, and wide gaps.
+            centers = rng.uniform(150.0, 1200.0, size=6)
+            jitter_scale = 0.25 if mode == "Da" else 0.015
+            vals = np.concatenate(
+                [
+                    c + rng.uniform(0.0, jitter_scale, size=rng.integers(1, 9))
+                    for c in centers
+                ]
+            )
+            vals = np.sort(np.concatenate([vals, vals[:3]]))
+            n = len(vals)
+
+            splits = scheduling.precursor_mz_splits(
+                vals, tol, mode, batch_size
+            )
+            assert splits.dtype == np.int64
+            assert splits[0] == 0
+            assert splits[-1] == n
+            lengths = np.diff(splits)
+            assert np.all((lengths >= 1) & (lengths <= batch_size))
+
+            # Independent reference: contiguous natural blocks separated
+            # by gaps strictly exceeding tol.
+            diffs = (
+                np.diff(vals)
+                if mode == "Da"
+                else np.diff(vals) / vals[:-1] * 1e6
+            )
+            gap_indices = np.flatnonzero(diffs > tol) + 1
+            block_bounds = [0, *gap_indices.tolist(), n]
+
+            # Every natural gap must appear as a split boundary, and any
+            # sub-splits inside a block must be balanced within <= 1.
+            split_set = set(splits.tolist())
+            assert set(block_bounds).issubset(split_set)
+            for b_start, b_end in itertools.pairwise(block_bounds):
+                sub = splits[(splits >= b_start) & (splits <= b_end)]
+                sub_lens = np.diff(sub)
+                expected_chunks = (
+                    (b_end - b_start) + batch_size - 1
+                ) // batch_size
+                assert len(sub_lens) == expected_chunks
+                assert int(sub_lens.max() - sub_lens.min()) <= 1
 
 
 class TestIntervalRowBoundsAndTilePlanning:
@@ -259,15 +316,12 @@ class TestPrepareBucketChunks:
     def test_canonical_order_and_exact_giant_threshold_separation(
         self, lance_dataset, spectrum_row, da_clustering_factory
     ):
-        peaks = [100.0, 200.0, 300.0]
-        inten = [1.0, 0.8, 0.6]
-        # Insert out of canonical order so row_ids must remap cleanly.
         rows = [
-            spectrum_row("s:g2", 700.02, peaks, inten, 2, 12.0),
-            spectrum_row("s:n1", 500.00, peaks, inten, 2, 10.0),
-            spectrum_row("s:g0", 700.00, peaks, inten, 2, 10.0),
-            spectrum_row("s:n2", 500.01, peaks, inten, 2, 11.0),
-            spectrum_row("s:g1", 700.01, peaks, inten, 2, 11.0),
+            spectrum_row("s:g2", 700.02, retention_time=12.0),
+            spectrum_row("s:n1", 500.00, retention_time=10.0),
+            spectrum_row("s:g0", 700.00, retention_time=10.0),
+            spectrum_row("s:n2", 500.01, retention_time=11.0),
+            spectrum_row("s:g1", 700.01, retention_time=11.0),
         ]
         ds = lance_dataset(rows)
         plan = scheduling.prepare_bucket_chunks(
@@ -287,7 +341,6 @@ class TestPrepareBucketChunks:
         assert plan.giant_specs[0].n_spectra == 3
         assert isinstance(plan.giant_specs[0].row_ids, np.ndarray)
 
-        # Taking by row_ids must yield rows in canonical order.
         giant_ids = (
             ds.take(
                 indices=plan.giant_specs[0].row_ids.tolist(),
@@ -301,27 +354,17 @@ class TestPrepareBucketChunks:
     def test_giant_interval_does_not_skew_normal_chunk_lpt_balance(
         self, lance_dataset, spectrum_row, da_clustering_factory
     ):
-        peaks = [100.0, 200.0, 300.0]
-        inten = [1.0, 0.8, 0.6]
-        rows = []
-        # 1 giant interval (10 spectra, cost 100) at m/z ~100 Da.
-        for i in range(10):
-            rows.append(
-                spectrum_row(
-                    f"g:{i}", 100.0 + 0.01 * i, peaks, inten, 2, float(i)
-                )
-            )
-        # 4 normal intervals (4 spectra each, cost 16 each; sum 64 < 100).
+        rows = [
+            spectrum_row(f"g:{i}", 100.0 + 0.01 * i, retention_time=float(i))
+            for i in range(10)
+        ]
         for group_idx, base_mz in enumerate((200.0, 300.0, 400.0, 500.0)):
             for i in range(4):
                 rows.append(
                     spectrum_row(
                         f"n:{group_idx}:{i}",
                         base_mz + 0.01 * i,
-                        peaks,
-                        inten,
-                        2,
-                        float(i),
+                        retention_time=float(i),
                     )
                 )
         ds = lance_dataset(rows)
@@ -356,11 +399,9 @@ class TestPrepareBucketChunks:
         assert plan_empty.normal_chunks == []
         assert plan_empty.giant_specs == []
 
-        peaks = [100.0, 200.0, 300.0]
-        inten = [1.0, 0.8, 0.6]
         ds_giant = lance_dataset(
             [
-                spectrum_row(f"g:{i}", 500.0 + 0.01 * i, peaks, inten, 2, i)
+                spectrum_row(f"g:{i}", 500.0 + 0.01 * i, retention_time=i)
                 for i in range(4)
             ],
             name="giant.lance",

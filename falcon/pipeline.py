@@ -12,8 +12,7 @@ from typing import TYPE_CHECKING
 import lance
 
 from .cluster import generate_clusters_multi
-from .config.models import AverageConsensusConfig
-from .config.serialize import format_metadata_lines
+from .config import AverageConsensusConfig, format_metadata_lines
 from .dataset import bucket_dataset_path, format_bucket_label, spectra_dir
 from .export import export_results, prepare_outputs
 from .preprocessing import build_process_spectrum
@@ -22,7 +21,7 @@ from .staging import load_or_stage_buckets
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from .config.models import ConsensusConfig, FalconConfig
+    from .config import ConsensusConfig, FalconConfig
     from .types import ChargeBucket, ClusterResult
 
 logger = logging.getLogger(__name__)
@@ -190,10 +189,6 @@ def run(config: FalconConfig) -> int:
         bucket_datasets, cluster_results = _run_clustering(
             config, work_dir, charge_buckets
         )
-        if config.io.overwrite:
-            for out_path in (config.io.csv_path, config.io.mgf_path):
-                if out_path.is_file() or out_path.is_symlink():
-                    out_path.unlink()
         export_results(config, work_dir, bucket_datasets, cluster_results)
         return 0
     finally:

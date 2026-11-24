@@ -64,6 +64,96 @@ class TestNormalizeSource:
         assert reader_utils.normalize_source(stream) is stream
 
 
+class TestParseOptionalRt:
+    @pytest.mark.parametrize(
+        "raw_rt", [None, "", "   ", unitstr("", "second"), (), []]
+    )
+    def test_absent_blank_or_empty_returns_nan(self, raw_rt):
+        rt = reader_utils.parse_optional_rt(raw_rt)
+        assert type(rt) is float
+        assert math.isnan(rt)
+
+    @pytest.mark.parametrize(
+        ("raw_rt", "expected"),
+        [
+            (12.5, 12.5),
+            ("42.25", 42.25),
+            (0, 0.0),
+            (unitfloat(6.0, "second"), 6.0),
+            ((42.5,), 42.5),
+            ([10.0], 10.0),
+            ((100.0, 110.0), 105.0),
+            ([10.0, 20.0], 15.0),
+        ],
+    )
+    def test_parses_scalars_singletons_and_range_midpoints(
+        self, raw_rt, expected
+    ):
+        rt = reader_utils.parse_optional_rt(raw_rt)
+        assert type(rt) is float
+        assert rt == pytest.approx(expected)
+
+    @pytest.mark.parametrize(
+        "bad_range",
+        [
+            (float("inf"), float("-inf")),
+            (float("-inf"), 10.0),
+            (10.0, float("inf")),
+        ],
+    )
+    def test_infinite_range_endpoints_raise_value_error(self, bad_range):
+        with pytest.raises(
+            ValueError,
+            match="Retention time range endpoints must be finite or NaN",
+        ):
+            reader_utils.parse_optional_rt(bad_range)
+
+    def test_non_numeric_string_raises_value_error(self):
+        with pytest.raises(ValueError, match="could not convert"):
+            reader_utils.parse_optional_rt("not_a_number")
+
+
+class TestParseOptionalCharge:
+    @pytest.mark.parametrize(
+        "raw_charge",
+        [None, "", "   ", [], (), [None], [""], ["   "]],
+    )
+    @pytest.mark.parametrize("negative", [False, True])
+    def test_absent_blank_or_empty_returns_none(self, raw_charge, negative):
+        assert (
+            reader_utils.parse_optional_charge(raw_charge, negative=negative)
+            is None
+        )
+
+    @pytest.mark.parametrize(
+        ("raw_charge", "negative", "expected"),
+        [
+            (2, False, 2),
+            (-2, False, -2),
+            ("3", False, 3),
+            (0, False, 0),
+            ([2, 3], False, 2),
+            ((4, 5), False, 4),
+            (2, True, -2),
+            (-2, True, -2),
+            (0, True, 0),
+            ([3, 4], True, -3),
+        ],
+    )
+    def test_parses_scalars_sequences_and_negative_mode(
+        self, raw_charge, negative, expected
+    ):
+        assert (
+            reader_utils.parse_optional_charge(raw_charge, negative=negative)
+            == expected
+        )
+
+    @pytest.mark.parametrize("bad_charge", ["2-", "abc", ["2-"]])
+    def test_invalid_charge_string_raises_value_error(self, bad_charge):
+        with pytest.raises(ValueError, match="invalid literal"):
+            reader_utils.parse_optional_charge(bad_charge)
+
+
 class TestPathStem:
     def test_extracts_stem_from_pathlike_and_returns_none_otherwise(self):
         assert reader_utils.path_stem("/data/runs/exp.v1.mzML") == "exp.v1"
@@ -72,7 +162,21 @@ class TestPathStem:
         assert (
             reader_utils.path_stem(_BytesPath(b"/dir/bpath.mzml")) == "bpath"
         )
-        for empty_or_invalid in ("", "/", ".", b"/", b".", None, 3, object()):
+        for empty_or_invalid in (
+            "",
+            "   ",
+            "   .mgf",
+            "/",
+            ".",
+            "..",
+            b"/",
+            b".",
+            b"..",
+            b"   ",
+            None,
+            3,
+            object(),
+        ):
             assert reader_utils.path_stem(empty_or_invalid) is None
 
 
@@ -95,7 +199,10 @@ class TestBaseFilename:
             == "bpath"
         )
 
-    @pytest.mark.parametrize("empty_stem", ["", "/", ".", b"/", b"."])
+    @pytest.mark.parametrize(
+        "empty_stem",
+        ["", "   ", "   .mgf", "/", ".", "..", b"/", b".", b".."],
+    )
     def test_empty_or_root_stems_return_unknown(self, empty_stem):
         assert reader_utils.base_filename(empty_stem, None) == "unknown"
 

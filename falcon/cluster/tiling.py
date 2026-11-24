@@ -12,6 +12,7 @@ import pyarrow as pa
 
 from .distance import (
     close_memmap,
+    extract_arrow_csr,
     fill_condensed_rows_csr,
     open_shared_condensed,
 )
@@ -22,6 +23,7 @@ if TYPE_CHECKING:
 
     import lance
 
+    from ..types import PathLike
     from .scheduling import IntervalSpec
 
 _TILE_PEAK_COLUMNS: tuple[str, ...] = ("mz", "intensity")
@@ -63,7 +65,7 @@ class TileDone:
 class GiantMemmapStore:
     """Manage lifecycle and eager unlinking of giant memmap files."""
 
-    def __init__(self, temp_dir: os.PathLike[str] | str | None = None) -> None:
+    def __init__(self, temp_dir: PathLike | None = None) -> None:
         self._temp_dir = temp_dir
         self._paths: dict[int, str] = {}
 
@@ -118,48 +120,8 @@ class GiantMemmapStore:
         self.release_all()
 
 
-def _extract_list_csr(
-    column: pa.ChunkedArray, name: str
-) -> tuple[np.ndarray, np.ndarray]:
-    """Validate one PyArrow list column into ``(values, offsets)``."""
-    col = (
-        column.chunk(0) if column.num_chunks == 1 else column.combine_chunks()
-    )
-    if not isinstance(col, (pa.ListArray, pa.LargeListArray)):
-        raise TypeError(
-            "Expected PyArrow list arrays for 'mz' and 'intensity' "
-            f"columns, got {type(col).__name__} for {name!r}"
-        )
-    if col.null_count:
-        raise ValueError(f"Null lists are not allowed in {name!r} column")
-    offsets = col.offsets.to_numpy().astype(np.int64, copy=False)
-    start, stop = int(offsets[0]), int(offsets[-1])
-    if start != 0:
-        offsets = offsets - start
-    values = col.values.slice(start, stop - start)
-    if values.null_count:
-        raise ValueError(f"Null values are not allowed in {name!r} column")
-    flat = np.asarray(values.to_numpy(), dtype=np.float32)
-    return flat, offsets
-
-
-def _extract_arrow_csr(
-    table: pa.Table,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Extract float32 CSR peak buffers from a PyArrow table."""
-    mz_flat, mz_offsets = _extract_list_csr(table["mz"], "mz")
-    intensity_flat, int_offsets = _extract_list_csr(
-        table["intensity"], "intensity"
-    )
-    if not np.array_equal(mz_offsets, int_offsets):
-        raise ValueError(
-            "Mismatched PyArrow list offsets between 'mz' and 'intensity'"
-        )
-    return mz_flat, intensity_flat, mz_offsets
-
-
 def allocate_giant_tiles(
-    raw_giants: Sequence[tuple[int, lance.LanceDataset, IntervalSpec]],
+    giants: Sequence[tuple[lance.LanceDataset, IntervalSpec]],
     fragment_tol: float,
     min_matched_peaks: int,
     n_workers: int,
@@ -170,8 +132,8 @@ def allocate_giant_tiles(
 
     Parameters
     ----------
-    raw_giants : Sequence[tuple[int, lance.LanceDataset, IntervalSpec]]
-        Giant intervals as ``(bucket_id, dataset, spec)`` triples.
+    giants : Sequence[tuple[lance.LanceDataset, IntervalSpec]]
+        Giant intervals as ``(dataset, spec)`` pairs.
     fragment_tol : float
         Fragment m/z matching tolerance (in Da).
     min_matched_peaks : int
@@ -184,12 +146,12 @@ def allocate_giant_tiles(
     Returns
     -------
     tuple[list[str], list[TileTask]]
-        Backing memmap paths aligned with ``raw_giants`` and Pass 1
+        Backing memmap paths aligned with ``giants`` and Pass 1
         distance tile tasks.
     """
     memmap_paths: list[str] = []
     tile_tasks: list[TileTask] = []
-    for giant_idx, (_bucket_id, dataset, spec) in enumerate(raw_giants):
+    for giant_idx, (dataset, spec) in enumerate(giants):
         n = spec.n_spectra
         path = memmap_store.allocate(giant_idx, n)
         memmap_paths.append(path)
@@ -232,7 +194,7 @@ def tile_distance(task: TileTask) -> TileDone:
     table = task.dataset.take(
         indices=pa.array(task.row_ids), columns=list(_TILE_PEAK_COLUMNS)
     )
-    mz_flat, intensity_flat, offsets = _extract_arrow_csr(table)
+    mz_flat, intensity_flat, offsets = extract_arrow_csr(table)
     condensed = np.lib.format.open_memmap(task.memmap_path, mode="r+")
     try:
         fill_condensed_rows_csr(

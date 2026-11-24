@@ -10,10 +10,10 @@ import natsort
 import pandas as pd
 
 from . import ms_io
-from .config.serialize import format_metadata_lines
+from .config import format_metadata_lines
 from .dataset import METADATA_COLUMNS, read_canonical_metadata
 from .types import offset_cluster_result
-from .utils import expand_input_globs, paths_alias, resolve_path
+from .utils import expand_input_globs, find_path_alias
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -21,14 +21,19 @@ if TYPE_CHECKING:
 
     import lance
 
-    from .config.models import FalconConfig, IOConfig
+    from .config import FalconConfig, IOConfig
     from .types import ClusterResult, ConsensusTuple
 
 logger = logging.getLogger(__name__)
 
 _OUTPUT_COLUMNS = [*METADATA_COLUMNS, "cluster"]
 
-__all__ = ["export_results", "prepare_outputs", "write_cluster_csv"]
+__all__ = [
+    "export_results",
+    "prepare_outputs",
+    "remove_existing_outputs",
+    "write_cluster_csv",
+]
 
 
 def _check_input_output_aliasing(io_cfg: IOConfig) -> None:
@@ -37,22 +42,19 @@ def _check_input_output_aliasing(io_cfg: IOConfig) -> None:
         io_cfg.input_filenames, keep_unmatched_literals=True
     )
     for out_path in (io_cfg.csv_path, io_cfg.mgf_path):
-        try:
-            resolved_out = resolve_path(out_path)
-        except (OSError, RuntimeError, ValueError):
-            continue
-        out_exists = out_path.exists()
-        for candidate in input_candidates:
-            if paths_alias(
-                out_path,
-                candidate,
-                resolved_target=resolved_out,
-                target_exists=out_exists,
-            ):
-                raise ValueError(
-                    f"Output file {out_path} aliases input file "
-                    f"{candidate}; choose a distinct output prefix"
-                )
+        alias = find_path_alias(out_path, input_candidates)
+        if alias is not None:
+            raise ValueError(
+                f"Output file {out_path} aliases input file "
+                f"{alias}; choose a distinct output prefix"
+            )
+
+
+def remove_existing_outputs(io_cfg: IOConfig) -> None:
+    """Unlink any existing CSV or MGF output files or symlinks."""
+    for out_path in (io_cfg.csv_path, io_cfg.mgf_path):
+        if out_path.is_file() or out_path.is_symlink():
+            out_path.unlink()
 
 
 def prepare_outputs(io_cfg: IOConfig, *, unlink: bool = True) -> bool:
@@ -129,8 +131,8 @@ def prepare_outputs(io_cfg: IOConfig, *, unlink: bool = True) -> bool:
             path,
             description,
         )
-        if unlink:
-            path.unlink()
+    if unlink:
+        remove_existing_outputs(io_cfg)
     return True
 
 
@@ -227,6 +229,9 @@ def export_results(
         clusters_df = clusters_df.iloc[
             natsort.index_natsorted(clusters_df["identifier"])
         ]
+
+    if config.io.overwrite:
+        remove_existing_outputs(config.io)
 
     csv_path = config.io.csv_path
     logger.info(

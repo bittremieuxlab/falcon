@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import tempfile
@@ -16,17 +17,18 @@ from ..dataset import (
     is_bucket_dataset_name,
     spectra_dir,
 )
-from ..types import charge_sort_key, parse_charge_bucket_list
+from ..types import OTHER_BUCKET, charge_sort_key, parse_charge_bucket_list
 from ..utils import resolve_path
-from .ingest import resolve_input_files, stage_spectra
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
     import spectrum_utils.spectrum as sus
 
-    from ..config.models import FalconConfig
+    from ..config import FalconConfig
     from ..types import ChargeBucket, ChargeValue, ProcessedSpectrum
+
+logger = logging.getLogger(__name__)
 
 STAGING_CACHE_SCHEMA_VERSION = 1
 STAGING_CACHE_FILENAME = "staging_cache.json"
@@ -42,6 +44,21 @@ __all__ = [
     "load_or_stage_buckets",
     "serialize_cached_buckets",
 ]
+
+
+def _json_equal(left: Any, right: Any) -> bool:
+    """Compare decoded JSON values without ``bool == int/float``."""
+    if isinstance(left, bool) != isinstance(right, bool):
+        return False
+    if isinstance(left, Mapping) and isinstance(right, Mapping):
+        return left.keys() == right.keys() and all(
+            _json_equal(left[k], right[k]) for k in left
+        )
+    if isinstance(left, list) and isinstance(right, list):
+        return len(left) == len(right) and all(
+            _json_equal(x, y) for x, y in zip(left, right, strict=True)
+        )
+    return bool(left == right)
 
 
 def serialize_cached_buckets(
@@ -64,8 +81,8 @@ def serialize_cached_buckets(
         return None
     serialized: list[list[ChargeValue] | str] = []
     for bucket in buckets:
-        if bucket == "other":
-            serialized.append("other")
+        if bucket == OTHER_BUCKET:
+            serialized.append(OTHER_BUCKET)
         else:
             serialized.append(sorted(bucket, key=charge_sort_key))
     return serialized
@@ -171,9 +188,8 @@ def diff_staging_manifests(
     """
     if not isinstance(cached, Mapping):
         return ["schema_version"]
-    cached_version = cached.get("schema_version")
-    if isinstance(cached_version, bool) or cached_version != expected.get(
-        "schema_version"
+    if not _json_equal(
+        cached.get("schema_version"), expected.get("schema_version")
     ):
         return ["schema_version"]
 
@@ -185,7 +201,7 @@ def diff_staging_manifests(
             "fragment_tol",
             "precursor_charge_buckets",
         )
-        if key not in cached or cached[key] != expected[key]
+        if key not in cached or not _json_equal(cached[key], expected[key])
     ]
 
 
@@ -245,11 +261,11 @@ def _clear_directory(target_dir: Path) -> None:
 
 def _load_validated_cache(
     work_dir: Path,
+    target_dir: Path,
+    cache_path: Path,
     expected_manifest: Mapping[str, Any],
 ) -> list[ChargeBucket]:
     """Read and validate an existing ``staging_cache.json`` manifest."""
-    target_dir = spectra_dir(work_dir)
-    cache_path = target_dir / STAGING_CACHE_FILENAME
     try:
         cached = json.loads(cache_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -280,6 +296,11 @@ def _load_validated_cache(
             f"Invalid staging cache buckets in {cache_path}: staged datasets "
             "on disk do not match cached buckets"
         )
+    logger.info(
+        "Reusing validated staging cache in %s (%d bucket(s))",
+        work_dir,
+        len(cached_buckets),
+    )
     return cached_buckets
 
 
@@ -311,6 +332,8 @@ def load_or_stage_buckets(
     list[ChargeBucket]
         Charge bucket keys with staged Lance datasets.
     """
+    from .ingest import resolve_input_files, stage_spectra
+
     resolved_inputs = resolve_input_files(config.io.input_filenames)
     expected_manifest = build_staging_manifest(config, resolved_inputs)
     target_dir = spectra_dir(work_dir)
@@ -320,7 +343,9 @@ def load_or_stage_buckets(
     if config.io.overwrite:
         _clear_directory(target_dir)
     elif cache_path.exists() or cache_path.is_symlink():
-        return _load_validated_cache(work_dir, expected_manifest)
+        return _load_validated_cache(
+            work_dir, target_dir, cache_path, expected_manifest
+        )
     elif _has_unverified_staging_files(target_dir):
         raise _cache_error(
             f"Working directory {work_dir} contains an unverified or legacy "

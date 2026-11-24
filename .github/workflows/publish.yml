@@ -32,7 +32,9 @@ jobs:
           set -- dist/*.whl
           [ "$#" -eq 1 ]
           wheel="$1"
+          uv run --isolated --no-project --with "$wheel" falcon --help
           uv run --isolated --no-project --with "$wheel" falcon --version
+          uv run --isolated --no-project --with "$wheel" falcon --print-config > /dev/null
           uv run --isolated --no-project --with "$wheel" python -P -c \
             "from pathlib import Path; import falcon, falcon.pipeline, falcon.cluster, falcon.ms_io, falcon.staging; pkg = Path(falcon.__file__).resolve().parent; assert not pkg.is_relative_to(Path.cwd().resolve()), pkg; assert (pkg / 'py.typed').is_file(); assert falcon.__version__ != '0.0.0.dev0'"
 

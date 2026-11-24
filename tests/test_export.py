@@ -133,11 +133,32 @@ class TestPrepareOutputs:
         assert csv_file.read_text(encoding="utf-8") == "old csv"
         assert mgf_file.read_text(encoding="utf-8") == "old mgf"
 
-    def test_nul_byte_output_path_does_not_crash_aliasing_check(
-        self, config_factory
+    def test_nul_byte_output_path_does_not_crash_prepare_outputs(
+        self, tmp_path, config_factory
     ):
-        cfg = config_factory(output_filename="bad\x00out")
-        export._check_input_output_aliasing(cfg.io)
+        cfg = config_factory(output_filename=tmp_path / "bad\x00out")
+        assert export.prepare_outputs(cfg.io) is True
+
+    def test_remove_existing_outputs_unlinks_files_and_symlinks(
+        self, tmp_path, config_factory
+    ):
+        prefix = tmp_path / "run_v1.2"
+        csv_file = tmp_path / "run_v1.2.csv"
+        mgf_link = tmp_path / "run_v1.2.mgf"
+        unrelated = tmp_path / "keep.txt"
+        csv_file.write_text("old csv", encoding="utf-8")
+        mgf_link.symlink_to(tmp_path / "dangling_target")
+        unrelated.write_text("stay", encoding="utf-8")
+        cfg = config_factory(output_filename=prefix)
+
+        export.remove_existing_outputs(cfg.io)
+        assert not csv_file.exists()
+        assert not mgf_link.is_symlink()
+        assert unrelated.read_text(encoding="utf-8") == "stay"
+
+        # Calling again when neither output exists is a clean no-op.
+        export.remove_existing_outputs(cfg.io)
+        assert unrelated.read_text(encoding="utf-8") == "stay"
 
 
 class TestWriteClusterCsv:
@@ -220,19 +241,18 @@ class TestExportResults:
     ):
         ds1 = lance_dataset(
             [
-                spectrum_row(
-                    "run:scan:10", 500.0, [100.0, 200.0], [1.0, 1.0], 2, 10.0
-                ),
-                spectrum_row(
-                    "run:scan:2", 500.0, [100.0, 200.0], [1.0, 1.0], 2, 10.0
-                ),
+                spectrum_row("run:scan:10", 500.0, retention_time=10.0),
+                spectrum_row("run:scan:2", 500.0, retention_time=10.0),
             ],
             charge=2,
         )
         ds2 = lance_dataset(
             [
                 spectrum_row(
-                    "run:scan:1", 600.0, [150.0, 250.0], [1.0, 1.0], 3, 20.0
+                    "run:scan:1",
+                    600.0,
+                    precursor_charge=3,
+                    retention_time=20.0,
                 )
             ],
             charge=3,
@@ -288,7 +308,7 @@ class TestExportResults:
         self, tmp_path, lance_dataset, spectrum_row, config_factory
     ):
         ds = lance_dataset(
-            [spectrum_row("s:1", 500.0, [100.0, 200.0], [1.0, 1.0], 2, 10.0)],
+            [spectrum_row("s:1", 500.0, retention_time=10.0)],
             charge=2,
         )
         out_prefix = tmp_path / "csv_only"
@@ -323,7 +343,7 @@ class TestExportResults:
             concurrent.futures, "ThreadPoolExecutor", _forbid_pool
         )
         rows = (
-            [spectrum_row("s:1", 500.0, [100.0, 200.0], [1.0, 1.0], 2, 10.0)]
+            [spectrum_row("s:1", 500.0, retention_time=10.0)]
             if with_row
             else []
         )
@@ -350,11 +370,9 @@ class TestExportResults:
     ):
         ds_known = lance_dataset(
             [
+                spectrum_row("s:1", 500.0, retention_time=10.0),
                 spectrum_row(
-                    "s:1", 500.0, [100.0, 200.0], [1.0, 1.0], 2, 10.0
-                ),
-                spectrum_row(
-                    "s:2", 501.0, [100.0, 200.0], [1.0, 1.0], -2, np.nan
+                    "s:2", 501.0, precursor_charge=-2, retention_time=np.nan
                 ),
             ],
             charge=2,
@@ -362,7 +380,7 @@ class TestExportResults:
         ds_unknown = lance_dataset(
             [
                 spectrum_row(
-                    "s:3", 600.0, [100.0, 200.0], [1.0, 1.0], None, 20.0
+                    "s:3", 600.0, precursor_charge=None, retention_time=20.0
                 ),
             ],
             charge="unknown",
@@ -410,7 +428,7 @@ class TestExportResults:
         config_factory,
     ):
         ds = lance_dataset(
-            [spectrum_row("s:1", 500.0, [100.0, 200.0], [1.0, 1.0], 2, 10.0)],
+            [spectrum_row("s:1", 500.0, retention_time=10.0)],
             charge=2,
         )
         bad_prefix = tmp_path / "nonexistent_dir" / "out"
@@ -436,7 +454,7 @@ class TestExportResults:
         monkeypatch,
     ):
         ds = lance_dataset(
-            [spectrum_row("s:1", 500.0, [100.0, 200.0], [1.0, 1.0], 2, 10.0)],
+            [spectrum_row("s:1", 500.0, retention_time=10.0)],
             charge=2,
         )
         rep = consensus_factory(cluster_id=0)
@@ -463,12 +481,8 @@ class TestExportResults:
     ):
         ds = lance_dataset(
             [
-                spectrum_row(
-                    "s:1", 500.0, [100.0, 200.0], [1.0, 1.0], 2, 10.0
-                ),
-                spectrum_row(
-                    "s:2", 501.0, [100.0, 200.0], [1.0, 1.0], 2, 11.0
-                ),
+                spectrum_row("s:1", 500.0, retention_time=10.0),
+                spectrum_row("s:2", 501.0, retention_time=11.0),
             ],
             charge=2,
         )
@@ -480,3 +494,72 @@ class TestExportResults:
                 [ds],
                 [ClusterResult(np.array(bad_labels, dtype=np.int32), [])],
             )
+
+    def test_overwrite_preserves_existing_outputs_on_validation_failure(
+        self, tmp_path, lance_dataset, spectrum_row, config_factory
+    ):
+        ds = lance_dataset(
+            [
+                spectrum_row("s:1", 500.0, retention_time=10.0),
+                spectrum_row("s:2", 501.0, retention_time=11.0),
+            ],
+            charge=2,
+        )
+        prefix = tmp_path / "protected"
+        csv_file = tmp_path / "protected.csv"
+        mgf_file = tmp_path / "protected.mgf"
+        csv_file.write_text("precious csv", encoding="utf-8")
+        mgf_file.write_text("precious mgf", encoding="utf-8")
+        cfg = config_factory(output_filename=prefix, io={"overwrite": True})
+
+        with pytest.raises(ValueError, match="does not match"):
+            export.export_results(
+                cfg,
+                tmp_path,
+                [ds],
+                [ClusterResult(np.array([0], dtype=np.int32), [])],
+            )
+        assert csv_file.read_text(encoding="utf-8") == "precious csv"
+        assert mgf_file.read_text(encoding="utf-8") == "precious mgf"
+
+    def test_overwrite_removes_stale_mgf_when_representatives_disabled(
+        self, tmp_path, lance_dataset, spectrum_row, config_factory
+    ):
+        ds = lance_dataset(
+            [spectrum_row("s:1", 500.0, retention_time=10.0)],
+            charge=2,
+        )
+        prefix = tmp_path / "stale_mgf_run"
+        csv_file = tmp_path / "stale_mgf_run.csv"
+        mgf_file = tmp_path / "stale_mgf_run.mgf"
+        csv_file.write_text("old csv", encoding="utf-8")
+        mgf_file.write_text("stale mgf", encoding="utf-8")
+        cfg = config_factory(
+            output_filename=prefix,
+            io={"overwrite": True, "export_representatives": False},
+        )
+
+        export.export_results(
+            cfg,
+            tmp_path,
+            [ds],
+            [ClusterResult(np.array([0], dtype=np.int32), [])],
+        )
+        df = pd.read_csv(csv_file, comment="#")
+        assert list(df["identifier"]) == ["s:1"]
+        assert not mgf_file.exists()
+
+    def test_rejects_mismatched_dataset_and_result_sequence_lengths(
+        self, tmp_path, lance_dataset, spectrum_row, config_factory
+    ):
+        ds = lance_dataset(
+            [spectrum_row("s:1", 500.0, retention_time=10.0)],
+            charge=2,
+        )
+        cfg = config_factory(output_filename=tmp_path / "len_mismatch")
+        res = ClusterResult(np.array([0], dtype=np.int32), [])
+
+        with pytest.raises(ValueError, match="argument 2 is shorter"):
+            export.export_results(cfg, tmp_path, [ds], [])
+        with pytest.raises(ValueError, match="argument 2 is longer"):
+            export.export_results(cfg, tmp_path, [], [res])

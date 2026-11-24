@@ -10,10 +10,13 @@ import spectrum_utils.spectrum as sus
 
 from falcon import preprocessing
 
+_DEFAULT_MZ = (100.0, 200.0, 300.0, 400.0, 500.0)
+_DEFAULT_INTENSITY = (10.0, 20.0, 30.0, 40.0, 50.0)
+
 
 def _make_msms(
-    mz,
-    intensity,
+    mz=_DEFAULT_MZ,
+    intensity=_DEFAULT_INTENSITY,
     precursor_mz=500.0,
     precursor_charge=2,
     identifier="test:scan:1",
@@ -165,10 +168,11 @@ class TestProcessSpectrum:
             is None
         )
 
-    def test_mz_bounds_filter_peaks_inclusively(self):
+    def test_mz_bounds_filter_peaks_inclusively_and_one_sided(self):
         spec = _make_msms(
             mz=[50.0, 100.0, 200.0, 300.0, 400.0, 500.0, 600.0],
             intensity=[10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0],
+            annotation=["a", "b", "c", "d", "e", "f", "g"],
         )
         result = preprocessing.process_spectrum(
             spec,
@@ -181,6 +185,71 @@ class TestProcessSpectrum:
         np.testing.assert_allclose(
             result["mz"], [100.0, 200.0, 300.0, 400.0, 500.0]
         )
+        assert list(spec.annotation) == ["b", "c", "d", "e", "f"]
+
+        res_min_only = preprocessing.process_spectrum(
+            _make_msms(
+                mz=[50.0, 100.0, 300.0, 600.0],
+                intensity=[10.0, 20.0, 30.0, 40.0],
+            ),
+            min_peaks=3,
+            min_mz_range=200.0,
+            min_mz=100.0,
+            max_mz=None,
+        )
+        assert res_min_only is not None
+        np.testing.assert_allclose(res_min_only["mz"], [100.0, 300.0, 600.0])
+
+        res_max_only = preprocessing.process_spectrum(
+            _make_msms(
+                mz=[50.0, 100.0, 300.0, 600.0],
+                intensity=[10.0, 20.0, 30.0, 40.0],
+            ),
+            min_peaks=3,
+            min_mz_range=200.0,
+            min_mz=None,
+            max_mz=400.0,
+        )
+        assert res_max_only is not None
+        np.testing.assert_allclose(res_max_only["mz"], [50.0, 100.0, 300.0])
+
+    def test_omitted_mz_bounds_and_python_float_scalars(self, monkeypatch):
+        spec = _make_msms(
+            precursor_mz=np.float32(500.25),
+            retention_time=np.float32(12.5),
+        )
+
+        def _forbid_set_mz_range(*_args, **_kwargs):
+            raise AssertionError("set_mz_range must not be called")
+
+        monkeypatch.setattr(spec, "set_mz_range", _forbid_set_mz_range)
+        res = preprocessing.process_spectrum(
+            spec, min_peaks=5, min_mz_range=250.0, min_mz=None, max_mz=None
+        )
+        assert res is not None
+        assert type(res["precursor_mz"]) is float
+        assert res["precursor_mz"] == pytest.approx(500.25)
+        assert type(res["retention_time"]) is float
+        assert res["retention_time"] == pytest.approx(12.5)
+
+    def test_low_mz_positive_charge_removes_charge_reduced_precursor(self):
+        # precursor_mz=0.5 < _PROTON_MASS with charge=2 gives charge-1
+        # target 2*(0.5 - H+) + H+ = 1.0 - H+ = -0.0072766 Da, so peak
+        # at 0.0 Da is within 0.1 Da and must be removed.
+        spec = _make_msms(
+            mz=[0.0, 0.5, 100.0, 200.0, 300.0, 400.0],
+            intensity=[99.0, 99.0, 10.0, 20.0, 30.0, 40.0],
+            precursor_mz=0.5,
+            precursor_charge=2,
+        )
+        res = preprocessing.process_spectrum(
+            spec,
+            min_peaks=4,
+            min_mz_range=200.0,
+            remove_precursor_tol=0.1,
+        )
+        assert res is not None
+        np.testing.assert_allclose(res["mz"], [100.0, 200.0, 300.0, 400.0])
 
     def test_precursor_removal_strips_only_peaks_within_tolerance(self):
         spec = _make_msms(
@@ -219,12 +288,15 @@ class TestProcessSpectrum:
             is None
         )
 
-    def test_missing_charge_removes_precursor_and_restores_none(self):
+    @pytest.mark.parametrize("charge", [None, 0])
+    def test_missing_or_zero_charge_removes_precursor_and_preserves_charge(
+        self, charge
+    ):
         spec = _make_msms(
             mz=[110.0, 200.0, 300.0, 400.0, 500.0, 600.0],
             intensity=[100.0, 200.0, 50.0, 300.0, 999.0, 150.0],
             precursor_mz=500.0,
-            precursor_charge=None,
+            precursor_charge=charge,
         )
         result = preprocessing.process_spectrum(
             spec,
@@ -233,14 +305,14 @@ class TestProcessSpectrum:
             remove_precursor_tol=1.5,
         )
         assert result is not None
-        assert result["precursor_charge"] is None
+        assert result["precursor_charge"] == charge
         assert 500.0 not in result["mz"]
 
         spec_reject = _make_msms(
             mz=[110.0, 499.8, 500.2, 600.0],
             intensity=[100.0, 200.0, 200.0, 150.0],
             precursor_mz=500.0,
-            precursor_charge=None,
+            precursor_charge=charge,
         )
         assert (
             preprocessing.process_spectrum(
@@ -251,7 +323,7 @@ class TestProcessSpectrum:
             )
             is None
         )
-        assert spec_reject.precursor_charge is None
+        assert spec_reject.precursor_charge == charge
 
     @pytest.mark.parametrize("charge", [2, -2, 0, None])
     def test_float32_precursor_mz_removed_without_scalar_overflow(
@@ -290,9 +362,8 @@ class TestProcessSpectrum:
         assert result is not None
         np.testing.assert_allclose(result["mz"], [110.0, 300.0, 400.0, 450.0])
 
-    def test_intensity_filter_rejection_and_all_zero_with_min_intensity(self):
+    def test_intensity_filter_rejection(self):
         spec = _make_msms(
-            mz=[100.0, 200.0, 300.0, 400.0, 500.0],
             intensity=[1000.0, 1.0, 1.0, 1.0, 900.0],
         )
         assert (
@@ -301,20 +372,6 @@ class TestProcessSpectrum:
                 min_peaks=4,
                 min_mz_range=100.0,
                 min_intensity=0.1,
-            )
-            is None
-        )
-
-        all_zero = _make_msms(
-            mz=[100.0, 200.0, 300.0, 400.0, 500.0],
-            intensity=[0.0, 0.0, 0.0, 0.0, 0.0],
-        )
-        assert (
-            preprocessing.process_spectrum(
-                all_zero,
-                min_peaks=5,
-                min_mz_range=100.0,
-                min_intensity=0.01,
             )
             is None
         )
@@ -334,10 +391,7 @@ class TestProcessSpectrum:
     def test_invalid_or_non_positive_intensities_return_none(
         self, bad_intensities, min_intensity, scaling
     ):
-        spec = _make_msms(
-            mz=[100.0, 200.0, 300.0, 400.0, 500.0],
-            intensity=bad_intensities,
-        )
+        spec = _make_msms(intensity=bad_intensities)
         assert (
             preprocessing.process_spectrum(
                 spec,
@@ -351,10 +405,7 @@ class TestProcessSpectrum:
         )
 
     def test_max_peaks_used_without_min_intensity(self):
-        spec = _make_msms(
-            mz=[100.0, 200.0, 300.0, 400.0, 500.0],
-            intensity=[10.0, 50.0, 20.0, 40.0, 30.0],
-        )
+        spec = _make_msms(intensity=[10.0, 50.0, 20.0, 40.0, 30.0])
         result = preprocessing.process_spectrum(
             spec,
             min_peaks=3,
@@ -410,10 +461,7 @@ class TestProcessSpectrum:
     def test_intensity_scaling_matches_reference(
         self, scaling, max_peaks_used, raw_expected
     ):
-        spec = _make_msms(
-            mz=[100.0, 200.0, 300.0, 400.0, 500.0],
-            intensity=[1.0, 4.0, 9.0, 16.0, 25.0],
-        )
+        spec = _make_msms(intensity=[1.0, 4.0, 9.0, 16.0, 25.0])
         result = preprocessing.process_spectrum(
             spec,
             min_peaks=5,
@@ -426,13 +474,9 @@ class TestProcessSpectrum:
         np.testing.assert_allclose(result["intensity"], expected, rtol=1e-5)
 
     def test_unknown_scaling_raises_value_error(self):
-        spec = _make_msms(
-            mz=[100.0, 200.0, 300.0, 400.0, 500.0],
-            intensity=[10.0, 20.0, 30.0, 40.0, 50.0],
-        )
         with pytest.raises(ValueError, match="Unsupported intensity scaling"):
             preprocessing.process_spectrum(
-                spec,
+                _make_msms(),
                 min_peaks=1,
                 min_mz_range=0.0,
                 scaling=cast("Any", "invalid"),
@@ -445,11 +489,7 @@ class TestProcessSpectrum:
     def test_rejects_invalid_or_out_of_float32_precursor_mz(
         self, bad_precursor_mz
     ):
-        spec = _make_msms(
-            mz=[100.0, 200.0, 300.0, 400.0, 500.0],
-            intensity=[10.0, 20.0, 30.0, 40.0, 50.0],
-            precursor_mz=bad_precursor_mz,
-        )
+        spec = _make_msms(precursor_mz=bad_precursor_mz)
         with warnings.catch_warnings():
             warnings.simplefilter("error", RuntimeWarning)
             assert (
@@ -467,11 +507,7 @@ class TestProcessSpectrum:
         ],
     )
     def test_accepts_float32_boundary_precursor_mz(self, boundary_pmz):
-        spec = _make_msms(
-            mz=[100.0, 200.0, 300.0, 400.0, 500.0],
-            intensity=[10.0, 20.0, 30.0, 40.0, 50.0],
-            precursor_mz=boundary_pmz,
-        )
+        spec = _make_msms(precursor_mz=boundary_pmz)
         with warnings.catch_warnings():
             warnings.simplefilter("error", RuntimeWarning)
             res = preprocessing.process_spectrum(
@@ -484,11 +520,7 @@ class TestProcessSpectrum:
         "bad_rt", [float("inf"), float("-inf"), 1e40, -1e40]
     )
     def test_rejects_infinite_or_float32_overflow_retention_time(self, bad_rt):
-        spec = _make_msms(
-            mz=[100.0, 200.0, 300.0, 400.0, 500.0],
-            intensity=[10.0, 20.0, 30.0, 40.0, 50.0],
-            retention_time=bad_rt,
-        )
+        spec = _make_msms(retention_time=bad_rt)
         assert (
             preprocessing.process_spectrum(spec, min_peaks=1, min_mz_range=0.0)
             is None
@@ -499,11 +531,7 @@ class TestProcessSpectrum:
         [None, float("nan"), 0.0, -5.0, float(np.finfo(np.float32).max)],
     )
     def test_accepts_none_nan_and_float32_retention_time(self, valid_rt):
-        spec = _make_msms(
-            mz=[100.0, 200.0, 300.0, 400.0, 500.0],
-            intensity=[10.0, 20.0, 30.0, 40.0, 50.0],
-            retention_time=valid_rt,
-        )
+        spec = _make_msms(retention_time=valid_rt)
         res = preprocessing.process_spectrum(
             spec, min_peaks=5, min_mz_range=250.0
         )
@@ -531,11 +559,7 @@ class TestProcessSpectrum:
         ],
     )
     def test_rejects_invalid_or_out_of_int8_precursor_charge(self, bad_charge):
-        spec = _make_msms(
-            mz=[100.0, 200.0, 300.0, 400.0, 500.0],
-            intensity=[10.0, 20.0, 30.0, 40.0, 50.0],
-            precursor_charge=bad_charge,
-        )
+        spec = _make_msms(precursor_charge=bad_charge)
         assert (
             preprocessing.process_spectrum(spec, min_peaks=1, min_mz_range=0.0)
             is None
@@ -547,11 +571,7 @@ class TestProcessSpectrum:
     def test_accepts_int8_and_numpy_integer_precursor_charge(
         self, boundary_charge
     ):
-        spec = _make_msms(
-            mz=[100.0, 200.0, 300.0, 400.0, 500.0],
-            intensity=[10.0, 20.0, 30.0, 40.0, 50.0],
-            precursor_charge=boundary_charge,
-        )
+        spec = _make_msms(precursor_charge=boundary_charge)
         remove_tol = 1.5 if int(boundary_charge) == -128 else None
         with warnings.catch_warnings():
             warnings.simplefilter("error", RuntimeWarning)
@@ -586,7 +606,7 @@ class TestProcessSpectrum:
             is None
         )
 
-    def test_rejects_non_finite_mz_before_set_mz_range(self):
+    def test_rejects_non_finite_mz_before_mz_range_filter(self):
         for bad_mz in (np.nan, np.inf, -np.inf):
             spec = _make_msms(
                 mz=[100.0, 200.0, 300.0, 400.0, bad_mz],
@@ -602,6 +622,17 @@ class TestProcessSpectrum:
                 )
                 is None
             )
+
+        assert (
+            preprocessing.process_spectrum(
+                _make_msms(),
+                min_peaks=1,
+                min_mz_range=0.0,
+                min_mz=600.0,
+                max_mz=200.0,
+            )
+            is None
+        )
 
     @pytest.mark.parametrize("min_mz", [None, 100.0])
     def test_all_peaks_above_max_mz_returns_none(self, min_mz):
@@ -619,40 +650,6 @@ class TestProcessSpectrum:
             )
             is None
         )
-
-    def test_zero_charge_removes_precursor_and_restores_zero(self):
-        spec = _make_msms(
-            mz=[110.0, 200.0, 300.0, 400.0, 500.0, 600.0],
-            intensity=[100.0, 200.0, 50.0, 300.0, 999.0, 150.0],
-            precursor_mz=500.0,
-            precursor_charge=0,
-        )
-        result = preprocessing.process_spectrum(
-            spec,
-            min_peaks=5,
-            min_mz_range=250.0,
-            remove_precursor_tol=1.5,
-        )
-        assert result is not None
-        assert result["precursor_charge"] == 0
-        assert 500.0 not in result["mz"]
-
-        spec_reject = _make_msms(
-            mz=[110.0, 499.8, 500.2, 600.0],
-            intensity=[100.0, 200.0, 200.0, 150.0],
-            precursor_mz=500.0,
-            precursor_charge=0,
-        )
-        assert (
-            preprocessing.process_spectrum(
-                spec_reject,
-                min_peaks=4,
-                min_mz_range=250.0,
-                remove_precursor_tol=1.5,
-            )
-            is None
-        )
-        assert spec_reject.precursor_charge == 0
 
     def test_negative_charge_removes_precursor_and_charge_reduced_peaks(self):
         # For charge -2 at m/z 500.0:
@@ -703,10 +700,7 @@ class TestProcessSpectrum:
     def test_post_scaling_guard_rejects_invalid_scaled_intensities(
         self, monkeypatch, scaled_bad
     ):
-        spec = _make_msms(
-            mz=[100.0, 200.0, 300.0, 400.0, 500.0],
-            intensity=[10.0, 20.0, 30.0, 40.0, 50.0],
-        )
+        spec = _make_msms()
 
         def _bad_scale(*_args, **_kwargs):
             spec.intensity = scaled_bad

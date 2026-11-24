@@ -7,36 +7,58 @@ import concurrent.futures
 import contextlib
 import logging
 import threading
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import joblib
 import lance
 import numpy as np
 import pyarrow as pa
 
+from .. import ms_io
 from ..dataset import (
     SPECTRUM_SCHEMA,
     bucket_dataset_path,
+    format_bucket_label,
     spectra_dir,
 )
-from ..types import INT32_MAX, charge_sort_key, parse_charge_bucket_list
-from ..utils import effective_n_workers, expand_input_globs, resolve_path
+from ..types import (
+    INT32_MAX,
+    OTHER_BUCKET,
+    UNKNOWN_CHARGE,
+    charge_sort_key,
+    parse_charge_bucket_list,
+)
+from ..utils import (
+    effective_n_workers,
+    expand_input_globs,
+    loky_unordered_pool,
+    resolve_path,
+)
 
 if TYPE_CHECKING:
-    import os
     from collections.abc import Callable, Mapping, Sequence
     from types import TracebackType
 
     import spectrum_utils.spectrum as sus
 
-    from ..types import ChargeBucket, ChargeValue, ProcessedSpectrum
+    from ..types import (
+        ChargeBucket,
+        ChargeValue,
+        PathLike,
+        ProcessedSpectrum,
+    )
 
 logger = logging.getLogger(__name__)
 
 # Flush a bucket's buffered spectra to its Lance dataset once this many
 # rows accumulate, bounding per-bucket memory during staging.
 _LANCE_WRITE_BATCH_SIZE = 10_000
+
+# Upper bound on concurrent Lance writer threads in auto-bucket mode so
+# high-core hosts do not over-buffer in-flight batches across files.
+_MAX_AUTO_WRITER_WORKERS = 8
 
 __all__ = [
     "ChargeRouter",
@@ -126,7 +148,7 @@ class ChargeRouter:
         charge_to_bucket: dict[ChargeValue, tuple[ChargeValue, ...]] = {}
         catch_other = False
         for bucket in canonical:
-            if bucket == "other":
+            if bucket == OTHER_BUCKET:
                 catch_other = True
                 continue
             for charge in bucket:
@@ -163,14 +185,14 @@ class ChargeRouter:
             be dropped.
         """
         charge: ChargeValue = (
-            "unknown" if raw_charge is None else int(raw_charge)
+            UNKNOWN_CHARGE if raw_charge is None else int(raw_charge)
         )
         if self._canonical_buckets is None:
             return (charge,)
         bucket = self._charge_to_bucket.get(charge)
         if bucket is not None:
             return bucket
-        return "other" if self._catch_other else None
+        return OTHER_BUCKET if self._catch_other else None
 
 
 def _auto_bucket_sort_key(bucket: ChargeBucket) -> tuple[bool, int | str]:
@@ -183,28 +205,30 @@ def _collect_valid_buckets(
     written_counts: Mapping[ChargeBucket, int],
 ) -> list[ChargeBucket]:
     """Return non-empty staged buckets in deterministic order."""
-    if router.canonical_buckets is None:
+    canonical = router.canonical_buckets
+    if canonical is None:
         return sorted(
             (b for b, count in written_counts.items() if count > 0),
             key=_auto_bucket_sort_key,
         )
     valid: list[ChargeBucket] = []
-    for bucket in router.canonical_buckets:
+    for bucket in canonical:
         if written_counts.get(bucket, 0) > 0:
             valid.append(bucket)
         else:
-            logger.debug("No spectra for bucket %s, skipping", bucket)
+            logger.debug(
+                "No spectra for bucket %s, skipping",
+                format_bucket_label(bucket),
+            )
     return valid
 
 
-def _build_list_array(arrays: Sequence[np.ndarray]) -> pa.ListArray:
-    """Pack a sequence of 1D float32 arrays into a PyArrow ListArray."""
+def _compute_list_offsets(arrays: Sequence[np.ndarray]) -> np.ndarray:
+    """Compute validated int32 PyArrow ListArray offsets for arrays."""
     n = len(arrays)
     offsets_i64 = np.empty(n + 1, dtype=np.int64)
     offsets_i64[0] = 0
-    if n == 0:
-        flat = np.empty(0, dtype=np.float32)
-    else:
+    if n > 0:
         lengths = np.fromiter(
             (len(a) for a in arrays), dtype=np.int64, count=n
         )
@@ -215,8 +239,15 @@ def _build_list_array(arrays: Sequence[np.ndarray]) -> pa.ListArray:
                 f"Total peak count ({total_values}) exceeds PyArrow "
                 f"int32 ListArray offset limit ({INT32_MAX})"
             )
-        flat = np.concatenate(arrays)
-    offsets = offsets_i64.astype(np.int32, copy=False)
+    return offsets_i64.astype(np.int32)
+
+
+def _build_list_array(
+    arrays: Sequence[np.ndarray],
+    offsets: np.ndarray,
+) -> pa.ListArray:
+    """Pack a sequence of 1D float32 arrays into a PyArrow ListArray."""
+    flat = np.concatenate(arrays) if arrays else np.empty(0, dtype=np.float32)
     return pa.ListArray.from_arrays(offsets, pa.array(flat, type=pa.float32()))
 
 
@@ -225,10 +256,20 @@ def _spectra_to_arrow_table(
 ) -> pa.Table:
     """Build a columnar PyArrow table matching ``SPECTRUM_SCHEMA``."""
     n = len(spec_to_write)
-    mz_arrays = [np.asarray(s["mz"], dtype=np.float32) for s in spec_to_write]
-    int_arrays = [
-        np.asarray(s["intensity"], dtype=np.float32) for s in spec_to_write
-    ]
+    mz_arrays: list[np.ndarray] = []
+    int_arrays: list[np.ndarray] = []
+    for idx, spec in enumerate(spec_to_write):
+        mz = np.asarray(spec["mz"], dtype=np.float32)
+        intensity = np.asarray(spec["intensity"], dtype=np.float32)
+        if len(mz) != len(intensity):
+            raise ValueError(
+                f"Spectrum {idx} has mismatched mz ({len(mz)}) and intensity "
+                f"({len(intensity)}) lengths"
+            )
+        mz_arrays.append(mz)
+        int_arrays.append(intensity)
+
+    offsets = _compute_list_offsets(mz_arrays)
     precursor_mz = np.fromiter(
         (s["precursor_mz"] for s in spec_to_write), dtype=np.float32, count=n
     )
@@ -241,8 +282,8 @@ def _spectra_to_arrow_table(
             "precursor_charge": pa.array(
                 [s["precursor_charge"] for s in spec_to_write], type=pa.int8()
             ),
-            "mz": _build_list_array(mz_arrays),
-            "intensity": _build_list_array(int_arrays),
+            "mz": _build_list_array(mz_arrays, offsets),
+            "intensity": _build_list_array(int_arrays, offsets),
             "retention_time": pa.array(
                 [s["retention_time"] for s in spec_to_write],
                 type=pa.float32(),
@@ -252,19 +293,27 @@ def _spectra_to_arrow_table(
     )
 
 
+@dataclass(slots=True)
+class _BucketState:
+    """Per-bucket serialization lock and first-batch init flag."""
+
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    initialized: bool = False
+
+
 def _write_to_dataset(
     spec_to_write: Sequence[Mapping[str, Any]],
     charge_bucket: ChargeBucket,
-    lock: threading.Lock,
+    state: _BucketState,
     work_dir: Path,
-    *,
-    mode: Literal["overwrite", "append"] = "append",
 ) -> int:
-    """Create, overwrite, or append a batch of spectra to Lance."""
+    """Convert a batch to Arrow and write or append it to Lance."""
     new_rows = _spectra_to_arrow_table(spec_to_write)
     path = bucket_dataset_path(work_dir, charge_bucket)
-    with lock:
-        if mode == "overwrite":
+    with state.lock:
+        if state.initialized:
+            lance.write_dataset(new_rows, str(path), mode="append")
+        else:
             effective_mode = "overwrite" if path.exists() else "create"
             logger.debug(
                 "Writing lance dataset at %s (mode=%s)", path, effective_mode
@@ -275,8 +324,7 @@ def _write_to_dataset(
                 mode=effective_mode,
                 data_storage_version="stable",
             )
-        else:
-            lance.write_dataset(new_rows, str(path), mode="append")
+            state.initialized = True
     return len(new_rows)
 
 
@@ -286,10 +334,10 @@ class _LanceBatchWriter:
 
     Maintains a single pending buffer per active charge bucket on the
     main thread and dispatches full batches to a bounded thread pool.
-    Each bucket's first batch writes in ``"overwrite"`` mode and
-    completes before any ``"append"`` batch for that bucket is
-    submitted, preventing duplicate rows on repeated staging runs and
-    eliminating write-order races.
+    The first worker acquiring a bucket's lock writes in ``"overwrite"``
+    mode and marks the bucket initialized before releasing the lock,
+    preventing duplicate rows and write-order races without stalling
+    the main thread.
     """
 
     def __init__(
@@ -306,16 +354,12 @@ class _LanceBatchWriter:
         self._inflight_sem = threading.BoundedSemaphore(
             max(2, max_workers * 2)
         )
-        self._locks: dict[ChargeBucket, threading.Lock] = (
-            collections.defaultdict(threading.Lock)
+        self._bucket_states: dict[ChargeBucket, _BucketState] = (
+            collections.defaultdict(_BucketState)
         )
         self._pending: dict[ChargeBucket, list[ProcessedSpectrum]] = (
             collections.defaultdict(list)
         )
-        self._initialized: set[ChargeBucket] = set()
-        self._init_futures: dict[
-            ChargeBucket, concurrent.futures.Future[int]
-        ] = {}
         self._inflight: dict[concurrent.futures.Future[int], ChargeBucket] = {}
         self._written_counts: dict[ChargeBucket, int] = (
             collections.defaultdict(int)
@@ -366,22 +410,12 @@ class _LanceBatchWriter:
     ) -> None:
         """Dispatch one bucket batch to the bounded writer pool."""
         self._reap_completed()
-        if bucket in self._initialized:
-            init_fut = self._init_futures.pop(bucket, None)
-            if init_fut is not None and init_fut in self._inflight:
-                self._consume_future(init_fut)
-            mode: Literal["overwrite", "append"] = "append"
-        else:
-            mode = "overwrite"
-
         self._inflight_sem.acquire()
-        lock = self._locks[bucket]
+        state = self._bucket_states[bucket]
 
         def _task() -> int:
             try:
-                return _write_to_dataset(
-                    batch, bucket, lock, self._work_dir, mode=mode
-                )
+                return _write_to_dataset(batch, bucket, state, self._work_dir)
             finally:
                 self._inflight_sem.release()
 
@@ -391,9 +425,6 @@ class _LanceBatchWriter:
             self._inflight_sem.release()
             raise
         self._inflight[fut] = bucket
-        if mode == "overwrite":
-            self._initialized.add(bucket)
-            self._init_futures[bucket] = fut
 
     def add_spectrum(self, spec: ProcessedSpectrum) -> None:
         """Route one spectrum into its buffer, flushing when full."""
@@ -423,16 +454,21 @@ class _LanceBatchWriter:
             self._consume_future(fut)
 
 
+def _writer_workers(router: ChargeRouter, n_workers: int) -> int:
+    """Size Lance writer threads from bucket count rather than files."""
+    if router.canonical_buckets is not None:
+        return max(1, min(n_workers, len(router.canonical_buckets)))
+    return max(1, min(n_workers, _MAX_AUTO_WRITER_WORKERS))
+
+
 def _read_spectra(
     filename: Path,
     process_spectrum: Callable[[sus.MsmsSpectrum], ProcessedSpectrum | None],
 ) -> tuple[list[ProcessedSpectrum], int]:
     """Read and preprocess all spectra from a single peak file."""
-    from .. import ms_io
-
     low_quality_counter = 0
     spectra: list[ProcessedSpectrum] = []
-    abs_path = resolve_path(filename)
+    abs_path = filename if filename.is_absolute() else resolve_path(filename)
     for spec in ms_io.get_spectra(abs_path):
         processed = process_spectrum(spec)
         if processed is None:
@@ -443,19 +479,24 @@ def _read_spectra(
 
 
 def stage_spectra(
-    input_filenames: Sequence[str | os.PathLike[str]],
-    work_dir: str | os.PathLike[str],
+    input_filenames: Sequence[PathLike],
+    work_dir: PathLike,
     process_spectrum: Callable[[sus.MsmsSpectrum], ProcessedSpectrum | None],
     charge_buckets: Sequence[Any] | None,
 ) -> list[ChargeBucket]:
     """
     Read, preprocess, and stage spectra in per-charge Lance datasets.
 
+    Note that direct callers outside
+    :func:`~falcon.staging.cache.load_or_stage_buckets` overwrite only
+    the buckets observed in this call without removing stale datasets
+    from prior runs.
+
     Parameters
     ----------
-    input_filenames : Sequence[str | os.PathLike[str]]
+    input_filenames : Sequence[PathLike]
         Resolved peak file paths to read.
-    work_dir : str | os.PathLike[str]
+    work_dir : PathLike
         Working directory containing the ``spectra`` staging subfolder.
     process_spectrum : Callable
         Preprocessing function returning a ``ProcessedSpectrum`` or
@@ -479,25 +520,22 @@ def stage_spectra(
     work_path = Path(work_dir)
     spectra_dir(work_path).mkdir(parents=True, exist_ok=True)
     logger.info("Reading spectra from %d peak file(s)...", len(resolved_files))
-    max_file_workers = min(len(resolved_files), effective_n_workers())
+    n_workers = effective_n_workers()
+    max_file_workers = min(len(resolved_files), n_workers)
+    writer_workers = _writer_workers(router, n_workers)
 
     low_quality_counter = 0
-    with _LanceBatchWriter(router, work_path, max_file_workers) as writer:
-        if len(resolved_files) == 1:
-            from .. import ms_io
-
-            for spec in ms_io.get_spectra(str(resolved_files[0])):
-                processed = process_spectrum(spec)
-                if processed is None:
-                    low_quality_counter += 1
-                else:
-                    writer.add_spectrum(processed)
+    with _LanceBatchWriter(router, work_path, writer_workers) as writer:
+        if max_file_workers == 1:
+            for file in resolved_files:
+                for spec in ms_io.get_spectra(file):
+                    processed = process_spectrum(spec)
+                    if processed is None:
+                        low_quality_counter += 1
+                    else:
+                        writer.add_spectrum(processed)
         else:
-            parallel_iter = joblib.Parallel(
-                n_jobs=max_file_workers,
-                backend="loky",
-                return_as="generator_unordered",
-            )(
+            parallel_iter = loky_unordered_pool(max_file_workers)(
                 joblib.delayed(_read_spectra)(file, process_spectrum)
                 for file in resolved_files
             )

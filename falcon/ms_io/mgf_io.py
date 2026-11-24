@@ -6,7 +6,7 @@ import logging
 import math
 import re
 from pathlib import Path
-from typing import IO, TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pyteomics.mgf
@@ -15,22 +15,24 @@ from pyteomics.auxiliary import PyteomicsError
 from . import reader_utils
 
 if TYPE_CHECKING:
-    import os
     from collections.abc import Iterable, Iterator
 
     import spectrum_utils.spectrum as sus
 
-    from ..types import ConsensusTuple
+    from ..types import ConsensusTuple, PathLike
+    from .reader_utils import SourceType
 
 logger = logging.getLogger(__name__)
 
 # Matches standard Universal Spectrum Identifiers (USIs).
-USI_PATTERN = re.compile(r"^mzspec:[^:\s]+:[^:\s]+:(scan:\d+|\d+)(:[^:\s]+)?$")
+_USI_PATTERN = re.compile(
+    r"^mzspec:[^:\s]+:[^:\s]+:(scan:\d+|\d+)(:[^:\s]+)?$"
+)
 
 # Flush buffered serialized MGF blocks every ~1 MiB.
 _WRITE_BUFFER_CHARS = 1 << 20
 
-__all__ = ["USI_PATTERN", "get_spectra", "write_spectra"]
+__all__ = ["get_spectra", "write_spectra"]
 
 
 def _non_blank_scan(value: Any) -> str | None:
@@ -51,7 +53,7 @@ def _resolve_identifier(
 
     title = params.get("title")
     if isinstance(title, str) and (
-        USI_PATTERN.match(title) or title.startswith(f"{filename}:cluster:")
+        _USI_PATTERN.match(title) or title.startswith(f"{filename}:cluster:")
     ):
         return title
     for key in ("scans", "scan"):
@@ -61,9 +63,7 @@ def _resolve_identifier(
     return f"{filename}:index:{spectrum_i}"
 
 
-def get_spectra(
-    source: IO[Any] | str | os.PathLike[str],
-) -> Iterator[sus.MsmsSpectrum]:
+def get_spectra(source: SourceType) -> Iterator[sus.MsmsSpectrum]:
     """
     Read MS/MS spectra from an MGF file or stream.
 
@@ -73,7 +73,7 @@ def get_spectra(
 
     Parameters
     ----------
-    source : IO[Any] | str | os.PathLike[str]
+    source : SourceType
         Path or open file object for the MGF source.
 
     Yields
@@ -95,7 +95,9 @@ def get_spectra(
                 try:
                     params = spectrum_dict["params"]
                     identifier = _resolve_identifier(params, base, spectrum_i)
-                    spectrum = _parse_spectrum(spectrum_dict, identifier)
+                    spectrum = _parse_spectrum(
+                        spectrum_dict, params, identifier
+                    )
                 except reader_utils.PARSE_EXCEPTIONS as exc:
                     reader_utils.log_skipped_spectrum(
                         source, identifier, exc, log=logger
@@ -106,21 +108,10 @@ def get_spectra(
         logger.warning("Failed to read file %s: %s", source, exc)
 
 
-def _parse_retention_time(raw_rt: Any) -> float:
-    """Parse an MGF ``RTINSECONDS`` scalar, range, or empty value."""
-    if raw_rt is None or (isinstance(raw_rt, str) and not raw_rt.strip()):
-        return float("nan")
-    if isinstance(raw_rt, (tuple, list)):
-        if not raw_rt:
-            return float("nan")
-        if len(raw_rt) >= 2:
-            return (float(raw_rt[0]) + float(raw_rt[1])) / 2.0
-        return float(raw_rt[0])
-    return float(raw_rt)
-
-
 def _parse_spectrum(
-    spectrum_dict: dict[str, Any], identifier: str
+    spectrum_dict: dict[str, Any],
+    params: dict[str, Any],
+    identifier: str,
 ) -> sus.MsmsSpectrum:
     """
     Parse a Pyteomics MGF spectrum dictionary into an ``MsmsSpectrum``.
@@ -128,8 +119,11 @@ def _parse_spectrum(
     Parameters
     ----------
     spectrum_dict : dict[str, Any]
-        Pyteomics MGF entry containing ``params``, ``m/z array``, and
+        Pyteomics MGF entry containing ``m/z array`` and
         ``intensity array``.
+    params : dict[str, Any]
+        Spectrum ``params`` mapping already extracted from
+        ``spectrum_dict``.
     identifier : str
         Spectrum identifier assigned to the parsed spectrum.
 
@@ -139,14 +133,11 @@ def _parse_spectrum(
         Parsed spectrum; missing charge is ``None`` and missing RT is
         ``NaN``.
     """
-    params = spectrum_dict["params"]
     mz_array = spectrum_dict["m/z array"]
     intensity_array = spectrum_dict["intensity array"]
-    retention_time = _parse_retention_time(params.get("rtinseconds"))
-
-    precursor_mz = float(params["pepmass"][0])
-    raw_charge = params.get("charge")
-    precursor_charge = int(raw_charge[0]) if raw_charge else None
+    retention_time = reader_utils.parse_optional_rt(params.get("rtinseconds"))
+    precursor_mz = params["pepmass"][0]
+    precursor_charge = reader_utils.parse_optional_charge(params.get("charge"))
 
     return reader_utils.build_msms_spectrum(
         identifier,
@@ -179,7 +170,17 @@ def _format_spectrum(spectrum: ConsensusTuple, scan_nr: int) -> str:
     str
         Serialized MGF block with intensities scaled to ``[0, 1000]``
         and non-finite charge/RT fields omitted.
+
+    Raises
+    ------
+    ValueError
+        If ``spectrum.precursor_mz`` is not finite.
     """
+    if not _is_present(spectrum.precursor_mz):
+        raise ValueError(
+            "Representative precursor_mz must be finite, got "
+            f"{spectrum.precursor_mz!r}"
+        )
     lines = [
         "BEGIN IONS",
         f"TITLE=falcon:cluster:{spectrum.cluster_id}",
@@ -205,14 +206,14 @@ def _format_spectrum(spectrum: ConsensusTuple, scan_nr: int) -> str:
 
 
 def write_spectra(
-    filename: str | os.PathLike[str], spectra: Iterable[ConsensusTuple]
+    filename: PathLike, spectra: Iterable[ConsensusTuple]
 ) -> None:
     """
     Write representative spectra to an MGF file.
 
     Parameters
     ----------
-    filename : str | os.PathLike[str]
+    filename : PathLike
         Destination MGF file path.
     spectra : Iterable[ConsensusTuple]
         Representative spectra to serialize.
@@ -236,10 +237,13 @@ def _scale_intensities(intensity: np.ndarray) -> np.ndarray:
     """
     Rescale positive peak intensities so the base peak equals 1000.
 
+    Scales in float64 to avoid float32 overflow/underflow on extreme
+    positive intensities.
+
     Parameters
     ----------
     intensity : np.ndarray
-        Float32 fragment peak intensities.
+        Fragment peak intensities.
 
     Returns
     -------
@@ -252,4 +256,4 @@ def _scale_intensities(intensity: np.ndarray) -> np.ndarray:
     max_i = float(np.max(intensity))
     if not math.isfinite(max_i) or max_i <= 0.0:
         return intensity
-    return (intensity / np.float32(max_i)) * np.float32(1000.0)
+    return (intensity.astype(np.float64, copy=False) / max_i) * 1000.0

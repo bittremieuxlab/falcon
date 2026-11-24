@@ -14,13 +14,13 @@ from pyteomics.auxiliary.structures import unitstr
 from falcon.ms_io import mzml_io
 
 
-def _mzml_dict(scan=None, ion_extra=None, extra_ions=None):
+def _mzml_dict(scan=None, ion_extra=None, extra_ions=None, scan_nr=5):
     """Build a minimal Pyteomics-style mzML spectrum dict."""
     ions = [{"selected ion m/z": 500.0, **(ion_extra or {})}]
     if extra_ions:
         ions.extend(extra_ions)
     return {
-        "id": "controllerType=0 controllerNumber=1 scan=5",
+        "id": f"controllerType=0 controllerNumber=1 scan={scan_nr}",
         "ms level": 2,
         "m/z array": np.array([100.0, 200.0], dtype=np.float32),
         "intensity array": np.array([1.0, 2.0], dtype=np.float32),
@@ -29,6 +29,14 @@ def _mzml_dict(scan=None, ion_extra=None, extra_ions=None):
             "precursor": [{"selectedIonList": {"selectedIon": ions}}]
         },
     }
+
+
+def _read_mzml_dicts(
+    monkeypatch, fake_reader_factory, raw_dicts, source="run.mzml"
+):
+    """Run ``mzml_io.get_spectra`` against stubbed Pyteomics records."""
+    monkeypatch.setattr(pyteomics.mzml, "MzML", fake_reader_factory(raw_dicts))
+    return list(mzml_io.get_spectra(source))
 
 
 class TestOfflinePsimsCv:
@@ -110,10 +118,12 @@ class TestExtractScanNr:
 
 
 class TestMzmlParseSpectrum:
-    def test_missing_rt_is_nan(self):
+    def test_missing_rt_is_nan(self, monkeypatch, fake_reader_factory):
         raw = _mzml_dict(ion_extra={"charge state": 2})
         orig_id = raw["id"]
-        spec = mzml_io._parse_spectrum(raw, "run:scan:5")
+        spectra = _read_mzml_dicts(monkeypatch, fake_reader_factory, [raw])
+        assert len(spectra) == 1
+        spec = spectra[0]
         assert spec.identifier == "run:scan:5"
         assert raw["id"] == orig_id
         assert spec.retention_time is not None
@@ -122,147 +132,185 @@ class TestMzmlParseSpectrum:
         assert spec.precursor_charge == 2
 
     @pytest.mark.parametrize("scan_list", [None, {}, {"scan": []}])
-    def test_absent_or_empty_scan_list_defaults_rt_to_nan(self, scan_list):
+    def test_absent_or_empty_scan_list_defaults_rt_to_nan(
+        self, monkeypatch, fake_reader_factory, scan_list
+    ):
         raw = _mzml_dict(ion_extra={"charge state": 2})
         if scan_list is None:
             del raw["scanList"]
         else:
             raw["scanList"] = scan_list
-        spec = mzml_io._parse_spectrum(raw, "run:scan:5")
-        assert spec.retention_time is not None
-        assert math.isnan(spec.retention_time)
+        spectra = _read_mzml_dicts(monkeypatch, fake_reader_factory, [raw])
+        assert len(spectra) == 1
+        assert spectra[0].retention_time is not None
+        assert math.isnan(spectra[0].retention_time)
 
     @pytest.mark.parametrize(
         "blank_rt", [None, "", "   ", unitstr("", "second")]
     )
-    def test_empty_or_none_scan_start_time_defaults_to_nan(self, blank_rt):
-        spec = mzml_io._parse_spectrum(
-            _mzml_dict(scan={"scan start time": blank_rt}),
-            "run:scan:5",
+    def test_empty_or_none_scan_start_time_defaults_to_nan(
+        self, monkeypatch, fake_reader_factory, blank_rt
+    ):
+        spectra = _read_mzml_dicts(
+            monkeypatch,
+            fake_reader_factory,
+            [_mzml_dict(scan={"scan start time": blank_rt})],
         )
-        assert spec.retention_time is not None
-        assert math.isnan(spec.retention_time)
+        assert len(spectra) == 1
+        assert spectra[0].retention_time is not None
+        assert math.isnan(spectra[0].retention_time)
 
-    def test_rt_present(self):
-        spec = mzml_io._parse_spectrum(
-            _mzml_dict(
-                scan={"scan start time": 6.0}, ion_extra={"charge state": 2}
-            ),
-            "run:scan:5",
+    def test_rt_present(self, monkeypatch, fake_reader_factory):
+        spectra = _read_mzml_dicts(
+            monkeypatch,
+            fake_reader_factory,
+            [
+                _mzml_dict(
+                    scan={"scan start time": 6.0},
+                    ion_extra={"charge state": 2},
+                )
+            ],
         )
-        assert spec.retention_time == pytest.approx(6.0)
+        assert len(spectra) == 1
+        assert spectra[0].retention_time == pytest.approx(6.0)
 
-    def test_possible_charge_state_fallback_scalar_and_sequences(self):
-        spec_scalar = mzml_io._parse_spectrum(
-            _mzml_dict(ion_extra={"possible charge state": 3}),
-            "run:scan:5",
+    def test_possible_charge_state_fallback_scalar_and_sequences(
+        self, monkeypatch, fake_reader_factory
+    ):
+        spectra = _read_mzml_dicts(
+            monkeypatch,
+            fake_reader_factory,
+            [
+                _mzml_dict(ion_extra={"possible charge state": 3}, scan_nr=1),
+                _mzml_dict(
+                    ion_extra={"possible charge state": [2, 3]}, scan_nr=2
+                ),
+                _mzml_dict(ion_extra={"possible charge state": []}, scan_nr=3),
+            ],
         )
-        assert spec_scalar.precursor_charge == 3
+        assert [s.precursor_charge for s in spectra] == [3, 2, None]
 
-        spec_list = mzml_io._parse_spectrum(
-            _mzml_dict(ion_extra={"possible charge state": [2, 3]}),
-            "run:scan:5",
+    def test_charge_state_sequence_and_empty_fallback(
+        self, monkeypatch, fake_reader_factory
+    ):
+        spectra = _read_mzml_dicts(
+            monkeypatch,
+            fake_reader_factory,
+            [
+                _mzml_dict(ion_extra={"charge state": (4, 5)}, scan_nr=1),
+                _mzml_dict(
+                    ion_extra={
+                        "charge state": [],
+                        "possible charge state": [3, 4],
+                    },
+                    scan_nr=2,
+                ),
+                _mzml_dict(ion_extra={"charge state": ()}, scan_nr=3),
+            ],
         )
-        assert spec_list.precursor_charge == 2
+        assert [s.precursor_charge for s in spectra] == [4, 3, None]
 
-        spec_empty = mzml_io._parse_spectrum(
-            _mzml_dict(ion_extra={"possible charge state": []}),
-            "run:scan:5",
+    def test_charge_state_takes_precedence_over_possible(
+        self, monkeypatch, fake_reader_factory
+    ):
+        spectra = _read_mzml_dicts(
+            monkeypatch,
+            fake_reader_factory,
+            [
+                _mzml_dict(
+                    ion_extra={"charge state": 2, "possible charge state": 3}
+                )
+            ],
         )
-        assert spec_empty.precursor_charge is None
+        assert [s.precursor_charge for s in spectra] == [2]
 
-    def test_charge_state_sequence_and_empty_fallback(self):
-        spec_seq = mzml_io._parse_spectrum(
-            _mzml_dict(ion_extra={"charge state": (4, 5)}),
-            "run:scan:5",
+    def test_missing_charge_is_none(self, monkeypatch, fake_reader_factory):
+        spectra = _read_mzml_dicts(
+            monkeypatch, fake_reader_factory, [_mzml_dict()]
         )
-        assert spec_seq.precursor_charge == 4
-
-        spec_empty_falls_back = mzml_io._parse_spectrum(
-            _mzml_dict(
-                ion_extra={"charge state": [], "possible charge state": [3, 4]}
-            ),
-            "run:scan:5",
-        )
-        assert spec_empty_falls_back.precursor_charge == 3
-
-        spec_both_empty = mzml_io._parse_spectrum(
-            _mzml_dict(ion_extra={"charge state": ()}),
-            "run:scan:5",
-        )
-        assert spec_both_empty.precursor_charge is None
-
-    def test_charge_state_takes_precedence_over_possible(self):
-        spec = mzml_io._parse_spectrum(
-            _mzml_dict(
-                ion_extra={"charge state": 2, "possible charge state": 3}
-            ),
-            "run:scan:5",
-        )
-        assert spec.precursor_charge == 2
-
-    def test_missing_charge_is_none(self):
-        spec = mzml_io._parse_spectrum(_mzml_dict(), "run:scan:5")
-        assert spec.precursor_charge is None
+        assert [s.precursor_charge for s in spectra] == [None]
 
     @pytest.mark.parametrize("blank_charge", [None, "", "   ", [""], [None]])
     def test_empty_charge_cv_param_returns_none_and_allows_fallback(
-        self, blank_charge
+        self, monkeypatch, fake_reader_factory, blank_charge
     ):
-        spec_none = mzml_io._parse_spectrum(
-            _mzml_dict(ion_extra={"charge state": blank_charge}),
-            "run:scan:5",
+        spectra = _read_mzml_dicts(
+            monkeypatch,
+            fake_reader_factory,
+            [
+                _mzml_dict(
+                    ion_extra={"charge state": blank_charge}, scan_nr=1
+                ),
+                _mzml_dict(
+                    ion_extra={
+                        "charge state": blank_charge,
+                        "possible charge state": 3,
+                    },
+                    scan_nr=2,
+                ),
+            ],
         )
-        assert spec_none.precursor_charge is None
-
-        spec_fallback = mzml_io._parse_spectrum(
-            _mzml_dict(
-                ion_extra={
-                    "charge state": blank_charge,
-                    "possible charge state": 3,
-                }
-            ),
-            "run:scan:5",
-        )
-        assert spec_fallback.precursor_charge == 3
+        assert [s.precursor_charge for s in spectra] == [None, 3]
 
     @pytest.mark.parametrize(
         ("raw_charge", "expected"),
         [(2, -2), (-2, -2), (None, None)],
     )
     def test_negative_scan_negates_charge_magnitude(
-        self, raw_charge, expected
+        self, monkeypatch, fake_reader_factory, raw_charge, expected
     ):
         ion_extra = (
             {"charge state": raw_charge} if raw_charge is not None else {}
         )
         raw = {**_mzml_dict(ion_extra=ion_extra), "negative scan": ""}
-        spec = mzml_io._parse_spectrum(raw, "run:scan:5")
-        assert spec.precursor_charge == expected
+        spectra = _read_mzml_dicts(monkeypatch, fake_reader_factory, [raw])
+        assert [s.precursor_charge for s in spectra] == [expected]
 
-    def test_multiple_selected_ions_uses_first(self):
-        spec = mzml_io._parse_spectrum(
-            _mzml_dict(
-                ion_extra={"charge state": 2},
-                extra_ions=[{"selected ion m/z": 600.0, "charge state": 3}],
-            ),
-            "run:scan:5",
+    def test_multiple_selected_ions_uses_first(
+        self, monkeypatch, fake_reader_factory
+    ):
+        spectra = _read_mzml_dicts(
+            monkeypatch,
+            fake_reader_factory,
+            [
+                _mzml_dict(
+                    ion_extra={"charge state": 2},
+                    extra_ions=[
+                        {"selected ion m/z": 600.0, "charge state": 3}
+                    ],
+                )
+            ],
         )
-        assert spec.precursor_mz == pytest.approx(500.0)
-        assert spec.precursor_charge == 2
+        assert len(spectra) == 1
+        assert spectra[0].precursor_mz == pytest.approx(500.0)
+        assert spectra[0].precursor_charge == 2
 
-    def test_rejects_non_numeric_rt_and_non_finite_precursor_mz(self):
-        with pytest.raises(ValueError, match="could not convert"):
-            mzml_io._parse_spectrum(
-                _mzml_dict(scan={"scan start time": unitstr("bad", "second")}),
-                "run:scan:5",
-            )
-        bad_mz_dict = _mzml_dict()
+    def test_skips_non_numeric_rt_and_non_finite_precursor_mz(
+        self, monkeypatch, caplog, fake_reader_factory
+    ):
+        bad_rt_dict = _mzml_dict(
+            scan={"scan start time": unitstr("bad", "second")}, scan_nr=1
+        )
+        bad_mz_dict = _mzml_dict(scan_nr=2)
         bad_mz_dict["precursorList"]["precursor"][0]["selectedIonList"][
             "selectedIon"
         ][0]["selected ion m/z"] = float("nan")
-        with pytest.raises(ValueError, match="Precursor m/z must be finite"):
-            mzml_io._parse_spectrum(bad_mz_dict, "run:scan:5")
+        valid_dict = _mzml_dict(scan_nr=3)
+
+        with caplog.at_level(logging.DEBUG, logger="falcon.ms_io.mzml_io"):
+            spectra = _read_mzml_dicts(
+                monkeypatch,
+                fake_reader_factory,
+                [bad_rt_dict, bad_mz_dict, valid_dict],
+            )
+        assert [s.identifier for s in spectra] == ["run:scan:3"]
+        messages = [
+            rec.message
+            for rec in caplog.records
+            if rec.levelno == logging.DEBUG
+        ]
+        assert any("could not convert" in m for m in messages)
+        assert any("Precursor m/z must be finite" in m for m in messages)
 
 
 class TestMzmlGetSpectra:
@@ -395,43 +443,20 @@ class TestMzmlGetSpectra:
         assert missing_scan_recs[2].levelno == logging.DEBUG
 
     def test_parses_multi_possible_charge_state_and_missing_scanlist_end2end(
-        self, tmp_path
+        self, tmp_path, mzml_writer
     ):
-        mzml = tmp_path / "multi_charge.mzml"
-        mzml.write_text(
-            '<?xml version="1.0" encoding="utf-8"?>\n'
-            '<mzML xmlns="http://psi.hupo.org/ms/mzml" version="1.1.0">\n'
-            ' <run id="run1">\n'
-            '  <spectrumList count="1">\n'
-            '   <spectrum index="0" id="scan=1" defaultArrayLength="1">\n'
-            '    <cvParam cvRef="MS" accession="MS:1000511" '
-            'name="ms level" value="2"/>\n'
-            '    <precursorList count="1"><precursor>'
-            '<selectedIonList count="1"><selectedIon>'
-            '<cvParam cvRef="MS" accession="MS:1000744" '
-            'name="selected ion m/z" value="500.0"/>'
-            '<cvParam cvRef="MS" accession="MS:1000633" '
-            'name="possible charge state" value="2"/>'
-            '<cvParam cvRef="MS" accession="MS:1000633" '
-            'name="possible charge state" value="3"/>'
-            "</selectedIon></selectedIonList>"
-            "</precursor></precursorList>\n"
-            '    <binaryDataArrayList count="2">\n'
-            '     <binaryDataArray encodedLength="12">'
-            '<cvParam cvRef="MS" accession="MS:1000523" name="64-bit float"/>'
-            '<cvParam cvRef="MS" accession="MS:1000514" name="m/z array"/>'
-            "<binary>AAAAAAAAWUA=</binary></binaryDataArray>\n"
-            '     <binaryDataArray encodedLength="12">'
-            '<cvParam cvRef="MS" accession="MS:1000523" name="64-bit float"/>'
-            '<cvParam cvRef="MS" accession="MS:1000515" '
-            'name="intensity array"/>'
-            "<binary>AAAAAAAAWUA=</binary></binaryDataArray>\n"
-            "    </binaryDataArrayList>\n"
-            "   </spectrum>\n"
-            "  </spectrumList>\n"
-            " </run>\n"
-            "</mzML>\n",
-            encoding="utf-8",
+        mzml = mzml_writer(
+            tmp_path / "multi_charge.mzml",
+            [
+                {
+                    "id_str": "scan=1",
+                    "precursor_mz": 500.0,
+                    "possible_charges": [2, 3],
+                    "omit_scan_list": True,
+                    "mz": [100.0],
+                    "intensity": [100.0],
+                }
+            ],
         )
         spectra = list(mzml_io.get_spectra(mzml))
         assert len(spectra) == 1
@@ -439,64 +464,30 @@ class TestMzmlGetSpectra:
         assert spectra[0].retention_time is not None
         assert math.isnan(spectra[0].retention_time)
 
-    def test_parses_negative_scan_and_empty_cv_params_end2end(self, tmp_path):
-        mzml = tmp_path / "neg_and_empty.mzml"
-        mzml.write_text(
-            '<?xml version="1.0" encoding="utf-8"?>\n'
-            '<mzML xmlns="http://psi.hupo.org/ms/mzml" version="1.1.0">\n'
-            ' <run id="run1"><spectrumList count="2">\n'
-            '  <spectrum index="0" id="scan=1" defaultArrayLength="1">\n'
-            '   <cvParam cvRef="MS" accession="MS:1000511" '
-            'name="ms level" value="2"/>\n'
-            '   <cvParam cvRef="MS" accession="MS:1000129" '
-            'name="negative scan"/>\n'
-            '   <scanList count="1"><scan>'
-            '<cvParam cvRef="MS" accession="MS:1000016" '
-            'name="scan start time" value=""/>'
-            "</scan></scanList>\n"
-            '   <precursorList count="1"><precursor>'
-            '<selectedIonList count="1"><selectedIon>'
-            '<cvParam cvRef="MS" accession="MS:1000744" '
-            'name="selected ion m/z" value="500.0"/>'
-            '<cvParam cvRef="MS" accession="MS:1000041" '
-            'name="charge state" value="2"/>'
-            "</selectedIon></selectedIonList></precursor></precursorList>\n"
-            '   <binaryDataArrayList count="2">\n'
-            '    <binaryDataArray encodedLength="12">'
-            '<cvParam cvRef="MS" accession="MS:1000523" name="64-bit float"/>'
-            '<cvParam cvRef="MS" accession="MS:1000514" name="m/z array"/>'
-            "<binary>AAAAAAAAWUA=</binary></binaryDataArray>\n"
-            '    <binaryDataArray encodedLength="12">'
-            '<cvParam cvRef="MS" accession="MS:1000523" name="64-bit float"/>'
-            '<cvParam cvRef="MS" accession="MS:1000515" '
-            'name="intensity array"/>'
-            "<binary>AAAAAAAAWUA=</binary></binaryDataArray>\n"
-            "   </binaryDataArrayList>\n"
-            "  </spectrum>\n"
-            '  <spectrum index="1" id="scan=2" defaultArrayLength="1">\n'
-            '   <cvParam cvRef="MS" accession="MS:1000511" '
-            'name="ms level" value="2"/>\n'
-            '   <precursorList count="1"><precursor>'
-            '<selectedIonList count="1"><selectedIon>'
-            '<cvParam cvRef="MS" accession="MS:1000744" '
-            'name="selected ion m/z" value="600.0"/>'
-            '<cvParam cvRef="MS" accession="MS:1000041" '
-            'name="charge state" value=""/>'
-            "</selectedIon></selectedIonList></precursor></precursorList>\n"
-            '   <binaryDataArrayList count="2">\n'
-            '    <binaryDataArray encodedLength="12">'
-            '<cvParam cvRef="MS" accession="MS:1000523" name="64-bit float"/>'
-            '<cvParam cvRef="MS" accession="MS:1000514" name="m/z array"/>'
-            "<binary>AAAAAAAAWUA=</binary></binaryDataArray>\n"
-            '    <binaryDataArray encodedLength="12">'
-            '<cvParam cvRef="MS" accession="MS:1000523" name="64-bit float"/>'
-            '<cvParam cvRef="MS" accession="MS:1000515" '
-            'name="intensity array"/>'
-            "<binary>AAAAAAAAWUA=</binary></binaryDataArray>\n"
-            "   </binaryDataArrayList>\n"
-            "  </spectrum>\n"
-            " </spectrumList></run></mzML>\n",
-            encoding="utf-8",
+    def test_parses_negative_scan_and_empty_cv_params_end2end(
+        self, tmp_path, mzml_writer
+    ):
+        mzml = mzml_writer(
+            tmp_path / "neg_and_empty.mzml",
+            [
+                {
+                    "id_str": "scan=1",
+                    "negative_scan": True,
+                    "rt": "",
+                    "precursor_mz": 500.0,
+                    "charge": 2,
+                    "mz": [100.0],
+                    "intensity": [100.0],
+                },
+                {
+                    "id_str": "scan=2",
+                    "omit_scan_list": True,
+                    "precursor_mz": 600.0,
+                    "charge": "",
+                    "mz": [100.0],
+                    "intensity": [100.0],
+                },
+            ],
         )
         spectra = list(mzml_io.get_spectra(mzml))
         assert [s.identifier for s in spectra] == [
@@ -528,51 +519,36 @@ class TestMzmlGetSpectra:
             )
 
     def test_corrupt_base64_and_zlib_log_warning_instead_of_crashing(
-        self, tmp_path, caplog
+        self, tmp_path, caplog, mzml_writer
     ):
-        template = (
-            '<?xml version="1.0" encoding="utf-8"?>\n'
-            '<mzML xmlns="http://psi.hupo.org/ms/mzml" version="1.1.0">\n'
-            ' <run id="run1"><spectrumList count="1">\n'
-            '  <spectrum index="0" id="scan=1" defaultArrayLength="1">\n'
-            '   <cvParam cvRef="MS" accession="MS:1000511" '
-            'name="ms level" value="2"/>\n'
-            '   <precursorList count="1"><precursor>'
-            '<selectedIonList count="1"><selectedIon>'
-            '<cvParam cvRef="MS" accession="MS:1000744" '
-            'name="selected ion m/z" value="500.0"/>'
-            "</selectedIon></selectedIonList></precursor></precursorList>\n"
-            '   <binaryDataArrayList count="2">\n'
-            '    <binaryDataArray encodedLength="12">'
-            '<cvParam cvRef="MS" accession="MS:1000523" name="64-bit float"/>'
-            "{extra_cv}"
-            '<cvParam cvRef="MS" accession="MS:1000514" name="m/z array"/>'
-            "<binary>{payload}</binary></binaryDataArray>\n"
-            '    <binaryDataArray encodedLength="12">'
-            '<cvParam cvRef="MS" accession="MS:1000523" name="64-bit float"/>'
-            '<cvParam cvRef="MS" accession="MS:1000515" '
-            'name="intensity array"/>'
-            "<binary>AAAAAAAAWUA=</binary></binaryDataArray>\n"
-            "   </binaryDataArrayList>\n"
-            "  </spectrum>\n"
-            " </spectrumList></run></mzML>\n"
-        )
         cases = [
-            ("bad_b64.mzml", "", "!!!not-base64!!!"),
+            ("bad_b64.mzml", {"raw_mz_b64": "!!!not-base64!!!"}),
             (
                 "bad_zlib.mzml",
-                '<cvParam cvRef="MS" accession="MS:1000574" '
-                'name="zlib compression"/>',
-                "AAAAAAAAWUA=",
+                {
+                    "mz_extra_cv": (
+                        '<cvParam cvRef="MS" accession="MS:1000574" '
+                        'name="zlib compression"/>'
+                    ),
+                    "raw_mz_b64": "AAAAAAAAWUA=",
+                },
             ),
             # Valid base64 of 3 bytes (not a multiple of 8-byte f64).
-            ("truncated_binary.mzml", "", "YWJj"),
+            ("truncated_binary.mzml", {"raw_mz_b64": "YWJj"}),
         ]
-        for filename, extra_cv, payload in cases:
-            path = tmp_path / filename
-            path.write_text(
-                template.format(extra_cv=extra_cv, payload=payload),
-                encoding="utf-8",
+        for filename, extra in cases:
+            path = mzml_writer(
+                tmp_path / filename,
+                [
+                    {
+                        "id_str": "scan=1",
+                        "precursor_mz": 500.0,
+                        "omit_scan_list": True,
+                        "mz": [100.0],
+                        "intensity": [100.0],
+                        **extra,
+                    }
+                ],
             )
             caplog.clear()
             with caplog.at_level(logging.WARNING, logger="falcon"):
@@ -602,26 +578,12 @@ class TestMzmlGetSpectra:
         assert len(spectra) == 1
         assert spectra[0].identifier == "sample:scan:2"
 
-    def test_skips_spectrum_with_empty_selected_ion_list(self, tmp_path):
-        # Empty <selectedIonList count="0"/> triggers IndexError.
-        bad_mzml = tmp_path / "empty_ion.mzml"
-        bad_mzml.write_text(
-            '<?xml version="1.0" encoding="utf-8"?>\n'
-            '<mzML xmlns="http://psi.hupo.org/ms/mzml" version="1.1.0">\n'
-            ' <run id="run1">\n'
-            '  <spectrumList count="1">\n'
-            '   <spectrum index="0" id="scan=1" defaultArrayLength="0">\n'
-            '    <cvParam cvRef="MS" accession="MS:1000511" '
-            'name="ms level" value="2"/>\n'
-            '    <scanList count="1"><scan/></scanList>\n'
-            '    <precursorList count="1"><precursor>'
-            '<selectedIonList count="0"/>'
-            "</precursor></precursorList>\n"
-            '    <binaryDataArrayList count="0"/>\n'
-            "   </spectrum>\n"
-            "  </spectrumList>\n"
-            " </run>\n"
-            "</mzML>\n",
-            encoding="utf-8",
+    def test_skips_spectrum_with_empty_selected_ion_list(
+        self, tmp_path, mzml_writer
+    ):
+        # Empty <selectedIonList count="0"/> triggers IndexError/KeyError.
+        bad_mzml = mzml_writer(
+            tmp_path / "empty_ion.mzml",
+            [{"id_str": "scan=1", "empty_selected_ions": True}],
         )
         assert list(mzml_io.get_spectra(bad_mzml)) == []

@@ -1,51 +1,50 @@
-"""Hierarchical spectrum clustering engine and worker coordinator."""
+"""Parallel clustering coordinator, chunk execution, and assembly."""
 
 from __future__ import annotations
 
 import contextlib
-import gc
 import logging
-import math
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from functools import partial
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-import fastcluster
 import joblib
 import numpy as np
 import pyarrow as pa
 
-from ..config.models import (
+from ..config import MedoidConsensusConfig
+from ..dataset import SORTED_INTERVAL_COLUMNS, bucket_label_from_uri
+from ..types import (
     DEFAULT_MAX_MZ,
     DEFAULT_MIN_MZ,
-    MedoidConsensusConfig,
-)
-from ..dataset import (
-    CANONICAL_SORT_COLUMNS,
-    SORTED_INTERVAL_COLUMNS,
-    bucket_label_from_uri,
-)
-from ..types import (
     ClusterResult,
     ConsensusTuple,
-    SpectrumTuple,
     offset_cluster_result,
 )
-from ..utils import effective_n_workers, format_hms
-from . import scheduling
-from .consensus import get_representative_spectra
-from .distance import close_memmap, compute_condensed_distance_matrix
-from .refine import cut_linkage, refine_clusters
+from ..utils import (
+    effective_memory_bytes,
+    effective_n_workers,
+    format_hms,
+    loky_unordered_pool,
+)
+from .distance import close_memmap
+from .interval import (
+    MIN_CLUSTER_SAMPLES,
+    ClusteringOptions,
+    cluster_arrow_interval,
+    cluster_mz_interval,
+    interval_spectrum_tuples,
+)
 from .scheduling import (
     CHUNKS_PER_WORKER,
+    effective_tile_threshold,
     prepare_bucket_chunks,
-    tile_threshold,
 )
 from .tiling import (
     GiantMemmapStore,
+    TileDone,
     TileTask,
     allocate_giant_tiles,
     tile_distance,
@@ -55,23 +54,25 @@ if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator, Sequence
 
     import lance
-    import pandas as pd
 
-    from ..config.models import ClusteringConfig, ConsensusConfig
+    from ..config import ClusteringConfig, ConsensusConfig
+    from ..types import PathLike
     from .scheduling import BucketPlan, IntervalSpec
 
 logger = logging.getLogger(__name__)
 
 TaggedIntervalResult = tuple[int, ClusterResult]
 
-# Minimum spectra a refined cluster needs to keep a shared label;
-# smaller groups become individually labeled singletons.
-_MIN_CLUSTER_SAMPLES = 2
+# Columns read for normal chunks when representative spectra are off.
+_CHUNK_NO_REP_COLUMNS: tuple[str, ...] = (
+    "precursor_mz",
+    "retention_time",
+    "mz",
+    "intensity",
+)
 
-# Run explicit gc.collect() only after intervals larger than this size;
-# smaller intervals do not allocate enough to justify GC overhead.
-_GC_COLLECT_MIN_SPECTRA = 2**11
-
+# Columns needed for Pass 2 giant finalization when representatives are
+# skipped (distances are already precomputed in the shared memmap).
 _GIANT_METADATA_COLUMNS: tuple[str, ...] = (
     "precursor_mz",
     "retention_time",
@@ -82,13 +83,6 @@ _GIANT_METADATA_COLUMNS: tuple[str, ...] = (
 # float64 working copy (8 B). Reserve 30% headroom for OS/workers.
 _PASS2_BYTES_PER_PAIR = 16
 _PASS2_RAM_BUDGET_FRACTION = 0.7
-_PROC_CGROUP_PATH = "/proc/self/cgroup"
-_CGROUP_V2_ROOT = "/sys/fs/cgroup"
-_CGROUP_V1_MEMORY_ROOT = "/sys/fs/cgroup/memory"
-_CGROUP_MEMORY_PATHS: tuple[str, ...] = (
-    "/sys/fs/cgroup/memory.max",
-    "/sys/fs/cgroup/memory/memory.limit_in_bytes",
-)
 
 __all__ = [
     "ChunkDone",
@@ -105,18 +99,6 @@ __all__ = [
     "generate_clusters_multi",
     "interval_spectrum_tuples",
 ]
-
-
-@dataclass(frozen=True, slots=True)
-class ClusteringOptions:
-    """Bundled clustering, consensus, and m/z-range options."""
-
-    clustering: ClusteringConfig
-    consensus: ConsensusConfig = field(default_factory=MedoidConsensusConfig)
-    min_mz: float = DEFAULT_MIN_MZ
-    max_mz: float = DEFAULT_MAX_MZ
-    compute_representatives: bool = True
-    temp_dir: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,88 +144,6 @@ class GiantDone:
     result: ClusterResult
 
 
-def _parallel_pool(n_jobs: int) -> joblib.Parallel:
-    """Create a loky pool of ``n_jobs`` returning unordered results."""
-    return joblib.Parallel(
-        n_jobs=max(1, n_jobs),
-        backend="loky",
-        verbose=0,
-        return_as="generator_unordered",
-    )
-
-
-def _effective_tile_threshold(batch_size: int, n_workers: int) -> int:
-    """Return minimum interval size that splits into >= 2 tiles."""
-    if n_workers <= 1:
-        return batch_size + 1
-    # Exact smallest n with n * (n - 1) // 2 >= 2 * MIN_PAIRS_PER_TILE.
-    min_two_tile = (math.isqrt(16 * scheduling.MIN_PAIRS_PER_TILE) + 3) // 2
-    return max(tile_threshold(batch_size), min_two_tile)
-
-
-def _read_positive_int(path: Path) -> int | None:
-    """Read a positive decimal integer from ``path``, or ``None``."""
-    try:
-        raw = path.read_text(encoding="ascii").strip()
-    except (OSError, UnicodeDecodeError):
-        return None
-    if raw.isdigit():
-        value = int(raw)
-        if value > 0:
-            return value
-    return None
-
-
-def _walk_cgroup_limits(root: Path, rel_path: str, filename: str) -> list[int]:
-    """Collect finite limits from ``root / rel_path`` up to ``root``."""
-    parts = [p for p in rel_path.split("/") if p and p not in (".", "..")]
-    current = root.joinpath(*parts)
-    limits: list[int] = []
-    while True:
-        limit = _read_positive_int(current / filename)
-        if limit is not None:
-            limits.append(limit)
-        if current == root:
-            break
-        current = current.parent
-    return limits
-
-
-def _cgroup_memory_limit() -> int | None:
-    """Return minimum finite Linux cgroup memory limit in bytes."""
-    limits: list[int] = []
-    try:
-        proc_text = Path(_PROC_CGROUP_PATH).read_text(
-            encoding="utf-8", errors="surrogateescape"
-        )
-    except (OSError, UnicodeError):
-        proc_text = ""
-    for line in proc_text.splitlines():
-        fields = line.split(":", 2)
-        if len(fields) != 3:
-            continue
-        hierarchy, controllers, rel_path = fields
-        if hierarchy == "0" and controllers == "":
-            limits.extend(
-                _walk_cgroup_limits(
-                    Path(_CGROUP_V2_ROOT), rel_path, "memory.max"
-                )
-            )
-        elif "memory" in controllers.split(","):
-            limits.extend(
-                _walk_cgroup_limits(
-                    Path(_CGROUP_V1_MEMORY_ROOT),
-                    rel_path,
-                    "memory.limit_in_bytes",
-                )
-            )
-    for fallback in _CGROUP_MEMORY_PATHS:
-        limit = _read_positive_int(Path(fallback))
-        if limit is not None:
-            limits.append(limit)
-    return min(limits) if limits else None
-
-
 def _pass2_worker_limit(
     giants: Sequence[GiantInterval], n_workers: int
 ) -> int:
@@ -251,204 +151,13 @@ def _pass2_worker_limit(
     max_workers = min(max(1, n_workers), len(giants))
     if max_workers <= 1:
         return max(1, max_workers)
-    try:
-        page_size = os.sysconf("SC_PAGE_SIZE")
-        phys_pages = os.sysconf("SC_PHYS_PAGES")
-    except (AttributeError, OSError, ValueError):
+    total_ram = effective_memory_bytes()
+    if total_ram is None:
         return max_workers
-    if page_size <= 0 or phys_pages <= 0:
-        return max_workers
-    total_ram = int(page_size) * int(phys_pages)
-    cgroup_limit = _cgroup_memory_limit()
-    if cgroup_limit is not None:
-        total_ram = min(total_ram, cgroup_limit)
     budget_bytes = int(total_ram * _PASS2_RAM_BUDGET_FRACTION)
     max_n = max(giant.spec.n_spectra for giant in giants)
     per_giant_bytes = max(1, _PASS2_BYTES_PER_PAIR * max_n * (max_n - 1) // 2)
     return min(max_workers, max(1, budget_bytes // per_giant_bytes))
-
-
-def _sorted_metadata(
-    spectra: pd.DataFrame, already_sorted: bool
-) -> tuple[pd.DataFrame, np.ndarray, np.ndarray]:
-    """Return canonically sorted DataFrame plus precursor m/z and RT."""
-    if not already_sorted:
-        spectra = spectra.sort_values(
-            list(CANONICAL_SORT_COLUMNS), kind="stable"
-        )
-    return (
-        spectra,
-        spectra["precursor_mz"].to_numpy(),
-        spectra["retention_time"].to_numpy(),
-    )
-
-
-def interval_spectrum_tuples(
-    spectra: pd.DataFrame,
-    *,
-    already_sorted: bool = False,
-) -> tuple[list[SpectrumTuple], np.ndarray, np.ndarray]:
-    """
-    Build canonically ordered ``SpectrumTuple`` records and metadata.
-
-    Parameters
-    ----------
-    spectra : pd.DataFrame
-        Interval spectrum table containing ``SORTED_INTERVAL_COLUMNS``
-        (plus ``"identifier"`` when ``already_sorted`` is ``False``).
-    already_sorted : bool, default=False
-        Skip sorting when the caller guarantees rows are already in
-        ``CANONICAL_SORT_COLUMNS`` order (e.g. via Lance ``take``).
-
-    Returns
-    -------
-    tuple[list[SpectrumTuple], np.ndarray, np.ndarray]
-        ``(spec_tuples, precursor_mzs, rts)`` aligned to canonical
-        order.
-    """
-    spectra, precursor_mz, rts = _sorted_metadata(spectra, already_sorted)
-    precursor_charge = spectra["precursor_charge"].to_numpy()
-    mz = spectra["mz"].to_numpy()
-    intensity = spectra["intensity"].to_numpy()
-    spec_tuples = [
-        SpectrumTuple(
-            precursor_mz[i], precursor_charge[i], mz[i], intensity[i]
-        )
-        for i in range(len(precursor_mz))
-    ]
-    return spec_tuples, precursor_mz, rts
-
-
-def cluster_mz_interval(
-    spectra: pd.DataFrame,
-    options: ClusteringOptions,
-    *,
-    pdist: np.ndarray | None = None,
-    already_sorted: bool = False,
-) -> ClusterResult:
-    """
-    Cluster spectra within one precursor m/z interval.
-
-    Parameters
-    ----------
-    spectra : pd.DataFrame
-        Pre-fetched interval spectra. When ``pdist`` is supplied and
-        ``options.compute_representatives`` is ``False``, only
-        ``precursor_mz`` and ``retention_time`` (plus ``identifier`` if
-        ``already_sorted`` is ``False``) are required.
-    options : ClusteringOptions
-        Bundled clustering, consensus, and representative options.
-    pdist : np.ndarray | None, default=None
-        Optional precomputed condensed distance matrix (tiled giant
-        path) indexed identically to canonical order.
-    already_sorted : bool, default=False
-        Whether ``spectra`` is already in canonical order.
-
-    Returns
-    -------
-    ClusterResult
-        Int32 cluster labels aligned to canonical input order and
-        representative spectra ordered by ascending cluster ID (or an
-        empty list when ``options.compute_representatives`` is False).
-    """
-    needs_peaks = pdist is None or options.compute_representatives
-    if needs_peaks:
-        spec_tuples, precursor_mzs, rts_orig = interval_spectrum_tuples(
-            spectra, already_sorted=already_sorted
-        )
-    else:
-        _, precursor_mzs, rts_orig = _sorted_metadata(spectra, already_sorted)
-        spec_tuples = []
-    n_spectra = len(precursor_mzs)
-
-    if n_spectra == 0:
-        return ClusterResult(np.empty(0, dtype=np.int32), [])
-    if n_spectra == 1:
-        labels_single = np.zeros(1, dtype=np.int32)
-        reps = (
-            [
-                ConsensusTuple.from_spectrum(
-                    spec_tuples[0], float(rts_orig[0]), 0
-                )
-            ]
-            if options.compute_representatives
-            else []
-        )
-        return ClusterResult(labels_single, reps)
-
-    clustering = options.clustering
-    owns_pdist = pdist is None
-    if pdist is None:
-        pdist = compute_condensed_distance_matrix(
-            spec_tuples,
-            clustering.fragment_tol,
-            clustering.min_matched_peaks,
-            temp_dir=options.temp_dir,
-        )
-    else:
-        expected_pairs = n_spectra * (n_spectra - 1) // 2
-        if pdist.ndim != 1 or pdist.shape[0] != expected_pairs:
-            raise ValueError(
-                f"pdist must be 1D of length {expected_pairs} for "
-                f"{n_spectra} spectra, got shape {pdist.shape}"
-            )
-    try:
-        labels = cut_linkage(
-            fastcluster.linkage(pdist, clustering.linkage),
-            clustering.distance_threshold,
-        )
-
-        refined_labels, label_order, n_clusters = refine_clusters(
-            labels,
-            precursor_mzs,
-            rts_orig,
-            clustering,
-            _MIN_CLUSTER_SAMPLES,
-        )
-
-        cluster_labels = np.empty(n_spectra, dtype=np.int32)
-        if not options.compute_representatives:
-            cluster_labels[label_order] = refined_labels
-            rep_spectra: list[ConsensusTuple] = []
-        elif n_clusters < n_spectra:
-            refined_order = np.argsort(refined_labels, kind="stable")
-            sorted_labels = refined_labels[refined_order]
-            order_map = label_order[refined_order]
-            rts_ref = rts_orig[order_map]
-            rep_spectra = get_representative_spectra(
-                spec_tuples,
-                sorted_labels,
-                rts_ref,
-                order_map,
-                options.consensus,
-                pdist=pdist,
-                min_mz=options.min_mz,
-                max_mz=options.max_mz,
-                fragment_tol=clustering.fragment_tol,
-            )
-            cluster_labels[order_map] = sorted_labels
-        else:
-            # Every spectrum became a singleton; refined_labels in
-            # label_order are 0..n_spectra-1, so iterating pos emits
-            # representatives ordered by ascending cluster_id.
-            cluster_labels[label_order] = refined_labels
-            rep_spectra = [
-                ConsensusTuple.from_spectrum(
-                    spec_tuples[int(idx)],
-                    float(rts_orig[int(idx)]),
-                    int(refined_labels[pos]),
-                )
-                for pos, idx in enumerate(label_order)
-            ]
-    finally:
-        # Release owned distance storage eagerly on large intervals.
-        if owns_pdist:
-            if isinstance(pdist, np.memmap):
-                close_memmap(pdist)
-            del pdist
-            if n_spectra > _GC_COLLECT_MIN_SPECTRA:
-                gc.collect()
-    return ClusterResult(cluster_labels, rep_spectra)
 
 
 def cluster_chunk(
@@ -460,6 +169,10 @@ def cluster_chunk(
 ) -> list[TaggedIntervalResult]:
     """
     Cluster all intervals in a worker chunk with batched Lance reads.
+
+    Reads Arrow tables directly from Lance and streams CSR peak buffers
+    into :func:`~falcon.cluster.interval.cluster_arrow_interval`,
+    omitting ``precursor_charge`` when representatives are disabled.
 
     Parameters
     ----------
@@ -480,7 +193,11 @@ def cluster_chunk(
     """
     if not chunk:
         return []
-    columns = list(SORTED_INTERVAL_COLUMNS)
+    columns = list(
+        SORTED_INTERVAL_COLUMNS
+        if options.compute_representatives
+        else _CHUNK_NO_REP_COLUMNS
+    )
 
     def _cluster_group(
         group: list[IntervalSpec],
@@ -488,24 +205,17 @@ def cluster_chunk(
         # Batch Lance reads across small intervals; `take` preserves
         # row_ids order (already canonical) so slices stay contiguous.
         group_row_ids = np.concatenate([spec.row_ids for spec in group])
-        group_spectra = dataset.take(
+        group_table = dataset.take(
             indices=pa.array(group_row_ids), columns=columns
-        ).to_pandas()
+        )
         out: list[TaggedIntervalResult] = []
         offset = 0
         for spec in group:
             n_rows = spec.n_spectra
-            interval_spectra = group_spectra.iloc[offset : offset + n_rows]
+            interval_table = group_table.slice(offset, n_rows)
             offset += n_rows
             out.append(
-                (
-                    spec.task_id,
-                    cluster_mz_interval(
-                        interval_spectra,
-                        options,
-                        already_sorted=True,
-                    ),
-                )
+                (spec.task_id, cluster_arrow_interval(interval_table, options))
             )
         return out
 
@@ -569,17 +279,12 @@ def finalize_giant(giant: GiantInterval) -> GiantDone:
         if giant.options.compute_representatives
         else list(_GIANT_METADATA_COLUMNS)
     )
-    spectra = giant.dataset.take(
+    table = giant.dataset.take(
         indices=pa.array(giant.spec.row_ids), columns=columns
-    ).to_pandas()
+    )
     pdist = np.lib.format.open_memmap(giant.memmap_path, mode="r")
     try:
-        result = cluster_mz_interval(
-            spectra,
-            giant.options,
-            pdist=pdist,
-            already_sorted=True,
-        )
+        result = cluster_arrow_interval(table, giant.options, pdist=pdist)
     finally:
         close_memmap(pdist)
     return GiantDone(
@@ -599,16 +304,17 @@ def finalize_bucket(
     """
     Assemble per-split results into bucket-wide labels and consensus.
 
-    Validates split coverage and computes cumulative label offsets in a
-    single sorted pass so labels and representatives are unique across
-    the bucket.
+    Validates split monotonicity, coverage, and per-interval label
+    lengths, then computes cumulative label offsets in a single sorted
+    pass so labels and representatives are unique across the bucket.
 
     Parameters
     ----------
     n : int
         Total number of spectra in the bucket.
     splits : Sequence[int] | np.ndarray
-        Interval split boundaries from ``prepare_bucket_chunks``.
+        Monotonic interval split boundaries from
+        ``prepare_bucket_chunks``.
     interval_results : Sequence[TaggedIntervalResult]
         Unordered ``(task_id, ClusterResult)`` split results.
     bucket_label : str
@@ -623,16 +329,23 @@ def finalize_bucket(
     Raises
     ------
     ValueError
-        If ``splits`` bounds do not match ``n`` or ``interval_results``
-        task IDs do not cover ``0..len(splits) - 2`` without gaps or
-        duplicates.
+        If ``splits`` is not 1D monotonic covering ``[0, n]``, if
+        ``interval_results`` task IDs do not cover ``0..len(splits)-2``,
+        or if any split has mismatched label length or negative labels.
     """
-    if len(splits) == 0 or int(splits[0]) != 0 or int(splits[-1]) != n:
+    splits_arr = np.asarray(splits, dtype=np.int64)
+    if (
+        splits_arr.ndim != 1
+        or splits_arr.size == 0
+        or int(splits_arr[0]) != 0
+        or int(splits_arr[-1]) != n
+        or bool(np.any(splits_arr[1:] < splits_arr[:-1]))
+    ):
         raise ValueError(
-            f"Invalid splits for n={n}: expected bounds starting at 0 "
-            f"and ending at {n}"
+            f"Invalid splits for n={n}: expected 1D monotonic bounds "
+            f"starting at 0 and ending at {n}"
         )
-    n_splits = len(splits) - 1
+    n_splits = int(splits_arr.size) - 1
     sorted_results = sorted(interval_results, key=lambda item: item[0])
     task_ids = [task_id for task_id, _ in sorted_results]
     if task_ids != list(range(n_splits)):
@@ -646,7 +359,17 @@ def finalize_bucket(
     current_offset = 0
 
     for task_id, interval_result in sorted_results:
-        start, stop = int(splits[task_id]), int(splits[task_id + 1])
+        start, stop = int(splits_arr[task_id]), int(splits_arr[task_id + 1])
+        expected_len = stop - start
+        if len(interval_result.labels) != expected_len:
+            raise ValueError(
+                f"Split {task_id} expected {expected_len} label(s), got "
+                f"{len(interval_result.labels)}"
+            )
+        if expected_len > 0 and int(np.min(interval_result.labels)) < 0:
+            raise ValueError(
+                f"Split {task_id} contains negative cluster labels"
+            )
         shifted, current_offset = offset_cluster_result(
             interval_result, current_offset
         )
@@ -661,7 +384,7 @@ def finalize_bucket(
         "Charge %s: %d spectra grouped in %d clusters, %d spectra remain "
         "as singletons",
         bucket_label,
-        int(counts[counts > 1].sum()),
+        n - n_singletons,
         n_clusters,
         n_singletons,
     )
@@ -677,7 +400,7 @@ def _run_pass1(
     n_workers: int,
     total_spectra: int,
 ) -> dict[int, list[TaggedIntervalResult]]:
-    """Run Pass 1 (giant tiles and normal chunks) with progress logs."""
+    """Run Pass 1 (giant tiles and normal chunks) in joint LPT order."""
     results_by_bucket: dict[int, list[TaggedIntervalResult]] = {}
     n_pass1 = len(chunk_tasks) + len(tile_tasks)
     if n_pass1 == 0:
@@ -699,18 +422,27 @@ def _run_pass1(
     )
     run_chunk = partial(_cluster_chunk_tagged, options=options)
 
+    # Sort combined Pass 1 tasks jointly by descending cost (LPT) so
+    # heavy chunks never queue behind light giant tiles.
+    pass1_tasks: list[tuple[float, ChunkTask | TileTask]] = [
+        *((tile.tile_cost, tile) for tile in tile_tasks),
+        *((float(task.cost), task) for task in chunk_tasks),
+    ]
+    pass1_tasks.sort(key=lambda item: item[0], reverse=True)
+
     def _jobs() -> Iterator[Any]:
-        for tile in tile_tasks:
-            yield joblib.delayed(tile_distance)(tile)
-        for task in chunk_tasks:
-            yield joblib.delayed(run_chunk)(task)
+        for _cost, work_item in pass1_tasks:
+            if isinstance(work_item, TileTask):
+                yield joblib.delayed(tile_distance)(work_item)
+            else:
+                yield joblib.delayed(run_chunk)(work_item)
 
     done_cost = 0.0
     done_spectra = 0.0
     next_log_pct = 5
     start = time.monotonic()
 
-    done_gen: Any = _parallel_pool(pool_workers)(_jobs())
+    done_gen: Any = loky_unordered_pool(pool_workers)(_jobs())
     with contextlib.closing(done_gen) as done_iter:
         for done_tasks, done in enumerate(done_iter, start=1):
             if isinstance(done, ChunkDone):
@@ -719,9 +451,14 @@ def _run_pass1(
                 )
                 done_cost += done.cost
                 done_spectra += done.n_spectra
-            else:
+            elif isinstance(done, TileDone):
                 done_cost += done.tile_cost
                 done_spectra += done.tile_spectra
+            else:
+                raise TypeError(
+                    f"Unexpected Pass 1 completion record: "
+                    f"{type(done).__name__}"
+                )
             pct = (
                 min(100.0, 100.0 * done_cost / total_cost)
                 if total_cost
@@ -749,81 +486,48 @@ def _run_pass1(
     return results_by_bucket
 
 
-def generate_clusters_multi(
+def _run_pass2(
+    giants: Sequence[GiantInterval],
+    memmap_store: GiantMemmapStore,
+    results_by_bucket: dict[int, list[TaggedIntervalResult]],
+    n_workers: int,
+) -> None:
+    """Run Pass 2 RAM-bounded giant finalization and release memmaps."""
+    if not giants:
+        return
+    pass2_workers = _pass2_worker_limit(giants, n_workers)
+    logger.info("Finalizing %d giant interval(s)...", len(giants))
+    finalize_ctx: contextlib.AbstractContextManager[Iterable[GiantDone]]
+    if len(giants) == 1 or pass2_workers <= 1:
+        finalize_ctx = contextlib.nullcontext(
+            finalize_giant(giant) for giant in giants
+        )
+    else:
+        finalize_gen: Any = loky_unordered_pool(pass2_workers)(
+            joblib.delayed(finalize_giant)(giant) for giant in giants
+        )
+        finalize_ctx = contextlib.closing(finalize_gen)
+    with finalize_ctx as finalize_results:
+        for done in finalize_results:
+            results_by_bucket.setdefault(done.bucket_id, []).append(
+                (done.task_id, done.result)
+            )
+            memmap_store.release(done.giant_idx)
+
+
+def _plan_buckets(
     bucket_datasets: Sequence[lance.LanceDataset],
+    labels_list: Sequence[str],
     clustering: ClusteringConfig,
-    consensus: ConsensusConfig | None = None,
-    *,
-    min_mz: float = DEFAULT_MIN_MZ,
-    max_mz: float = DEFAULT_MAX_MZ,
-    bucket_labels: Sequence[str] | None = None,
-    compute_representatives: bool = True,
-    temp_dir: os.PathLike[str] | str | None = None,
-) -> list[ClusterResult]:
-    """
-    Cluster multiple per-charge datasets in one shared worker pool.
-
-    All buckets' m/z-split tasks share a single ``joblib`` pool so idle
-    workers steal work across charge buckets rather than waiting at
-    per-bucket barriers.
-
-    Parameters
-    ----------
-    bucket_datasets : Sequence[lance.LanceDataset]
-        Per-charge Lance datasets to cluster.
-    clustering : ClusteringConfig
-        Validated clustering configuration.
-    consensus : ConsensusConfig | None, default=None
-        Validated consensus configuration (defaults to medoid).
-    min_mz, max_mz : float
-        Configured fragment m/z range for average consensus.
-    bucket_labels : Sequence[str] | None, default=None
-        Optional human-readable labels aligned with ``bucket_datasets``.
-    compute_representatives : bool, default=True
-        Whether to compute representative spectra for each cluster.
-    temp_dir : os.PathLike[str] | str | None, default=None
-        Optional directory for temporary distance memmaps; defaults to
-        Python's system temporary directory.
-
-    Returns
-    -------
-    list[ClusterResult]
-        Per-dataset ``ClusterResult(labels, representatives)`` results
-        in the same order as ``bucket_datasets``.
-    """
-    # Absolutize temp_dir so warm loky workers do not resolve relative
-    # paths against a stale working directory after os.chdir().
-    temp_dir_str = os.path.abspath(temp_dir) if temp_dir is not None else None
-    options = ClusteringOptions(
-        clustering=clustering,
-        consensus=(
-            MedoidConsensusConfig() if consensus is None else consensus
-        ),
-        min_mz=min_mz,
-        max_mz=max_mz,
-        compute_representatives=compute_representatives,
-        temp_dir=temp_dir_str,
-    )
-    labels_list = (
-        list(bucket_labels)
-        if bucket_labels is not None
-        else [
-            bucket_label_from_uri(ds.uri, str(i))
-            for i, ds in enumerate(bucket_datasets)
-        ]
-    )
-    logger.debug(
-        "Hierarchical clustering (linkage=%s, distance_threshold=%.4f, "
-        "min_samples=%d)",
-        clustering.linkage,
-        clustering.distance_threshold,
-        _MIN_CLUSTER_SAMPLES,
-    )
-
-    n_workers = effective_n_workers()
+    n_workers: int,
+) -> tuple[
+    list[BucketPlan],
+    list[ChunkTask],
+    list[tuple[int, lance.LanceDataset, IntervalSpec]],
+]:
+    """Build per-bucket plans, normal chunks, and giant specs."""
     num_chunks = CHUNKS_PER_WORKER * n_workers
-    threshold = _effective_tile_threshold(clustering.batch_size, n_workers)
-
+    threshold = effective_tile_threshold(clustering.batch_size, n_workers)
     plans: list[BucketPlan] = []
     chunk_tasks: list[ChunkTask] = []
     raw_giants: list[tuple[int, lance.LanceDataset, IntervalSpec]] = []
@@ -847,13 +551,99 @@ def generate_clusters_multi(
             )
         for spec in plan.giant_specs:
             raw_giants.append((bucket_id, dataset, spec))
+    return plans, chunk_tasks, raw_giants
 
-    # Schedule heaviest chunks first so small buckets backfill cleanly.
-    chunk_tasks.sort(key=lambda task: task.cost, reverse=True)
+
+def generate_clusters_multi(
+    bucket_datasets: Sequence[lance.LanceDataset],
+    clustering: ClusteringConfig,
+    consensus: ConsensusConfig | None = None,
+    *,
+    min_mz: float = DEFAULT_MIN_MZ,
+    max_mz: float = DEFAULT_MAX_MZ,
+    bucket_labels: Sequence[str] | None = None,
+    compute_representatives: bool = True,
+    temp_dir: PathLike | None = None,
+) -> list[ClusterResult]:
+    """
+    Cluster multiple per-charge datasets in one shared worker pool.
+
+    All buckets' m/z-split tasks share a single ``joblib`` pool so idle
+    workers steal work across charge buckets rather than waiting at
+    per-bucket barriers.
+
+    Parameters
+    ----------
+    bucket_datasets : Sequence[lance.LanceDataset]
+        Per-charge Lance datasets to cluster.
+    clustering : ClusteringConfig
+        Validated clustering configuration.
+    consensus : ConsensusConfig | None, default=None
+        Validated consensus configuration (defaults to medoid).
+    min_mz, max_mz : float
+        Configured fragment m/z range for average consensus.
+    bucket_labels : Sequence[str] | None, default=None
+        Optional human-readable labels aligned with ``bucket_datasets``.
+    compute_representatives : bool, default=True
+        Whether to compute representative spectra for each cluster.
+    temp_dir : PathLike | None, default=None
+        Optional directory for temporary distance memmaps; defaults to
+        Python's system temporary directory.
+
+    Returns
+    -------
+    list[ClusterResult]
+        Per-dataset ``ClusterResult(labels, representatives)`` results
+        in the same order as ``bucket_datasets``.
+
+    Raises
+    ------
+    ValueError
+        If ``bucket_labels`` is supplied with a length different from
+        ``bucket_datasets``.
+    """
+    if bucket_labels is not None:
+        labels_list = list(bucket_labels)
+        if len(labels_list) != len(bucket_datasets):
+            raise ValueError(
+                f"bucket_labels length ({len(labels_list)}) must match "
+                f"bucket_datasets length ({len(bucket_datasets)})"
+            )
+    else:
+        labels_list = [
+            bucket_label_from_uri(ds.uri, str(i))
+            for i, ds in enumerate(bucket_datasets)
+        ]
+
+    # Absolutize temp_dir so warm loky workers do not resolve relative
+    # paths against a stale working directory after os.chdir().
+    temp_dir_str = os.path.abspath(temp_dir) if temp_dir is not None else None
+    options = ClusteringOptions(
+        clustering=clustering,
+        consensus=(
+            MedoidConsensusConfig() if consensus is None else consensus
+        ),
+        min_mz=min_mz,
+        max_mz=max_mz,
+        compute_representatives=compute_representatives,
+        temp_dir=temp_dir_str,
+    )
+    logger.debug(
+        "Hierarchical clustering (linkage=%s, distance_threshold=%.4f, "
+        "min_samples=%d)",
+        clustering.linkage,
+        clustering.distance_threshold,
+        MIN_CLUSTER_SAMPLES,
+    )
+
+    n_workers = effective_n_workers()
+    plans, chunk_tasks, raw_giants = _plan_buckets(
+        bucket_datasets, labels_list, clustering, n_workers
+    )
 
     with GiantMemmapStore(temp_dir=temp_dir_str) as memmap_store:
         memmap_paths, tile_tasks = allocate_giant_tiles(
-            raw_giants,
+            [(dataset, spec) for _bucket_id, dataset, spec in raw_giants],
             clustering.fragment_tol,
             clustering.min_matched_peaks,
             n_workers,
@@ -872,8 +662,7 @@ def generate_clusters_multi(
                 zip(raw_giants, memmap_paths, strict=True)
             )
         ]
-        # LPT ordering for giant tiles and Pass 2 giant finalization.
-        tile_tasks.sort(key=lambda tile: tile.tile_cost, reverse=True)
+        # LPT ordering for Pass 2 giant finalization.
         giants.sort(key=lambda giant: giant.spec.cost, reverse=True)
 
         total_spectra = sum(plan.n_spectra for plan in plans)
@@ -885,28 +674,7 @@ def generate_clusters_multi(
             n_workers=n_workers,
             total_spectra=total_spectra,
         )
-
-        if giants:
-            pass2_workers = _pass2_worker_limit(giants, n_workers)
-            logger.info("Finalizing %d giant interval(s)...", len(giants))
-            finalize_ctx: contextlib.AbstractContextManager[
-                Iterable[GiantDone]
-            ]
-            if len(giants) == 1 or pass2_workers <= 1:
-                finalize_ctx = contextlib.nullcontext(
-                    finalize_giant(giant) for giant in giants
-                )
-            else:
-                finalize_gen: Any = _parallel_pool(pass2_workers)(
-                    joblib.delayed(finalize_giant)(giant) for giant in giants
-                )
-                finalize_ctx = contextlib.closing(finalize_gen)
-            with finalize_ctx as finalize_results:
-                for done in finalize_results:
-                    results_by_bucket.setdefault(done.bucket_id, []).append(
-                        (done.task_id, done.result)
-                    )
-                    memmap_store.release(done.giant_idx)
+        _run_pass2(giants, memmap_store, results_by_bucket, n_workers)
 
     return [
         finalize_bucket(
@@ -928,7 +696,7 @@ def generate_clusters(
     max_mz: float = DEFAULT_MAX_MZ,
     bucket_label: str | None = None,
     compute_representatives: bool = True,
-    temp_dir: os.PathLike[str] | str | None = None,
+    temp_dir: PathLike | None = None,
 ) -> ClusterResult:
     """
     Cluster spectra in one Lance dataset via hierarchical clustering.
@@ -947,7 +715,7 @@ def generate_clusters(
         Optional charge label for logging.
     compute_representatives : bool, default=True
         Whether to compute representative spectra.
-    temp_dir : os.PathLike[str] | str | None, default=None
+    temp_dir : PathLike | None, default=None
         Optional directory for temporary distance memmaps; defaults to
         Python's system temporary directory.
 

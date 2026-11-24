@@ -22,16 +22,18 @@ from .config import (
     LinkageMethod,
     MedoidConsensusConfig,
     PrecursorTolerance,
+    PrecursorTolMode,
     PreprocessingConfig,
     ScalingMethod,
     build_json_schema,
     format_toml,
     load_config,
     load_settings,
+    sentinel_for_field,
+    validate_file_path,
     write_saved_config,
 )
-from .config.models import validate_file_path
-from .types import AUTO_SENTINEL, NONE_SENTINEL
+from .types import AUTO_SENTINEL, NONE_SENTINEL, OTHER_BUCKET, UNKNOWN_CHARGE
 from .utils import configure_logger
 
 if TYPE_CHECKING:
@@ -56,6 +58,7 @@ __all__ = [
 
 _T = TypeVar("_T")
 
+_PRECURSOR_TOL_MODES: tuple[str, ...] = get_args(PrecursorTolMode)
 _SCALING_CHOICES: tuple[str, ...] = get_args(ScalingMethod)
 _LINKAGE_CHOICES: tuple[str, ...] = get_args(LinkageMethod)
 _CONSENSUS_CHOICES: tuple[str, ...] = get_args(ConsensusMethod)
@@ -123,19 +126,23 @@ def _add_field_arg(
     group: argparse._ArgumentGroup,
     model: type[BaseModel],
     field: str,
-    help_text: str,
+    help_text: str | None = None,
     *,
     flag: str | None = None,
-    none_label: str = NONE_SENTINEL,
     **kwargs: Any,
 ) -> None:
-    """Register one model-backed CLI flag with a synced default note."""
-    default = model.model_fields[field].default
-    default_str = none_label if default is None else str(default)
+    """Register one model-backed CLI flag with synced help/default."""
+    field_info = model.model_fields[field]
+    default = field_info.default
+    if default is None:
+        default_str = sentinel_for_field(field_info) or NONE_SENTINEL
+    else:
+        default_str = str(default)
+    text = field_info.description if help_text is None else help_text
     option = flag if flag is not None else f"--{field.replace('_', '-')}"
     group.add_argument(
         option,
-        help=f"{help_text} (default: {default_str}).",
+        help=f"{text} (default: {default_str}).",
         **kwargs,
     )
 
@@ -163,7 +170,7 @@ def _cli_float(raw: str) -> float:
 def _cli_save_path(raw: str) -> Path:
     """Validate raw ``--save-config`` path strings before ``Path()``."""
     try:
-        return validate_file_path(raw, label="config output path")
+        return validate_file_path(raw, label="Config output path")
     except ValueError as exc:
         raise argparse.ArgumentTypeError(str(exc)) from exc
 
@@ -198,8 +205,8 @@ def _parse_cli_charge_buckets(
 
     buckets: list[list[int | str] | str] = []
     for raw in stripped:
-        if raw == "other":
-            buckets.append("other")
+        if raw == OTHER_BUCKET:
+            buckets.append(OTHER_BUCKET)
             continue
         inner = raw
         has_open = inner.startswith("[")
@@ -216,15 +223,15 @@ def _parse_cli_charge_buckets(
             part_clean = part.strip()
             if not part_clean:
                 raise ConfigError(f"Empty charge entry in bucket {raw!r}")
-            if part_clean == "unknown":
-                bucket.append("unknown")
+            if part_clean == UNKNOWN_CHARGE:
+                bucket.append(UNKNOWN_CHARGE)
             else:
                 try:
                     bucket.append(int(part_clean))
                 except ValueError as exc:
                     raise ConfigError(
                         f"Invalid charge value {part_clean!r} in bucket "
-                        f"{raw!r} (expected integer or 'unknown')"
+                        f"{raw!r} (expected integer or '{UNKNOWN_CHARGE}')"
                     ) from exc
         buckets.append(bucket)
     return buckets
@@ -308,22 +315,18 @@ def _add_io_args(parser: argparse.ArgumentParser) -> None:
         group,
         IOConfig,
         "work_dir",
-        f"Working directory for Lance staging cache, or '{NONE_SENTINEL}' "
-        "for a temporary directory",
         metavar=f"DIR|{NONE_SENTINEL}",
     )
     _add_field_arg(
         group,
         IOConfig,
         "overwrite",
-        "Overwrite existing results and cached staging files",
         action=argparse.BooleanOptionalAction,
     )
     _add_field_arg(
         group,
         IOConfig,
         "export_representatives",
-        "Export cluster representative spectra to an MGF file",
         action=argparse.BooleanOptionalAction,
     )
 
@@ -331,55 +334,24 @@ def _add_io_args(parser: argparse.ArgumentParser) -> None:
 def _add_preprocessing_args(parser: argparse.ArgumentParser) -> None:
     """Register spectrum preprocessing flags."""
     group = parser.add_argument_group("Preprocessing")
-    _add_field_arg(
-        group,
-        PreprocessingConfig,
-        "min_peaks",
-        "Minimum number of peaks per spectrum",
-        type=_cli_int,
-    )
-    _add_field_arg(
-        group,
-        PreprocessingConfig,
-        "min_mz_range",
-        "Minimum fragment m/z span per spectrum",
-        type=_cli_float,
-    )
-    _add_field_arg(
-        group,
-        PreprocessingConfig,
-        "min_mz",
-        "Minimum peak m/z inclusive",
-        type=_cli_float,
-    )
-    _add_field_arg(
-        group,
-        PreprocessingConfig,
-        "max_mz",
-        "Maximum peak m/z inclusive",
-        type=_cli_float,
-    )
+    _add_field_arg(group, PreprocessingConfig, "min_peaks", type=_cli_int)
+    _add_field_arg(group, PreprocessingConfig, "min_mz_range", type=_cli_float)
+    _add_field_arg(group, PreprocessingConfig, "min_mz", type=_cli_float)
+    _add_field_arg(group, PreprocessingConfig, "max_mz", type=_cli_float)
     _add_field_arg(
         group,
         PreprocessingConfig,
         "remove_precursor_tol",
-        f"Window (Da) around precursor m/z to remove peaks, or "
-        f"'{NONE_SENTINEL}' to disable",
         type=_cli_optional_float,
         metavar=f"DA|{NONE_SENTINEL}",
     )
     _add_field_arg(
-        group,
-        PreprocessingConfig,
-        "min_intensity",
-        "Minimum peak intensity relative to base peak in [0, 1)",
-        type=_cli_float,
+        group, PreprocessingConfig, "min_intensity", type=_cli_float
     )
     _add_field_arg(
         group,
         PreprocessingConfig,
         "max_peaks_used",
-        f"Maximum most-intense peaks to retain, or '{NONE_SENTINEL}' for all",
         type=_cli_optional_int,
         metavar=f"N|{NONE_SENTINEL}",
     )
@@ -387,7 +359,6 @@ def _add_preprocessing_args(parser: argparse.ArgumentParser) -> None:
         group,
         PreprocessingConfig,
         "scaling",
-        "Peak intensity scaling method",
         choices=_SCALING_CHOICES,
     )
 
@@ -396,13 +367,14 @@ def _add_clustering_args(parser: argparse.ArgumentParser) -> None:
     """Register spectrum comparison and clustering flags."""
     tol_mass = PrecursorTolerance.model_fields["mass"].default
     tol_mode = PrecursorTolerance.model_fields["mode"].default
+    modes_desc = " or ".join(f'"{m}"' for m in _PRECURSOR_TOL_MODES)
     group = parser.add_argument_group("Clustering")
     group.add_argument(
         "--precursor-tol",
         nargs=2,
         metavar=("MASS", "MODE"),
         help=(
-            'Precursor mass tolerance and unit ("ppm" or "Da", '
+            f"Precursor mass tolerance and unit ({modes_desc}, "
             f"default: {tol_mass:g} {tol_mode})."
         ),
     )
@@ -410,52 +382,24 @@ def _add_clustering_args(parser: argparse.ArgumentParser) -> None:
         group,
         ClusteringConfig,
         "rt_tol",
-        f"Retention time tolerance, or '{NONE_SENTINEL}' to disable",
         type=_cli_optional_float,
         metavar=f"TOL|{NONE_SENTINEL}",
     )
+    _add_field_arg(group, ClusteringConfig, "fragment_tol", type=_cli_float)
     _add_field_arg(
-        group,
-        ClusteringConfig,
-        "fragment_tol",
-        "Fragment mass tolerance in m/z",
-        type=_cli_float,
+        group, ClusteringConfig, "linkage", choices=_LINKAGE_CHOICES
     )
     _add_field_arg(
-        group,
-        ClusteringConfig,
-        "linkage",
-        "Hierarchical clustering linkage criterion",
-        choices=_LINKAGE_CHOICES,
+        group, ClusteringConfig, "distance_threshold", type=_cli_float
     )
-    _add_field_arg(
-        group,
-        ClusteringConfig,
-        "distance_threshold",
-        "Cosine distance threshold in (0, 1)",
-        type=_cli_float,
-    )
-    _add_field_arg(
-        group,
-        ClusteringConfig,
-        "min_matched_peaks",
-        "Minimum matched fragment peaks",
-        type=_cli_int,
-    )
-    _add_field_arg(
-        group,
-        ClusteringConfig,
-        "batch_size",
-        "Maximum spectra per precursor m/z batch",
-        type=_cli_int,
-    )
+    _add_field_arg(group, ClusteringConfig, "min_matched_peaks", type=_cli_int)
+    _add_field_arg(group, ClusteringConfig, "batch_size", type=_cli_int)
     _add_field_arg(
         group,
         ClusteringConfig,
         "precursor_charge_buckets",
         "Charge buckets such as '[1]' '[2, 3]' unknown other, or "
         f"'{AUTO_SENTINEL}' to cluster each observed charge separately",
-        none_label=AUTO_SENTINEL,
         nargs="+",
         metavar="BUCKET",
     )
@@ -468,7 +412,6 @@ def _add_consensus_args(parser: argparse.ArgumentParser) -> None:
         group,
         MedoidConsensusConfig,
         "method",
-        "Representative spectrum method",
         flag="--consensus-method",
         choices=_CONSENSUS_CHOICES,
     )
@@ -476,16 +419,12 @@ def _add_consensus_args(parser: argparse.ArgumentParser) -> None:
         group,
         AverageConsensusConfig,
         "outlier_cutoff_lower",
-        "Lower sigma cutoff for consensus averaging (only valid when "
-        "consensus.method = 'average')",
         type=_cli_float,
     )
     _add_field_arg(
         group,
         AverageConsensusConfig,
         "outlier_cutoff_upper",
-        "Upper sigma cutoff for consensus averaging (only valid when "
-        "consensus.method = 'average')",
         type=_cli_float,
     )
 
@@ -564,13 +503,13 @@ def format_validation_error(exc: ValidationError) -> str:
     return "\n".join(lines)
 
 
-def _extract_cli_overrides(ns: dict[str, Any]) -> dict[str, Any]:
-    """Build a sparse nested override dict from parsed CLI args."""
-    io_ov = {k: ns[k] for k in _IO_DIRECT_KEYS if k in ns}
-    prep_ov = {k: ns[k] for k in _PREP_KEYS if k in ns}
-    clust_ov = {k: ns[k] for k in _CLUST_DIRECT_KEYS if k in ns}
-    cons_ov = {k: ns[k] for k in _AVG_CUTOFF_KEYS if k in ns}
+def _pick_keys(ns: dict[str, Any], keys: Sequence[str]) -> dict[str, Any]:
+    """Extract present CLI keys from ``ns`` into an override dict."""
+    return {k: ns[k] for k in keys if k in ns}
 
+
+def _apply_positional_paths(ns: dict[str, Any], io_ov: dict[str, Any]) -> None:
+    """Validate and apply positional paths into ``io_ov``."""
     paths: list[str] = ns.get("paths", [])
     has_named_io = "input_filenames" in ns or "output_filename" in ns
     if paths and has_named_io:
@@ -586,6 +525,16 @@ def _extract_cli_overrides(ns: dict[str, Any]) -> dict[str, Any]:
     if len(paths) >= 2:
         io_ov["input_filenames"] = paths[:-1]
         io_ov["output_filename"] = paths[-1]
+
+
+def _extract_cli_overrides(ns: dict[str, Any]) -> dict[str, Any]:
+    """Build a sparse nested override dict from parsed CLI args."""
+    io_ov = _pick_keys(ns, _IO_DIRECT_KEYS)
+    prep_ov = _pick_keys(ns, _PREP_KEYS)
+    clust_ov = _pick_keys(ns, _CLUST_DIRECT_KEYS)
+    cons_ov = _pick_keys(ns, _AVG_CUTOFF_KEYS)
+
+    _apply_positional_paths(ns, io_ov)
 
     if "precursor_tol" in ns:
         raw_mass, raw_mode = ns["precursor_tol"]

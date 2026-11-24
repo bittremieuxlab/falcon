@@ -8,7 +8,9 @@ lazily when called.
 
 from __future__ import annotations
 
+import functools
 import math
+import os
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypedDict
 
 if TYPE_CHECKING:
@@ -18,23 +20,47 @@ INT8_MIN = -128
 INT8_MAX = 127
 INT32_MAX = 2**31 - 1
 
+DEFAULT_MIN_MZ: float = 101.0
+DEFAULT_MAX_MZ: float = 1500.0
+DEFAULT_OUTLIER_CUTOFF_LOWER: float = 1.5
+DEFAULT_OUTLIER_CUTOFF_UPPER: float = 1.5
+
 NONE_SENTINEL = "none"
 AUTO_SENTINEL = "auto"
+UNKNOWN_CHARGE: Literal["unknown"] = "unknown"
+OTHER_BUCKET: Literal["other"] = "other"
 
+PrecursorTolMode = Literal["ppm", "Da"]
+ScalingMethod = Literal["off", "root", "log", "rank"]
+LinkageMethod = Literal["single", "complete", "average"]
+ConsensusMethod = Literal["medoid", "average"]
+
+PathLike = str | os.PathLike[str]
 ChargeValue = int | Literal["unknown"]
 ChargeBucket = tuple[ChargeValue, ...] | Literal["other"]
 
 __all__ = [
     "AUTO_SENTINEL",
+    "DEFAULT_MAX_MZ",
+    "DEFAULT_MIN_MZ",
+    "DEFAULT_OUTLIER_CUTOFF_LOWER",
+    "DEFAULT_OUTLIER_CUTOFF_UPPER",
     "INT8_MAX",
     "INT8_MIN",
     "INT32_MAX",
     "NONE_SENTINEL",
+    "OTHER_BUCKET",
+    "UNKNOWN_CHARGE",
     "ChargeBucket",
     "ChargeValue",
     "ClusterResult",
+    "ConsensusMethod",
     "ConsensusTuple",
+    "LinkageMethod",
+    "PathLike",
+    "PrecursorTolMode",
     "ProcessedSpectrum",
+    "ScalingMethod",
     "SpectrumTuple",
     "charge_sort_key",
     "make_consensus_tuple",
@@ -43,6 +69,14 @@ __all__ = [
     "parse_charge_bucket_list",
     "parse_optional_charge_buckets",
 ]
+
+
+@functools.lru_cache(maxsize=1)
+def _numpy() -> Any:
+    """Lazily import and cache ``numpy`` on first array-helper call."""
+    import numpy as np
+
+    return np
 
 
 class ProcessedSpectrum(TypedDict):
@@ -150,7 +184,7 @@ def make_consensus_tuple(
     ConsensusTuple
         Typed representative spectrum record.
     """
-    import numpy as np
+    np = _numpy()
 
     if precursor_charge is None or not math.isfinite(float(precursor_charge)):
         norm_charge: np.int32 | float = np.nan
@@ -159,8 +193,8 @@ def make_consensus_tuple(
     return ConsensusTuple(
         precursor_mz=np.float32(precursor_mz),
         precursor_charge=norm_charge,
-        mz=np.asarray(mz, dtype=np.float32),
-        intensity=np.asarray(intensity, dtype=np.float32),
+        mz=np.array(mz, dtype=np.float32, copy=True),
+        intensity=np.array(intensity, dtype=np.float32, copy=True),
         retention_time=np.float32(retention_time),
         cluster_id=np.int32(cluster_id),
     )
@@ -193,7 +227,7 @@ def offset_cluster_result(
         Shifted ``ClusterResult`` and the next available global label
         offset (``max(shifted_labels) + 1``, or ``offset`` if empty).
     """
-    import numpy as np
+    np = _numpy()
 
     if len(result.labels) == 0:
         return ClusterResult(np.empty(0, dtype=np.int32), []), offset
@@ -248,8 +282,8 @@ def _parse_single_charge_bucket(
                 "Charge bucket entries must be integers or 'unknown', "
                 "not booleans"
             )
-        if elem == "unknown":
-            parsed: ChargeValue = "unknown"
+        if elem == UNKNOWN_CHARGE:
+            parsed: ChargeValue = UNKNOWN_CHARGE
         elif isinstance(elem, int):
             if not (INT8_MIN <= elem <= INT8_MAX):
                 raise ValueError(
@@ -311,13 +345,13 @@ def parse_charge_bucket_list(value: Any) -> tuple[ChargeBucket, ...]:
     seen_values: set[ChargeValue] = set()
     seen_other = False
     for raw_bucket in value:
-        if raw_bucket == "other":
+        if raw_bucket == OTHER_BUCKET:
             if seen_other:
                 raise ValueError(
                     "Charge bucket 'other' appears more than once"
                 )
             seen_other = True
-            buckets.append("other")
+            buckets.append(OTHER_BUCKET)
             continue
         buckets.append(_parse_single_charge_bucket(raw_bucket, seen_values))
 

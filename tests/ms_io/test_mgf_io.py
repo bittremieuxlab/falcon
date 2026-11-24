@@ -3,12 +3,23 @@
 import io
 import logging
 import math
+import warnings
 
 import numpy as np
 import pyteomics.mgf
 import pytest
 
 from falcon.ms_io import mgf_io
+
+
+def _mgf_entry(params, mz=(100.0, 200.0), intensity=(50.0, 100.0)):
+    """Build a minimal Pyteomics-style MGF spectrum dict."""
+    return {
+        "params": {"pepmass": (500.0, None), **params},
+        "m/z array": np.asarray(mz, dtype=np.float32),
+        "intensity array": np.asarray(intensity, dtype=np.float32),
+    }
+
 
 # ----------------------------------------------------------------------
 # Reading MGF spectra and identifier construction
@@ -90,10 +101,52 @@ class TestMgfRead:
         assert spectra[1].retention_time is not None
         assert math.isnan(spectra[1].retention_time)
 
-    def test_parse_retention_time_edge_tuples(self):
-        assert mgf_io._parse_retention_time((42.5,)) == pytest.approx(42.5)
-        assert math.isnan(mgf_io._parse_retention_time(()))
-        assert math.isnan(mgf_io._parse_retention_time("   "))
+    def test_rtinseconds_edge_tuples_and_infinite_range(
+        self, monkeypatch, fake_reader_factory
+    ):
+        entries = [
+            _mgf_entry({"scans": "1", "rtinseconds": (42.5,)}),
+            _mgf_entry({"scans": "2", "rtinseconds": ()}),
+            _mgf_entry({"scans": "3", "rtinseconds": "   "}),
+            _mgf_entry(
+                {"scans": "4", "rtinseconds": (float("inf"), float("-inf"))}
+            ),
+        ]
+        monkeypatch.setattr(pyteomics.mgf, "MGF", fake_reader_factory(entries))
+        spectra = list(mgf_io.get_spectra("rt_edges.mgf"))
+        assert [s.identifier for s in spectra] == [
+            "rt_edges:scan:1",
+            "rt_edges:scan:2",
+            "rt_edges:scan:3",
+        ]
+        assert spectra[0].retention_time == pytest.approx(42.5)
+        assert math.isnan(spectra[1].retention_time)
+        assert math.isnan(spectra[2].retention_time)
+
+    def test_malformed_and_blank_charge_values_handled_cleanly(
+        self, monkeypatch, caplog, fake_reader_factory
+    ):
+        entries = [
+            _mgf_entry({"scans": "1", "charge": [None]}),
+            _mgf_entry({"scans": "2", "charge": [""]}),
+            _mgf_entry({"scans": "3", "charge": "2-"}),
+            _mgf_entry({"scans": "4", "charge": [2]}),
+        ]
+        monkeypatch.setattr(pyteomics.mgf, "MGF", fake_reader_factory(entries))
+        with caplog.at_level(logging.DEBUG, logger="falcon.ms_io.mgf_io"):
+            spectra = list(mgf_io.get_spectra("charges.mgf"))
+        assert [s.identifier for s in spectra] == [
+            "charges:scan:1",
+            "charges:scan:2",
+            "charges:scan:4",
+        ]
+        assert spectra[0].precursor_charge is None
+        assert spectra[1].precursor_charge is None
+        assert spectra[2].precursor_charge == 2
+        assert any(
+            rec.levelno == logging.DEBUG and "charges:scan:3" in rec.message
+            for rec in caplog.records
+        )
 
     def test_negative_charge(self, tmp_path, mgf_block, mgf_writer):
         mgf = mgf_writer(
@@ -212,7 +265,9 @@ class TestMgfRead:
             "prec:index:2",
         ]
 
-    def test_blank_scans_and_zero_scan_resolution(self, tmp_path):
+    def test_blank_scans_and_zero_scan_resolution(
+        self, tmp_path, monkeypatch, fake_reader_factory
+    ):
         mgf = tmp_path / "scans_edge.mgf"
         mgf.write_text(
             "BEGIN IONS\n"
@@ -241,9 +296,14 @@ class TestMgfRead:
             "scans_edge:scan:0",
         ]
         # Numeric 0 in params dict is also preserved.
-        assert (
-            mgf_io._resolve_identifier({"scans": 0}, "run", 5) == "run:scan:0"
+        monkeypatch.setattr(
+            pyteomics.mgf,
+            "MGF",
+            fake_reader_factory([_mgf_entry({"scans": 0})]),
         )
+        assert [s.identifier for s in mgf_io.get_spectra("run.mgf")] == [
+            "run:scan:0"
+        ]
 
     def test_filename_param_overrides_disk_stem_unless_empty_stem(
         self, tmp_path
@@ -445,18 +505,22 @@ class TestMgfRead:
 
 
 class TestMgfWriteAndRoundtrip:
-    def test_format_spectrum_full_fields_and_sequential_scans(
-        self, consensus_factory
+    def test_write_spectra_full_fields_and_sequential_scans(
+        self, tmp_path, consensus_factory
     ):
-        pos_block = mgf_io._format_spectrum(
-            consensus_factory(cluster_id=10, charge=2), scan_nr=1
+        out = tmp_path / "out.mgf"
+        mgf_io.write_spectra(
+            out,
+            [
+                consensus_factory(cluster_id=10, charge=2),
+                consensus_factory(cluster_id=25, charge=-1),
+                consensus_factory(cluster_id=30, charge=0),
+            ],
         )
-        neg_block = mgf_io._format_spectrum(
-            consensus_factory(cluster_id=25, charge=-1), scan_nr=2
-        )
-        zero_block = mgf_io._format_spectrum(
-            consensus_factory(cluster_id=30, charge=0), scan_nr=3
-        )
+        text = out.read_text(encoding="utf-8")
+        blocks = [b + "END IONS\n\n" for b in text.split("END IONS\n\n") if b]
+        assert len(blocks) == 3
+        pos_block, neg_block, zero_block = blocks
         assert pos_block == (
             "BEGIN IONS\n"
             "TITLE=falcon:cluster:10\n"
@@ -473,28 +537,26 @@ class TestMgfWriteAndRoundtrip:
         assert "CHARGE=1-\n" in neg_block
         assert "SCANS=2\n" in neg_block
         assert "CHARGE=0+\n" in zero_block
+        assert "SCANS=3\n" in zero_block
 
-        # Verify direct output parses cleanly with pyteomics.mgf.read.
-        parsed = list(
-            pyteomics.mgf.read(
-                io.StringIO(pos_block + neg_block + zero_block),
-                use_index=False,
-            )
-        )
+        # Verify serialized MGF parses cleanly with pyteomics.mgf.read.
+        parsed = list(pyteomics.mgf.read(str(out), use_index=False))
         assert [int(p["params"]["charge"][0]) for p in parsed] == [2, -1, 0]
 
     @pytest.mark.parametrize(
         "missing_charge", [np.nan, None, float("inf"), float("-inf")]
     )
     def test_missing_or_non_finite_charge_omitted(
-        self, missing_charge, consensus_factory
+        self, tmp_path, missing_charge, consensus_factory
     ):
         spec = consensus_factory(charge=2)._replace(
             precursor_charge=missing_charge
         )
-        block = mgf_io._format_spectrum(spec, scan_nr=1)
-        assert "CHARGE=" not in block
-        assert "RTINSECONDS=120.0\n" in block
+        out = tmp_path / "out.mgf"
+        mgf_io.write_spectra(out, [spec])
+        text = out.read_text(encoding="utf-8")
+        assert "CHARGE=" not in text
+        assert "RTINSECONDS=120.0\n" in text
 
     @pytest.mark.parametrize(
         "missing_rt",
@@ -506,12 +568,26 @@ class TestMgfWriteAndRoundtrip:
         ],
     )
     def test_missing_or_non_finite_rt_omitted(
-        self, missing_rt, consensus_factory
+        self, tmp_path, missing_rt, consensus_factory
     ):
         spec = consensus_factory(rt=120.0)._replace(retention_time=missing_rt)
-        block = mgf_io._format_spectrum(spec, scan_nr=1)
-        assert "RTINSECONDS=" not in block
-        assert "CHARGE=2+\n" in block
+        out = tmp_path / "out.mgf"
+        mgf_io.write_spectra(out, [spec])
+        text = out.read_text(encoding="utf-8")
+        assert "RTINSECONDS=" not in text
+        assert "CHARGE=2+\n" in text
+
+    @pytest.mark.parametrize(
+        "bad_precursor_mz", [float("nan"), float("inf"), float("-inf")]
+    )
+    def test_non_finite_precursor_mz_raises_value_error(
+        self, tmp_path, bad_precursor_mz, consensus_factory
+    ):
+        spec = consensus_factory()._replace(precursor_mz=bad_precursor_mz)
+        with pytest.raises(
+            ValueError, match="Representative precursor_mz must be finite"
+        ):
+            mgf_io.write_spectra(tmp_path / "bad.mgf", [spec])
 
     def test_roundtrip_positive_negative_and_missing_metadata(
         self, tmp_path, consensus_factory
@@ -586,18 +662,29 @@ class TestScaleIntensities:
     def test_scales_base_peak_to_1000_preserving_ratios(self):
         intensity = np.array([0.5, 1.0, 0.25], dtype=np.float32)
         scaled = mgf_io._scale_intensities(intensity)
-        np.testing.assert_allclose(
-            scaled, np.array([500.0, 1000.0, 250.0], dtype=np.float32)
-        )
+        assert scaled.dtype == np.float64
+        np.testing.assert_allclose(scaled, [500.0, 1000.0, 250.0])
 
     def test_small_positive_float32_intensities_do_not_overflow(self):
         intensity = np.array([0.5e-37, 1.0e-37, 0.0], dtype=np.float32)
-        scaled = mgf_io._scale_intensities(intensity)
-        assert scaled.dtype == np.float32
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            scaled = mgf_io._scale_intensities(intensity)
+        assert scaled.dtype == np.float64
         assert np.all(np.isfinite(scaled))
-        np.testing.assert_allclose(
-            scaled, np.array([500.0, 1000.0, 0.0], dtype=np.float32)
-        )
+        np.testing.assert_allclose(scaled, [500.0, 1000.0, 0.0])
+
+    @pytest.mark.parametrize("scale", [1e100, 1e-100, 1e306, 1e-306])
+    def test_extreme_float64_intensities_avoid_overflow_and_underflow(
+        self, scale
+    ):
+        intensity = np.array([0.5 * scale, 1.0 * scale, 0.0], dtype=np.float64)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            scaled = mgf_io._scale_intensities(intensity)
+        assert scaled.dtype == np.float64
+        assert np.all(np.isfinite(scaled))
+        np.testing.assert_allclose(scaled, [500.0, 1000.0, 0.0])
 
     def test_empty_non_positive_and_non_finite_arrays_unchanged(self):
         empty = np.array([], dtype=np.float32)

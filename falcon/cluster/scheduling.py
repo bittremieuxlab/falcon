@@ -4,21 +4,23 @@ from __future__ import annotations
 
 import heapq
 import logging
+import math
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, get_args
 
 import numba as nb
 import numba.typed
 import numpy as np
 
 from ..dataset import CANONICAL_SORT_COLUMNS, read_canonical_metadata
+from ..types import PrecursorTolMode
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
     import lance
 
-    from ..config.models import ClusteringConfig
+    from ..config import ClusteringConfig
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +34,7 @@ CHUNKS_PER_WORKER = 8
 # amortizes its Lance read over enough cosine distance work.
 MIN_PAIRS_PER_TILE = 4_000_000
 
-_VALID_PRECURSOR_TOL_MODES = frozenset({"Da", "ppm"})
+_VALID_PRECURSOR_TOL_MODES = frozenset(get_args(PrecursorTolMode))
 
 __all__ = [
     "CHUNKS_PER_WORKER",
@@ -40,6 +42,7 @@ __all__ = [
     "BucketPlan",
     "IntervalSpec",
     "cost_based_chunking",
+    "effective_tile_threshold",
     "interval_row_bounds",
     "plan_tile_bounds",
     "precursor_mz_splits",
@@ -102,6 +105,30 @@ def tile_threshold(batch_size: int) -> int:
     if batch_size < 1:
         raise ValueError(f"batch_size must be at least 1, got {batch_size}")
     return max(2, batch_size // 2)
+
+
+def effective_tile_threshold(batch_size: int, n_workers: int) -> int:
+    """
+    Return the minimum interval size that splits into at least 2 tiles.
+
+    Parameters
+    ----------
+    batch_size : int
+        Configured maximum interval size (must be at least 1).
+    n_workers : int
+        Available parallel worker count.
+
+    Returns
+    -------
+    int
+        Minimum spectrum count that justifies tiled distance work
+        (``batch_size + 1`` when ``n_workers <= 1`` to disable tiling).
+    """
+    if n_workers <= 1:
+        return batch_size + 1
+    # Exact smallest n with n * (n - 1) // 2 >= 2 * MIN_PAIRS_PER_TILE.
+    min_two_tile = (math.isqrt(16 * MIN_PAIRS_PER_TILE) + 3) // 2
+    return max(tile_threshold(batch_size), min_two_tile)
 
 
 @nb.njit(cache=True)

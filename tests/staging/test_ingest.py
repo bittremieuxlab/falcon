@@ -5,7 +5,6 @@ import json
 import logging
 import threading
 
-import joblib
 import lance
 import numpy as np
 import pyarrow as pa
@@ -23,13 +22,6 @@ from tests.helpers import LOW_QUALITY_PEAKS, TOY_PEAKS_5
 _TOY_PROC = functools.partial(
     preprocessing.process_spectrum, min_peaks=5, min_mz_range=250.0
 )
-
-
-def _row(spectrum_row, identifier, charge):
-    """Build a staged spectrum row for routing and writing tests."""
-    return spectrum_row(
-        identifier, 500.0, [100.0, 200.0, 300.0], [0.5, 0.6, 0.7], charge
-    )
 
 
 @pytest.fixture
@@ -227,7 +219,15 @@ class TestLanceWritingAndBatchWriter:
         assert empty_table.schema.equals(SPECTRUM_SCHEMA, check_metadata=True)
         assert empty_table.equals(pa.Table.from_pylist([], SPECTRUM_SCHEMA))
 
-    def test_build_list_array_raises_overflow_when_exceeding_int32_limit(
+    def test_spectra_to_arrow_table_rejects_mismatched_peak_lengths(
+        self, spectrum_row
+    ):
+        bad = spectrum_row("s:bad", precursor_charge=2)
+        bad["intensity"] = bad["intensity"][:-1]
+        with pytest.raises(ValueError, match="mismatched mz"):
+            staging_ingest._spectra_to_arrow_table([bad])
+
+    def test_compute_list_offsets_raises_overflow_when_exceeding_int32_limit(
         self, monkeypatch
     ):
         monkeypatch.setattr(staging_ingest, "INT32_MAX", 5)
@@ -236,7 +236,7 @@ class TestLanceWritingAndBatchWriter:
             np.zeros(3, dtype=np.float32),
         ]
         with pytest.raises(OverflowError, match="offset limit"):
-            staging_ingest._build_list_array(arrays)
+            staging_ingest._compute_list_offsets(arrays)
 
     def test_creates_appends_and_overwrites_at_explicit_work_dir(
         self, tmp_path, spectrum_row
@@ -244,20 +244,22 @@ class TestLanceWritingAndBatchWriter:
         explicit_dir = tmp_path / "target"
         spectra_dir(explicit_dir).mkdir(parents=True)
 
-        lock = threading.Lock()
+        state = staging_ingest._BucketState()
         count1 = staging_ingest._write_to_dataset(
-            [_row(spectrum_row, "s1", 2), _row(spectrum_row, "s2", 2)],
+            [
+                spectrum_row("s1", precursor_charge=2),
+                spectrum_row("s2", precursor_charge=2),
+            ],
             (2,),
-            lock,
+            state,
             explicit_dir,
-            mode="overwrite",
         )
+        assert state.initialized is True
         count2 = staging_ingest._write_to_dataset(
-            [_row(spectrum_row, "s3", 2)],
+            [spectrum_row("s3", precursor_charge=2)],
             (2,),
-            lock,
+            state,
             explicit_dir,
-            mode="append",
         )
         assert count1 == 2
         assert count2 == 1
@@ -265,61 +267,53 @@ class TestLanceWritingAndBatchWriter:
         assert target_ds.exists()
         assert lance.dataset(str(target_ds)).count_rows() == 3
 
-        # Re-writing in overwrite mode replaces prior rows cleanly.
+        # A fresh BucketState overwrites prior rows cleanly.
+        fresh_state = staging_ingest._BucketState()
         count3 = staging_ingest._write_to_dataset(
-            [_row(spectrum_row, "s4", 2)],
+            [spectrum_row("s4", precursor_charge=2)],
             (2,),
-            lock,
+            fresh_state,
             explicit_dir,
-            mode="overwrite",
         )
         assert count3 == 1
         assert lance.dataset(str(target_ds)).count_rows() == 1
 
-    def test_batch_flush_waits_for_inflight_overwrite_deterministically(
+    def test_batch_writer_serializes_concurrent_batches_per_bucket(
         self, staging_work_dir, monkeypatch, spectrum_row
     ):
         monkeypatch.setattr(staging_ingest, "_LANCE_WRITE_BATCH_SIZE", 2)
-        overwrite_started = threading.Event()
-        release_overwrite = threading.Event()
-        waited_for_inflight_init = False
+        first_write_started = threading.Event()
+        release_first_write = threading.Event()
         orig_write = staging_ingest._write_to_dataset
 
-        def _gated_write(*args, **kwargs):
-            if kwargs.get("mode") == "overwrite" and args[1] == (2,):
-                overwrite_started.set()
-                assert release_overwrite.wait(timeout=5.0)
-            return orig_write(*args, **kwargs)
+        def _gated_write(batch, bucket, state, work_dir):
+            if bucket == (2,) and not first_write_started.is_set():
+                first_write_started.set()
+                assert release_first_write.wait(timeout=5.0)
+            return orig_write(batch, bucket, state, work_dir)
 
         monkeypatch.setattr(staging_ingest, "_write_to_dataset", _gated_write)
 
         with staging_ingest._LanceBatchWriter(
             staging.ChargeRouter(None), staging_work_dir, max_workers=2
         ) as writer:
-            orig_consume = writer._consume_future
-
-            def _release_before_join(fut):
-                nonlocal waited_for_inflight_init
-                if not fut.done():
-                    waited_for_inflight_init = True
-                    release_overwrite.set()
-                return orig_consume(fut)
-
-            monkeypatch.setattr(
-                writer, "_consume_future", _release_before_join
-            )
             writer.add_spectra(
-                [_row(spectrum_row, f"c2_{i}", 2) for i in range(2)]
+                [spectrum_row(f"c2_{i}", precursor_charge=2) for i in range(2)]
             )
-            assert overwrite_started.wait(timeout=5.0)
+            assert first_write_started.wait(timeout=5.0)
+            # Subsequent batches for the same bucket submit without blocking
+            # the main thread; releasing the first write completes all rows.
             writer.add_spectra(
-                [_row(spectrum_row, f"c2_{i}", 2) for i in range(2, 7)]
+                [
+                    spectrum_row(f"c2_{i}", precursor_charge=2)
+                    for i in range(2, 7)
+                ]
             )
+            release_first_write.set()
             writer.add_spectra(
-                [_row(spectrum_row, f"c1_{i}", 1) for i in range(4)]
+                [spectrum_row(f"c1_{i}", precursor_charge=1) for i in range(4)]
             )
 
-        assert waited_for_inflight_init is True
         assert writer.excluded_count == 0
         assert (
             lance.dataset(
@@ -350,10 +344,10 @@ class TestLanceWritingAndBatchWriter:
             ) as writer,
         ):
             writer.add_spectra(
-                [_row(spectrum_row, f"s_{i}", 2) for i in range(3)]
+                [spectrum_row(f"s_{i}", precursor_charge=2) for i in range(3)]
             )
 
-    def test_submit_failure_releases_semaphore_and_leaves_bucket_uninitialized(
+    def test_submit_failure_releases_semaphore_and_leaves_bucket_clean(
         self, staging_work_dir, monkeypatch, spectrum_row
     ):
         monkeypatch.setattr(staging_ingest, "_LANCE_WRITE_BATCH_SIZE", 1)
@@ -370,11 +364,10 @@ class TestLanceWritingAndBatchWriter:
             pytest.raises(RuntimeError, match="executor rejected task"),
             writer,
         ):
-            writer.add_spectrum(_row(spectrum_row, "s_0", 2))
+            writer.add_spectrum(spectrum_row("s_0", precursor_charge=2))
 
-        assert (2,) not in writer._initialized
-        assert writer._init_futures == {}
-        assert writer._inflight == {}
+        assert not bucket_dataset_path(staging_work_dir, (2,)).exists()
+        assert writer.written_counts == {}
         # All semaphore permits were released (none leaked).
         acquired = [
             writer._inflight_sem.acquire(blocking=False)
@@ -384,6 +377,19 @@ class TestLanceWritingAndBatchWriter:
         assert writer._inflight_sem.acquire(blocking=False) is False
         for _ in range(max_permits):
             writer._inflight_sem.release()
+
+    def test_writer_workers_decoupled_from_file_count(self):
+        auto_router = staging.ChargeRouter(None)
+        assert staging_ingest._writer_workers(auto_router, 1) == 1
+        assert staging_ingest._writer_workers(auto_router, 4) == 4
+        assert (
+            staging_ingest._writer_workers(auto_router, 64)
+            == staging_ingest._MAX_AUTO_WRITER_WORKERS
+        )
+
+        explicit_router = staging.ChargeRouter([(1,), (2, 3)])
+        assert staging_ingest._writer_workers(explicit_router, 64) == 2
+        assert staging_ingest._writer_workers(explicit_router, 1) == 1
 
 
 # ----------------------------------------------------------------------
@@ -421,10 +427,12 @@ class TestReadAndStageSpectra:
 
         def _forbid_parallel(*_args, **_kwargs):
             raise AssertionError(
-                "Single-file staging should stream without joblib.Parallel"
+                "Single-file staging should stream without loky pool"
             )
 
-        monkeypatch.setattr(joblib, "Parallel", _forbid_parallel)
+        monkeypatch.setattr(
+            staging_ingest, "loky_unordered_pool", _forbid_parallel
+        )
         monkeypatch.setattr(staging_ingest, "_LANCE_WRITE_BATCH_SIZE", 2)
 
         submitted_at_yield = []
@@ -465,6 +473,30 @@ class TestReadAndStageSpectra:
             "Skipped 1 low-quality spectra" in r.message
             for r in caplog.records
         )
+
+    def test_multi_file_with_single_worker_streams_without_loky(
+        self, staging_work_dir, mgf_block, mgf_writer, monkeypatch
+    ):
+        mgf_a = mgf_writer(
+            staging_work_dir / "s1.mgf",
+            [mgf_block(TOY_PEAKS_5, 500.0, charge=2, scan=1)],
+        )
+        mgf_b = mgf_writer(
+            staging_work_dir / "s2.mgf",
+            [mgf_block(TOY_PEAKS_5, 501.0, charge=3, scan=1)],
+        )
+
+        def _forbid_parallel(*_args, **_kwargs):
+            raise AssertionError("1-worker staging must stream directly")
+
+        monkeypatch.setattr(staging_ingest, "effective_n_workers", lambda: 1)
+        monkeypatch.setattr(
+            staging_ingest, "loky_unordered_pool", _forbid_parallel
+        )
+        valid = staging.stage_spectra(
+            [mgf_a, mgf_b], staging_work_dir, _TOY_PROC, None
+        )
+        assert valid == [(2,), (3,)]
 
     def test_multi_file_stages_in_parallel_across_buckets(
         self, staging_work_dir, mgf_block, mgf_writer, caplog

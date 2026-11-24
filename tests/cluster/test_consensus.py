@@ -5,6 +5,7 @@ from typing import Any
 
 import numpy as np
 import pytest
+from scipy.spatial.distance import squareform
 
 from falcon.cluster import consensus
 from falcon.config import AverageConsensusConfig, MedoidConsensusConfig
@@ -35,25 +36,39 @@ class TestClusterMedoids:
         assert reps[0].retention_time == pytest.approx(30.0)
         assert reps[0].cluster_id == 0
 
-    def test_singleton_pair_and_empty_select_expected_medoids(
+    def test_singleton_pair_noise_and_ties_select_expected_medoids(
         self, spec_factory
     ):
         specs = [
             spec_factory([100.0], [1.0], precursor_mz=400.0),
             spec_factory([200.0], [1.0], precursor_mz=500.0),
             spec_factory([300.0], [1.0], precursor_mz=600.0),
+            spec_factory([400.0], [1.0], precursor_mz=700.0),
         ]
-        pdist = np.array([0.5, 0.5, 0.2], dtype=np.float32)
-        labels = np.array([0, 1, 1], dtype=np.int32)
-        rts = np.array([1.0, 2.0, 3.0], dtype=np.float32)
-        order_map = np.array([0, 1, 2], dtype=np.int64)
+        # Noise (-1) yields individual entries; pair selects first member.
+        pdist = np.full(6, 0.5, dtype=np.float32)
+        labels = np.array([-1, -1, 1, 1], dtype=np.int32)
+        rts = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
+        order_map = np.array([0, 1, 2, 3], dtype=np.int64)
 
         reps = consensus.get_cluster_medoids(
             specs, labels, rts, order_map, pdist
         )
-        assert [r.cluster_id for r in reps] == [0, 1]
-        assert [float(r.precursor_mz) for r in reps] == [400.0, 500.0]
-        assert [float(r.retention_time) for r in reps] == [1.0, 2.0]
+        assert [int(r.cluster_id) for r in reps] == [-1, -1, 1]
+        assert [float(r.precursor_mz) for r in reps] == [400.0, 500.0, 600.0]
+
+        # Equal within-cluster distance sums deterministically select the
+        # earliest member in labels/order_map order.
+        tie_reps = consensus.get_cluster_medoids(
+            specs[:3],
+            np.array([0, 0, 0], dtype=np.int32),
+            np.array([10.0, 20.0, 30.0], dtype=np.float32),
+            np.array([2, 0, 1], dtype=np.int64),
+            np.array([0.2, 0.2, 0.2], dtype=np.float32),
+        )
+        assert len(tie_reps) == 1
+        assert float(tie_reps[0].precursor_mz) == pytest.approx(600.0)
+        assert float(tie_reps[0].retention_time) == pytest.approx(10.0)
 
         empty = consensus.get_cluster_medoids(
             [],
@@ -64,7 +79,51 @@ class TestClusterMedoids:
         )
         assert empty == []
 
-    def test_validates_shapes_lengths_order_map_and_pdist_size(
+    def test_randomized_medoids_match_dense_squareform_reference(
+        self, spec_factory
+    ):
+        rng = np.random.default_rng(77)
+        for _ in range(10):
+            n = int(rng.integers(5, 25))
+            specs = [
+                spec_factory(
+                    [100.0 + i], [1.0], precursor_mz=300.0 + i, charge=2
+                )
+                for i in range(n)
+            ]
+            pdist = rng.uniform(0.0, 1.0, size=n * (n - 1) // 2).astype(
+                np.float32
+            )
+            dense = squareform(pdist.astype(np.float64))
+            order_map = rng.permutation(n).astype(np.int64)
+            rts = rng.uniform(1.0, 500.0, size=n).astype(np.float32)
+            # Assign sorted multi-cluster labels of varied sizes (1..6).
+            raw_labels = np.sort(
+                rng.integers(0, max(2, n // 3), size=n, dtype=np.int32)
+            )
+            reps = consensus.get_cluster_medoids(
+                specs, raw_labels, rts, order_map, pdist
+            )
+            unique_labels = np.unique(raw_labels)
+            assert [int(r.cluster_id) for r in reps] == unique_labels.tolist()
+
+            for rep, lbl in zip(reps, unique_labels, strict=True):
+                positions = np.flatnonzero(raw_labels == lbl)
+                members = order_map[positions]
+                if len(members) < 3:
+                    expected_pos = int(positions[0])
+                else:
+                    sub = dense[np.ix_(members, members)]
+                    expected_pos = int(positions[int(np.argmin(sub.sum(1)))])
+                expected_spec = specs[int(order_map[expected_pos])]
+                assert float(rep.precursor_mz) == pytest.approx(
+                    float(expected_spec.precursor_mz)
+                )
+                assert float(rep.retention_time) == pytest.approx(
+                    float(rts[expected_pos])
+                )
+
+    def test_medoid_pdist_size_and_duplicate_order_map_handling(
         self, spec_factory
     ):
         specs = [
@@ -75,39 +134,10 @@ class TestClusterMedoids:
         labels = np.array([0, 0, 0], dtype=np.int32)
         rts = np.array([1.0, 2.0, 3.0], dtype=np.float32)
         order = np.array([0, 1, 2], dtype=np.int64)
-        pdist = np.array([0.1, 0.2, 0.3], dtype=np.float32)
 
         with pytest.raises(ValueError, match="1D arrays"):
             consensus.get_cluster_medoids(
-                specs, labels.reshape(1, -1), rts, order, pdist
-            )
-        with pytest.raises(ValueError, match="1D arrays"):
-            consensus.get_cluster_medoids(
-                specs, labels, rts, order, pdist.reshape(1, -1)
-            )
-        with pytest.raises(ValueError, match="matching lengths"):
-            consensus.get_cluster_medoids(
-                specs, labels, rts[:-1], order, pdist
-            )
-        with pytest.raises(ValueError, match="matching lengths"):
-            consensus.get_cluster_medoids(
-                specs, labels, rts, order[:-1], pdist
-            )
-        with pytest.raises(ValueError, match="order_map indices"):
-            consensus.get_cluster_medoids(
-                specs,
-                labels,
-                rts,
-                np.array([-1, 0, 1], dtype=np.int64),
-                pdist,
-            )
-        with pytest.raises(ValueError, match="order_map indices"):
-            consensus.get_cluster_medoids(
-                specs,
-                labels,
-                rts,
-                np.array([0, 1, 3], dtype=np.int64),
-                pdist,
+                specs, labels, rts, order, np.zeros((1, 3), dtype=np.float32)
             )
         with pytest.raises(ValueError, match="pdist length"):
             consensus.get_cluster_medoids(
@@ -124,11 +154,10 @@ class TestClusterMedoids:
         )
         assert [int(r.cluster_id) for r in small_reps] == [0, 1]
 
-        # Duplicate order_map index in a cluster of size >= 3 treats
-        # self distance as 0.0 without calling condensed_index(i, i, n).
+        # Duplicate order_map index treats self-distance as 0.0.
         dup_reps = consensus.get_cluster_medoids(
             specs,
-            np.array([0, 0, 0], dtype=np.int32),
+            labels,
             rts,
             np.array([0, 0, 2], dtype=np.int64),
             np.array([0.5, 0.2, 0.9], dtype=np.float32),
@@ -138,14 +167,63 @@ class TestClusterMedoids:
             float(specs[0].precursor_mz)
         )
 
-        with pytest.raises(ValueError, match="integer dtype"):
-            consensus.get_cluster_medoids(
-                specs,
-                labels,
-                rts,
-                np.array([-0.9, -0.5, 0.0], dtype=np.float64),
-                pdist,
-            )
+
+class TestSharedConsensusInputValidation:
+    @pytest.mark.parametrize("mode", ["medoid", "average"])
+    @pytest.mark.parametrize(
+        ("case", "match"),
+        [
+            ("labels_2d", "1D arrays"),
+            ("rts_2d", "1D arrays"),
+            ("short_rts", "matching lengths"),
+            ("short_order", "matching lengths"),
+            ("neg_order", "order_map indices"),
+            ("oob_order", "order_map indices"),
+            ("float_order", "integer dtype"),
+        ],
+    )
+    def test_rejects_malformed_consensus_inputs(
+        self, spec_factory, mode, case, match
+    ):
+        specs = [
+            spec_factory([100.0], [1.0], precursor_mz=500.0),
+            spec_factory([200.0], [1.0], precursor_mz=501.0),
+            spec_factory([300.0], [1.0], precursor_mz=502.0),
+        ]
+        labels = np.array([0, 0, 0], dtype=np.int32)
+        rts = np.array([1.0, 2.0, 3.0], dtype=np.float32)
+        order = np.array([0, 1, 2], dtype=np.int64)
+        pdist = np.array([0.1, 0.2, 0.3], dtype=np.float32)
+
+        if case == "labels_2d":
+            labels = labels.reshape(1, -1)
+        elif case == "rts_2d":
+            rts = rts.reshape(1, -1)
+        elif case == "short_rts":
+            rts = rts[:-1]
+        elif case == "short_order":
+            order = order[:-1]
+        elif case == "neg_order":
+            order = np.array([-1, 0, 1], dtype=np.int64)
+        elif case == "oob_order":
+            order = np.array([0, 1, 3], dtype=np.int64)
+        elif case == "float_order":
+            order = np.array([0.0, 1.0, 2.0], dtype=np.float64)
+
+        if mode == "medoid":
+            with pytest.raises(ValueError, match=match):
+                consensus.get_cluster_medoids(specs, labels, rts, order, pdist)
+        else:
+            with pytest.raises(ValueError, match=match):
+                consensus.get_cluster_averages(
+                    specs,
+                    labels,
+                    rts,
+                    order,
+                    min_mz=50.0,
+                    max_mz=350.0,
+                    fragment_tol=0.5,
+                )
 
 
 class TestBinClusterPeaks:
@@ -174,6 +252,30 @@ class TestBinClusterPeaks:
         assert stops[1] - starts[1] == 14
         np.testing.assert_allclose(sorted_mz[starts[0] : stops[0]], 100.05)
         np.testing.assert_allclose(sorted_int[starts[0] : stops[0]], 0.5)
+
+    @pytest.mark.parametrize(
+        ("n_spectra", "min_keep"),
+        [(3, 3), (7, 5)],
+    )
+    def test_non_integer_occupancy_threshold_boundaries(
+        self, spec_factory, n_spectra, min_keep
+    ):
+        n_bins, start_dim, _ = mz_bin_bounds(50.0, 300.0, 0.1)
+        spectra = [
+            spec_factory(
+                [100.05] * int(i < min_keep)
+                + [200.05] * int(i < min_keep - 1),
+                [0.5] * int(i < min_keep) + [0.5] * int(i < min_keep - 1),
+                normalize=False,
+            )
+            for i in range(n_spectra)
+        ]
+        sorted_mz, _, starts, stops = consensus.bin_cluster_peaks(
+            spectra, start_dim, n_bins, 0.1
+        )
+        assert len(starts) == 1
+        assert stops[0] - starts[0] == min_keep
+        np.testing.assert_allclose(sorted_mz[starts[0] : stops[0]], 100.05)
 
     def test_out_of_range_disjoint_and_empty_inputs_ignored(
         self, spec_factory
@@ -255,14 +357,12 @@ class TestSigmaClipping:
         np.testing.assert_array_equal(out_pm, pair_m)
 
     def test_rejects_low_outlier_asymmetric_bounds_and_multi_iteration(self):
-        # Lower outlier rejected cleanly.
         low_i = np.array([0.001, 10.0, 10.0, 10.0, 10.0], dtype=np.float32)
         low_m = np.array([100.0, 100.1, 100.2, 100.3, 100.4], dtype=np.float32)
         kept_i, kept_m = consensus.sigma_clip(low_i, low_m, 1.5, 1.5)
         np.testing.assert_allclose(kept_i, [10.0, 10.0, 10.0, 10.0])
         np.testing.assert_allclose(kept_m, [100.1, 100.2, 100.3, 100.4])
 
-        # Asymmetric cutoffs apply lower and upper bounds independently.
         sym_i = np.array([1.0, 10.0, 10.0, 10.0, 19.0], dtype=np.float32)
         sym_m = np.array([200.0, 200.1, 200.2, 200.3, 200.4], dtype=np.float32)
         clip_low_i, clip_low_m = consensus.sigma_clip(sym_i, sym_m, 1.0, 3.0)
@@ -273,8 +373,6 @@ class TestSigmaClipping:
         np.testing.assert_allclose(clip_high_i, [1.0, 10.0, 10.0, 10.0])
         np.testing.assert_allclose(clip_high_m, [200.0, 200.1, 200.2, 200.3])
 
-        # Pass 1 removes only 200.0 (upper bound ~109 > 20.0); pass 2
-        # shrinks std enough to clip 20.0 (upper bound ~15.6 < 20.0).
         multi_i = np.array(
             [10.0, 10.0, 10.0, 10.0, 10.0, 20.0, 200.0], dtype=np.float32
         )
@@ -482,49 +580,4 @@ class TestClusterAveragesAndDispatch:
         with pytest.raises(ValueError, match="Unsupported consensus"):
             consensus.get_representative_spectra(
                 specs, labels, rts, order, invalid_cfg
-            )
-
-    def test_get_cluster_averages_validates_inputs(self, spec_factory):
-        specs = [
-            spec_factory([100.0, 200.0], [1.0, 0.5], precursor_mz=500.0),
-            spec_factory([100.0, 200.0], [1.0, 0.5], precursor_mz=500.1),
-        ]
-        labels = np.array([0, 0], dtype=np.int32)
-        rts = np.array([10.0, 11.0], dtype=np.float64)
-        order = np.array([0, 1], dtype=np.int64)
-        kw = {"min_mz": 50.0, "max_mz": 300.0, "fragment_tol": 0.5}
-
-        assert (
-            consensus.get_cluster_averages(
-                specs,
-                np.empty(0, dtype=np.int32),
-                np.empty(0, dtype=np.float64),
-                np.empty(0, dtype=np.int64),
-                **kw,
-            )
-            == []
-        )
-        with pytest.raises(ValueError, match="1D arrays"):
-            consensus.get_cluster_averages(
-                specs, labels, rts.reshape(1, -1), order, **kw
-            )
-        with pytest.raises(ValueError, match="matching lengths"):
-            consensus.get_cluster_averages(
-                specs, labels, rts[:-1], order, **kw
-            )
-        with pytest.raises(ValueError, match="order_map indices"):
-            consensus.get_cluster_averages(
-                specs, labels, rts, np.array([-1, 0], dtype=np.int64), **kw
-            )
-        with pytest.raises(ValueError, match="order_map indices"):
-            consensus.get_cluster_averages(
-                specs, labels, rts, np.array([0, 2], dtype=np.int64), **kw
-            )
-        with pytest.raises(ValueError, match="integer dtype"):
-            consensus.get_cluster_averages(
-                specs,
-                labels,
-                rts,
-                np.array([0.0, 1.0], dtype=np.float64),
-                **kw,
             )

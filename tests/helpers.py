@@ -165,65 +165,96 @@ def write_toy_mzml(path: Path, spectra_specs: list[dict[str, Any]]) -> Path:
             f"controllerType=0 controllerNumber=1 scan={scan_nr}",
         )
         ms_level = spec.get("ms_level", 2)
-        mzs = [float(v) for v in spec["mz"]]
-        intensities = [float(v) for v in spec["intensity"]]
-        mz_b64 = base64.b64encode(struct.pack(f"<{len(mzs)}d", *mzs)).decode(
-            "ascii"
+        mzs = [float(v) for v in spec.get("mz", ())]
+        intensities = [float(v) for v in spec.get("intensity", ())]
+        raw_mz_b64 = spec.get("raw_mz_b64")
+        mz_b64 = (
+            raw_mz_b64
+            if raw_mz_b64 is not None
+            else base64.b64encode(struct.pack(f"<{len(mzs)}d", *mzs)).decode(
+                "ascii"
+            )
         )
         int_b64 = base64.b64encode(
             struct.pack(f"<{len(intensities)}d", *intensities)
         ).decode("ascii")
+        default_len = len(mzs) if raw_mz_b64 is None else max(len(mzs), 1)
 
-        if "rt" in spec and spec["rt"] is not None:
+        if spec.get("omit_scan_list"):
+            scan_xml = ""
+        elif "rt" in spec and spec["rt"] is not None:
+            unit_attr = ' unitName="second"' if spec["rt"] != "" else ""
             scan_xml = (
                 '    <scanList count="1"><scan>'
                 '<cvParam cvRef="MS" accession="MS:1000016" '
-                f'name="scan start time" value="{spec["rt"]}" '
-                'unitName="second"/>'
+                f'name="scan start time" value="{spec["rt"]}"{unit_attr}/>'
                 "</scan></scanList>\n"
             )
         else:
             scan_xml = '    <scanList count="1"><scan/></scanList>\n'
 
         prec_xml = ""
-        if (
+        if spec.get("empty_selected_ions"):
+            prec_xml = (
+                '    <precursorList count="1"><precursor>'
+                '<selectedIonList count="0"/>'
+                "</precursor></precursorList>\n"
+            )
+        elif (
             ms_level is not None
             and ms_level > 1
             and spec.get("precursor_mz") is not None
         ):
-            charge_xml = ""
+            charge_parts: list[str] = []
             if spec.get("charge") is not None:
-                charge_xml = (
+                charge_parts.append(
                     '<cvParam cvRef="MS" accession="MS:1000041" '
                     f'name="charge state" value="{spec["charge"]}"/>'
+                )
+            for possible in spec.get("possible_charges", ()):
+                charge_parts.append(
+                    '<cvParam cvRef="MS" accession="MS:1000633" '
+                    f'name="possible charge state" value="{possible}"/>'
                 )
             prec_xml = (
                 '    <precursorList count="1"><precursor>'
                 '<selectedIonList count="1"><selectedIon>'
                 '<cvParam cvRef="MS" accession="MS:1000744" '
                 f'name="selected ion m/z" value="{spec["precursor_mz"]}"/>'
-                f"{charge_xml}"
+                f"{''.join(charge_parts)}"
                 "</selectedIon></selectedIonList>"
                 "</precursor></precursorList>\n"
             )
 
-        ms_level_xml = ""
+        cv_parts: list[str] = []
         if ms_level is not None:
-            ms_level_xml = (
+            cv_parts.append(
                 '    <cvParam cvRef="MS" accession="MS:1000511" '
                 f'name="ms level" value="{ms_level}"/>\n'
             )
+        if spec.get("negative_scan"):
+            cv_parts.append(
+                '    <cvParam cvRef="MS" accession="MS:1000129" '
+                'name="negative scan"/>\n'
+            )
+        if spec.get("extra_cv"):
+            cv_parts.append(f"    {spec['extra_cv']}\n")
+
+        mz_extra_cv = (
+            f"      {spec['mz_extra_cv']}\n" if spec.get("mz_extra_cv") else ""
+        )
 
         blocks.append(
             f'   <spectrum index="{idx}" id="{id_str}" '
-            f'defaultArrayLength="{len(mzs)}">\n'
-            f"{ms_level_xml}"
+            f'defaultArrayLength="{default_len}">\n'
+            f"{''.join(cv_parts)}"
             f"{scan_xml}"
             f"{prec_xml}"
             '    <binaryDataArrayList count="2">\n'
             f'     <binaryDataArray encodedLength="{len(mz_b64)}">\n'
             '      <cvParam cvRef="MS" accession="MS:1000523" '
             'name="64-bit float"/>\n'
+            f"{mz_extra_cv}"
             '      <cvParam cvRef="MS" accession="MS:1000514" '
             'name="m/z array"/>\n'
             f"      <binary>{mz_b64}</binary>\n"
@@ -261,38 +292,54 @@ def write_toy_mzxml(path: Path, spectra_specs: list[dict[str, Any]]) -> Path:
     for idx, spec in enumerate(spectra_specs):
         scan_num = spec.get("scan", idx + 1)
         ms_level = spec.get("ms_level", 2)
-        mzs = [float(v) for v in spec["mz"]]
-        intensities = [float(v) for v in spec["intensity"]]
-        interleaved = []
-        for mz_val, int_val in zip(mzs, intensities, strict=True):
-            interleaved.extend([mz_val, int_val])
-        peaks_b64 = base64.b64encode(
-            struct.pack(f">{len(interleaved)}f", *interleaved)
-        ).decode("ascii")
+        mzs = [float(v) for v in spec.get("mz", ())]
+        intensities = [float(v) for v in spec.get("intensity", ())]
+        raw_peaks_b64 = spec.get("raw_peaks_b64")
+        if raw_peaks_b64 is not None:
+            peaks_b64 = raw_peaks_b64
+            peaks_count = max(len(mzs), 1)
+        else:
+            interleaved = []
+            for mz_val, int_val in zip(mzs, intensities, strict=True):
+                interleaved.extend([mz_val, int_val])
+            peaks_b64 = base64.b64encode(
+                struct.pack(f">{len(interleaved)}f", *interleaved)
+            ).decode("ascii")
+            peaks_count = len(mzs)
 
-        attrs = [f'num="{scan_num}"']
-        if ms_level is not None:
-            attrs.append(f'msLevel="{ms_level}"')
-        attrs.append(f'peaksCount="{len(mzs)}"')
-        if "rt" in spec and spec["rt"] is not None:
-            attrs.append(f'retentionTime="PT{spec["rt"]}S"')
+        raw_attrs = spec.get("raw_attrs")
+        if raw_attrs is not None:
+            attrs = [raw_attrs]
+            if "peaksCount=" not in raw_attrs:
+                attrs.append(f'peaksCount="{peaks_count}"')
+        else:
+            attrs = [f'num="{scan_num}"']
+            if ms_level is not None:
+                attrs.append(f'msLevel="{ms_level}"')
+            if spec.get("polarity") is not None:
+                attrs.append(f'polarity="{spec["polarity"]}"')
+            attrs.append(f'peaksCount="{peaks_count}"')
+            if "rt" in spec and spec["rt"] is not None:
+                attrs.append(f'retentionTime="PT{spec["rt"]}S"')
 
         prec_xml = ""
         if spec.get("precursor_mz") is not None:
-            charge_attr = (
-                f' precursorCharge="{spec["charge"]}"'
-                if spec.get("charge") is not None
-                else ""
-            )
+            if spec.get("charge") is not None:
+                charge_attr = f' precursorCharge="{spec["charge"]}"'
+            elif spec.get("empty_charge"):
+                charge_attr = ' precursorCharge=""'
+            else:
+                charge_attr = ""
             prec_xml = (
                 f"   <precursorMz{charge_attr}>"
                 f"{spec['precursor_mz']}</precursorMz>\n"
             )
 
+        compression = spec.get("compression", "none")
         scans.append(
             f"  <scan {' '.join(attrs)}>\n"
             f"{prec_xml}"
-            '   <peaks compressionType="none" precision="32" '
+            f'   <peaks compressionType="{compression}" precision="32" '
             f'byteOrder="network" contentType="m/z-int">{peaks_b64}</peaks>\n'
             "  </scan>\n"
         )

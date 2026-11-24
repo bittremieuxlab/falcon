@@ -116,6 +116,17 @@ All settings have sensible default values (organized into `[io]`, `[preprocessin
 
 For detailed information on all available CLI options, run `falcon -h` or `falcon --help`.
 
+**Input/output (`[io]`)**
+
+- `input_filenames` and `output_filename` (positional arguments or `-i`/`--input` and `-o`/`--output`): Input peak file path(s) or glob patterns and the output file prefix (`<prefix>.csv` and optional `<prefix>.mgf`).
+  Repeatable `-i`/`--input` and `-o`/`--output` flags provide named alternatives to positional paths (useful when overriding only the output prefix from a saved TOML config); positional and named forms cannot be mixed.
+- `work_dir` (`--work-dir`): Optional directory for staging per-charge Lance datasets and the `staging_cache.json` provenance manifest (or `"none"` for a temporary directory removed on exit, the default).
+  Supplying an explicit directory persists staged datasets so subsequent runs with matching inputs, preprocessing, `fragment_tol`, and `precursor_charge_buckets` automatically reuse the validated cache across clustering, consensus, and output sweeps.
+- `overwrite` (`--overwrite` / `--no-overwrite`): Overwrite existing `.csv`/`.mgf` outputs and rebuild any cached staging datasets in `work_dir`.
+  Without `--overwrite`, existing outputs abort safely and mismatched or unverified caches fail fast; default is `false`.
+- `export_representatives` (`--export-representatives` / `--no-export-representatives`): Compute and export one representative spectrum per cluster to `<prefix>.mgf`.
+  Default is `false`.
+
 **Spectrum comparison (`[clustering]`)**
 
 - `precursor_tol` (`--precursor-tol MASS MODE`): The precursor mass tolerance (`mass >= 0`) and unit (`"ppm"` or `"Da"`).

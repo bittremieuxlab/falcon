@@ -6,9 +6,7 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-from falcon.cluster import distance, engine, scheduling, tiling
-from falcon.config import MedoidConsensusConfig
-from falcon.types import ClusterResult
+from falcon.cluster import distance, interval, scheduling, tiling
 
 
 class TestGiantMemmapStore:
@@ -70,143 +68,22 @@ class TestGiantMemmapStore:
         assert not os.path.exists(created[0])
 
 
-class TestExtractArrowCsr:
-    def test_extracts_int64_offsets_and_validates_columns(self):
-        table = pa.table(
-            {
-                "mz": pa.array(
-                    [[100.0, 200.0], [300.0]], pa.list_(pa.float32())
-                ),
-                "intensity": pa.array(
-                    [[0.6, 0.8], [1.0]], pa.list_(pa.float32())
-                ),
-            }
-        )
-        mz_flat, int_flat, offsets = tiling._extract_arrow_csr(table)
-        assert mz_flat.dtype == np.float32
-        assert int_flat.dtype == np.float32
-        assert offsets.dtype == np.int64
-        np.testing.assert_allclose(mz_flat, [100.0, 200.0, 300.0])
-        np.testing.assert_allclose(int_flat, [0.6, 0.8, 1.0])
-        np.testing.assert_array_equal(offsets, [0, 2, 3])
-
-        bad_type = pa.table(
-            {"mz": pa.array([1.0]), "intensity": pa.array([1.0])}
-        )
-        with pytest.raises(TypeError, match="list arrays"):
-            tiling._extract_arrow_csr(bad_type)
-
-        mismatch = pa.table(
-            {
-                "mz": pa.array([[100.0, 200.0]], pa.list_(pa.float32())),
-                "intensity": pa.array([[1.0]], pa.list_(pa.float32())),
-            }
-        )
-        with pytest.raises(
-            ValueError, match="Mismatched PyArrow list offsets"
-        ):
-            tiling._extract_arrow_csr(mismatch)
-
-    def test_rejects_list_level_and_element_level_nulls(self):
-        # Masked list-level null with offsets matching the sibling [].
-        null_mz_list = pa.table(
-            {
-                "mz": pa.array([[100.0], None], pa.list_(pa.float32())),
-                "intensity": pa.array([[1.0], []], pa.list_(pa.float32())),
-            }
-        )
-        with pytest.raises(ValueError, match="Null lists"):
-            tiling._extract_arrow_csr(null_mz_list)
-
-        null_int_list = pa.table(
-            {
-                "mz": pa.array([[100.0], []], pa.list_(pa.float32())),
-                "intensity": pa.array([[1.0], None], pa.list_(pa.float32())),
-            }
-        )
-        with pytest.raises(ValueError, match="Null lists"):
-            tiling._extract_arrow_csr(null_int_list)
-
-        null_mz_elem = pa.table(
-            {
-                "mz": pa.array([[100.0, None]], pa.list_(pa.float32())),
-                "intensity": pa.array([[0.6, 0.8]], pa.list_(pa.float32())),
-            }
-        )
-        with pytest.raises(ValueError, match="Null values"):
-            tiling._extract_arrow_csr(null_mz_elem)
-
-        null_int_elem = pa.table(
-            {
-                "mz": pa.array([[100.0, 200.0]], pa.list_(pa.float32())),
-                "intensity": pa.array([[0.6, None]], pa.list_(pa.float32())),
-            }
-        )
-        with pytest.raises(ValueError, match="Null values"):
-            tiling._extract_arrow_csr(null_int_elem)
-
-    def test_handles_sliced_list_arrays_with_distinct_base_offsets(self):
-        # Slice mz from index 1 (offset 2) and intensity from index 2
-        # (offset 3), with a parent null outside the sliced region.
-        mz_parent = pa.array(
-            [[None, 50.0], [100.0, 200.0], [300.0]], pa.list_(pa.float32())
-        )
-        int_parent = pa.array(
-            [[0.1], [0.2, 0.3], [0.6, 0.8], [1.0]], pa.list_(pa.float32())
-        )
-        table = pa.table(
-            {
-                "mz": mz_parent.slice(1, 2),
-                "intensity": int_parent.slice(2, 2),
-            }
-        )
-        mz_flat, int_flat, offsets = tiling._extract_arrow_csr(table)
-        np.testing.assert_allclose(mz_flat, [100.0, 200.0, 300.0])
-        np.testing.assert_allclose(int_flat, [0.6, 0.8, 1.0])
-        np.testing.assert_array_equal(offsets, [0, 2, 3])
-        assert np.shares_memory(int_parent.values.to_numpy(), int_flat)
-
-        # Multi-chunk columns combine cleanly too.
-        chunked = pa.table(
-            {
-                "mz": pa.chunked_array(
-                    [
-                        pa.array([[100.0]], pa.list_(pa.float32())),
-                        pa.array([[200.0, 300.0]], pa.list_(pa.float32())),
-                    ]
-                ),
-                "intensity": pa.chunked_array(
-                    [
-                        pa.array([[1.0]], pa.list_(pa.float32())),
-                        pa.array([[0.6, 0.8]], pa.list_(pa.float32())),
-                    ]
-                ),
-            }
-        )
-        c_mz, c_int, c_off = tiling._extract_arrow_csr(chunked)
-        np.testing.assert_allclose(c_mz, [100.0, 200.0, 300.0])
-        np.testing.assert_allclose(c_int, [1.0, 0.6, 0.8])
-        np.testing.assert_array_equal(c_off, [0, 1, 3])
-
-
 class TestGiantTiling:
-    def test_multi_tile_distance_populates_memmap_and_has_no_engine_exports(
+    def test_multi_tile_distance_populates_exact_memmap_and_decoupled_exports(
         self, lance_dataset, spectrum_row, da_clustering_factory, monkeypatch
     ):
         assert "GiantInterval" not in tiling.__all__
         assert "finalize_giant" not in tiling.__all__
 
-        peaks_a = [100.0, 200.0, 300.0]
         peaks_b = [400.0, 500.0, 600.0]
-        inten = [1.0, 0.8, 0.6]
         ds = lance_dataset(
             [
-                spectrum_row("s:0", 500.00, peaks_a, inten, 2, 10.0),
-                spectrum_row("s:1", 500.01, peaks_a, inten, 2, 11.0),
-                spectrum_row("s:2", 500.02, peaks_b, inten, 2, 12.0),
-                spectrum_row("s:3", 500.03, peaks_b, inten, 2, 13.0),
-                spectrum_row("s:4", 500.04, peaks_a, inten, 2, 14.0),
-                spectrum_row("s:5", 800.00, peaks_a, inten, 2, 15.0),
+                spectrum_row("s:0", 500.00, retention_time=10.0),
+                spectrum_row("s:1", 500.01, retention_time=11.0),
+                spectrum_row("s:2", 500.02, mz=peaks_b, retention_time=12.0),
+                spectrum_row("s:3", 500.03, mz=peaks_b, retention_time=13.0),
+                spectrum_row("s:4", 500.04, retention_time=14.0),
+                spectrum_row("s:5", 800.00, retention_time=15.0),
             ]
         )
         clust = da_clustering_factory(batch_size=8)
@@ -215,18 +92,12 @@ class TestGiantTiling:
         )
         assert plan.n_spectra == 6
         assert len(plan.giant_specs) == 1
-        assert len(plan.normal_chunks) == 1
 
         # Lower MIN_PAIRS_PER_TILE so n=5 splits into >= 2 disjoint tiles.
         monkeypatch.setattr(scheduling, "MIN_PAIRS_PER_TILE", 3)
-        options_on = engine.ClusteringOptions(
-            clustering=clust,
-            consensus=MedoidConsensusConfig(),
-            compute_representatives=True,
-        )
         with tiling.GiantMemmapStore() as store:
             memmap_paths, tile_tasks = tiling.allocate_giant_tiles(
-                [(0, ds, plan.giant_specs[0])],
+                [(ds, plan.giant_specs[0])],
                 clust.fragment_tol,
                 clust.min_matched_peaks,
                 n_workers=4,
@@ -246,28 +117,10 @@ class TestGiantTiling:
                 assert done.giant_idx == tile.giant_idx
                 assert done.tile_cost == pytest.approx(tile.tile_cost)
 
-            giant = engine.GiantInterval(
-                giant_idx=0,
-                bucket_id=0,
-                dataset=ds,
-                spec=plan.giant_specs[0],
-                memmap_path=memmap_paths[0],
-                options=options_on,
-            )
-            giant_done = engine.finalize_giant(giant)
-            assert isinstance(giant_done, engine.GiantDone)
-            assert (giant_done.bucket_id, giant_done.task_id) == (
-                0,
-                plan.giant_specs[0].task_id,
-            )
-            assert isinstance(giant_done.result, ClusterResult)
-            assert len(giant_done.result.representatives) == 2
-
-            # Verify tiled memmap matches direct distance calculation.
             giant_df = ds.take(
                 indices=pa.array(plan.giant_specs[0].row_ids)
             ).to_pandas()
-            spec_tuples, _, _ = engine.interval_spectrum_tuples(
+            spec_tuples, _, _ = interval.interval_spectrum_tuples(
                 giant_df, already_sorted=True
             )
             expected_pdist = distance.compute_condensed_distance_matrix(
@@ -278,19 +131,3 @@ class TestGiantTiling:
                 assert np.array_equal(tiled_pdist, expected_pdist)
             finally:
                 distance.close_memmap(tiled_pdist)
-
-            normal_res = engine.cluster_chunk(
-                plan.normal_chunks[0], ds, options_on
-            )
-            bucket_res = engine.finalize_bucket(
-                plan.n_spectra,
-                plan.splits,
-                [*normal_res, (giant_done.task_id, giant_done.result)],
-                "2",
-            )
-            assert len(bucket_res.labels) == 6
-            assert [int(r.cluster_id) for r in bucket_res.representatives] == [
-                0,
-                1,
-                2,
-            ]

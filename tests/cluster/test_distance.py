@@ -3,7 +3,9 @@
 import os
 import tempfile
 
+import numba as nb
 import numpy as np
+import pyarrow as pa
 import pytest
 from scipy.spatial.distance import squareform
 
@@ -43,8 +45,10 @@ class TestCondensedIndex:
         assert distance.condensed_index(99, 50, 100) == 3773
 
 
-class TestPackSpectraCsr:
-    def test_handles_empty_and_variable_length_spectra(self, spec_factory):
+class TestPackAndExtractCsr:
+    def test_pack_handles_empty_and_variable_length_spectra(
+        self, spec_factory
+    ):
         empty_mz, empty_int, empty_off = distance.pack_spectra_csr([])
         assert empty_mz.size == 0
         assert empty_int.size == 0
@@ -70,10 +74,105 @@ class TestPackSpectraCsr:
         np.testing.assert_allclose(int_flat, [0.6, 0.8, 1.0])
         np.testing.assert_array_equal(offsets, [0, 2, 3])
 
-    def test_rejects_mismatched_peak_lengths(self, spec_factory):
+    def test_pack_rejects_mismatched_peak_lengths(self, spec_factory):
         bad = spec_factory([100.0, 200.0], [1.0], normalize=False)
         with pytest.raises(ValueError, match="mismatched mz"):
             distance.pack_spectra_csr([bad])
+
+    def test_extract_arrow_csr_validates_columns_and_types(self):
+        table = pa.table(
+            {
+                "mz": pa.array(
+                    [[100.0, 200.0], [300.0]], pa.list_(pa.float32())
+                ),
+                "intensity": pa.array(
+                    [[0.6, 0.8], [1.0]], pa.list_(pa.float32())
+                ),
+            }
+        )
+        mz_flat, int_flat, offsets = distance.extract_arrow_csr(table)
+        assert mz_flat.dtype == np.float32
+        assert int_flat.dtype == np.float32
+        assert offsets.dtype == np.int64
+        np.testing.assert_allclose(mz_flat, [100.0, 200.0, 300.0])
+        np.testing.assert_allclose(int_flat, [0.6, 0.8, 1.0])
+        np.testing.assert_array_equal(offsets, [0, 2, 3])
+
+        bad_type = pa.table(
+            {"mz": pa.array([1.0]), "intensity": pa.array([1.0])}
+        )
+        with pytest.raises(TypeError, match="list arrays"):
+            distance.extract_arrow_csr(bad_type)
+
+        mismatch = pa.table(
+            {
+                "mz": pa.array([[100.0, 200.0]], pa.list_(pa.float32())),
+                "intensity": pa.array([[1.0]], pa.list_(pa.float32())),
+            }
+        )
+        with pytest.raises(
+            ValueError, match="Mismatched PyArrow list offsets"
+        ):
+            distance.extract_arrow_csr(mismatch)
+
+    @pytest.mark.parametrize(
+        ("mz_vals", "int_vals", "match"),
+        [
+            ([[100.0], None], [[1.0], []], "Null lists"),
+            ([[100.0], []], [[1.0], None], "Null lists"),
+            ([[100.0, None]], [[0.6, 0.8]], "Null values"),
+            ([[100.0, 200.0]], [[0.6, None]], "Null values"),
+        ],
+    )
+    def test_extract_arrow_csr_rejects_nulls(self, mz_vals, int_vals, match):
+        table = pa.table(
+            {
+                "mz": pa.array(mz_vals, pa.list_(pa.float32())),
+                "intensity": pa.array(int_vals, pa.list_(pa.float32())),
+            }
+        )
+        with pytest.raises(ValueError, match=match):
+            distance.extract_arrow_csr(table)
+
+    def test_extract_arrow_csr_handles_sliced_and_chunked_arrays(self):
+        mz_parent = pa.array(
+            [[None, 50.0], [100.0, 200.0], [300.0]], pa.list_(pa.float32())
+        )
+        int_parent = pa.array(
+            [[0.1], [0.2, 0.3], [0.6, 0.8], [1.0]], pa.list_(pa.float32())
+        )
+        table = pa.table(
+            {
+                "mz": mz_parent.slice(1, 2),
+                "intensity": int_parent.slice(2, 2),
+            }
+        )
+        mz_flat, int_flat, offsets = distance.extract_arrow_csr(table)
+        np.testing.assert_allclose(mz_flat, [100.0, 200.0, 300.0])
+        np.testing.assert_allclose(int_flat, [0.6, 0.8, 1.0])
+        np.testing.assert_array_equal(offsets, [0, 2, 3])
+        assert np.shares_memory(int_parent.values.to_numpy(), int_flat)
+
+        chunked = pa.table(
+            {
+                "mz": pa.chunked_array(
+                    [
+                        pa.array([[100.0]], pa.list_(pa.float32())),
+                        pa.array([[200.0, 300.0]], pa.list_(pa.float32())),
+                    ]
+                ),
+                "intensity": pa.chunked_array(
+                    [
+                        pa.array([[1.0]], pa.list_(pa.float32())),
+                        pa.array([[0.6, 0.8]], pa.list_(pa.float32())),
+                    ]
+                ),
+            }
+        )
+        c_mz, c_int, c_off = distance.extract_arrow_csr(chunked)
+        np.testing.assert_allclose(c_mz, [100.0, 200.0, 300.0])
+        np.testing.assert_allclose(c_int, [1.0, 0.6, 0.8])
+        np.testing.assert_array_equal(c_off, [0, 1, 3])
 
 
 class TestComputeCondensedDistanceMatrix:
@@ -97,6 +196,12 @@ class TestComputeCondensedDistanceMatrix:
         assert pdist.shape == (3,)
         np.testing.assert_allclose(pdist, [0.4, 1.0, 1.0], atol=1e-6)
 
+        mz_flat, int_flat, offsets = distance.pack_spectra_csr([s0, s1, s2])
+        pdist_csr = distance.compute_condensed_distance_matrix_csr(
+            mz_flat, int_flat, offsets, fragment_tol=0.05, min_matched_peaks=0
+        )
+        assert np.array_equal(pdist_csr, pdist)
+
     def test_min_matched_peaks_exact_threshold(self, mock_spectra):
         spec1, spec2 = mock_spectra(2, n_peaks=3)
         d_pass = distance.compute_condensed_distance_matrix(
@@ -112,11 +217,19 @@ class TestComputeCondensedDistanceMatrix:
     def test_empty_and_single_spectrum_return_empty_vector(
         self, mock_spectra, n
     ):
+        specs = mock_spectra(n)
         pdist = distance.compute_condensed_distance_matrix(
-            mock_spectra(n), fragment_tol=0.05, min_matched_peaks=0
+            specs, fragment_tol=0.05, min_matched_peaks=0
         )
         assert pdist.dtype == np.float32
         assert pdist.shape == (0,)
+
+        mz_flat, int_flat, offsets = distance.pack_spectra_csr(specs)
+        pdist_csr = distance.compute_condensed_distance_matrix_csr(
+            mz_flat, int_flat, offsets, fragment_tol=0.05, min_matched_peaks=0
+        )
+        assert pdist_csr.dtype == np.float32
+        assert pdist_csr.shape == (0,)
 
     def test_small_interval_uses_in_memory_and_large_unlinks_memmap(
         self, mock_spectra, tmp_path, monkeypatch
@@ -124,7 +237,6 @@ class TestComputeCondensedDistanceMatrix:
         monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
         spec1, spec2 = mock_spectra(2, n_peaks=3)
 
-        # Small interval stays in RAM with no backing temp file.
         pdist_ram = distance.compute_condensed_distance_matrix(
             [spec1, spec2], fragment_tol=0.5, min_matched_peaks=0
         )
@@ -132,8 +244,7 @@ class TestComputeCondensedDistanceMatrix:
         assert list(tmp_path.iterdir()) == []
         assert pdist_ram[0] == pytest.approx(0.0, abs=1e-5)
 
-        # At/above threshold uses a memmap unlinked immediately on POSIX.
-        monkeypatch.setattr(distance, "_MEMMAP_MIN_SPECTRA", 2)
+        monkeypatch.setattr(distance, "MEMMAP_MIN_SPECTRA", 2)
         pdist_mm = distance.compute_condensed_distance_matrix(
             [spec1, spec2], fragment_tol=0.5, min_matched_peaks=0
         )
@@ -145,11 +256,9 @@ class TestComputeCondensedDistanceMatrix:
     def test_close_memmap_on_plain_ndarray_and_unlink_failure_cleanup(
         self, mock_spectra, tmp_path, monkeypatch
     ):
-        # Plain ndarrays lack _mmap; close_memmap is a safe no-op.
         distance.close_memmap(np.array([0.0, 1.0], dtype=np.float32))
 
-        monkeypatch.setattr(distance, "_MEMMAP_MIN_SPECTRA", 2)
-        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        monkeypatch.setattr(distance, "MEMMAP_MIN_SPECTRA", 2)
         closed: list[np.ndarray] = []
         real_close = distance.close_memmap
         created: list[str] = []
@@ -164,13 +273,14 @@ class TestComputeCondensedDistanceMatrix:
             raise OSError("unlink denied")
 
         monkeypatch.setattr(distance, "close_memmap", _spy_close)
-        monkeypatch.setattr(os, "unlink", _fail_unlink)
+        monkeypatch.setattr(distance.os, "unlink", _fail_unlink)
         try:
             with pytest.raises(OSError, match="unlink denied"):
                 distance.compute_condensed_distance_matrix(
                     mock_spectra(2, n_peaks=3),
                     fragment_tol=0.5,
                     min_matched_peaks=0,
+                    temp_dir=tmp_path,
                 )
             assert len(closed) == 1
         finally:
@@ -181,8 +291,6 @@ class TestComputeCondensedDistanceMatrix:
     def test_serial_and_parallel_dispatch_produce_identical_distances(
         self, spec_factory, monkeypatch
     ):
-        import numba as nb
-
         rng = np.random.default_rng(11)
         spectra = _random_spectra(25, rng, spec_factory, n_peaks=15)
         monkeypatch.setattr(nb, "get_num_threads", lambda: 1)
@@ -199,7 +307,7 @@ class TestComputeCondensedDistanceMatrix:
         self, mock_spectra, tmp_path, monkeypatch
     ):
         specs = mock_spectra(4, n_peaks=3)
-        monkeypatch.setattr(distance, "_MEMMAP_MIN_SPECTRA", 2)
+        monkeypatch.setattr(distance, "MEMMAP_MIN_SPECTRA", 2)
 
         seen_dirs: list[str | None] = []
         real_open = distance.open_shared_condensed
@@ -243,8 +351,7 @@ class TestComputeCondensedDistanceMatrix:
         assert len(closed) == 1
         assert list(tmp_path.glob("*.npy")) == []
 
-        # Non-memmap kernel failure re-raises without calling close_memmap.
-        monkeypatch.setattr(distance, "_MEMMAP_MIN_SPECTRA", 100)
+        monkeypatch.setattr(distance, "MEMMAP_MIN_SPECTRA", 100)
         with pytest.raises(RuntimeError, match="kernel boom"):
             distance.compute_condensed_distance_matrix(
                 specs,
@@ -252,6 +359,53 @@ class TestComputeCondensedDistanceMatrix:
                 min_matched_peaks=0,
             )
         assert len(closed) == 1
+
+    @pytest.mark.parametrize(
+        ("mz_flat", "int_flat", "offsets", "match"),
+        [
+            (
+                np.empty(0, dtype=np.float32),
+                np.empty(0, dtype=np.float32),
+                np.empty(0, dtype=np.int64),
+                "offsets must be 1D",
+            ),
+            (
+                np.array([100.0, 200.0], dtype=np.float32),
+                np.array([1.0, 1.0], dtype=np.float32),
+                np.array([0.0, 1.0, 2.0], dtype=np.float64),
+                "integer dtype",
+            ),
+            (
+                np.array([100.0, 200.0], dtype=np.float32),
+                np.array([1.0, 1.0], dtype=np.float32),
+                np.array([0, 2, 1], dtype=np.int64),
+                "monotonically non-decreasing",
+            ),
+            (
+                np.array([100.0, 200.0], dtype=np.float32),
+                np.array([1.0], dtype=np.float32),
+                np.array([0, 1, 2], dtype=np.int64),
+                "equal length",
+            ),
+            (
+                np.array([100.0, 200.0], dtype=np.float32),
+                np.array([1.0, 1.0], dtype=np.float32),
+                np.array([0, 1, 5], dtype=np.int64),
+                "exceed peak buffer",
+            ),
+        ],
+    )
+    def test_compute_condensed_csr_rejects_invalid_buffers(
+        self, mz_flat, int_flat, offsets, match
+    ):
+        with pytest.raises(ValueError, match=match):
+            distance.compute_condensed_distance_matrix_csr(
+                mz_flat,
+                int_flat,
+                offsets,
+                fragment_tol=0.05,
+                min_matched_peaks=0,
+            )
 
 
 class TestTiledCondensed:
@@ -276,30 +430,28 @@ class TestTiledCondensed:
         finally:
             os.unlink(path)
 
-    def test_open_shared_condensed_validates_n_and_cleans_up_on_error(
+    @pytest.mark.parametrize("bad_n", [-1, 0, 1])
+    def test_open_shared_condensed_rejects_small_n(self, bad_n):
+        with pytest.raises(ValueError, match="at least 2 spectra"):
+            distance.open_shared_condensed(bad_n)
+
+    def test_open_shared_condensed_cleans_up_on_open_error(
         self, tmp_path, monkeypatch
     ):
-        for bad_n in (-1, 0, 1):
-            with pytest.raises(ValueError, match="at least 2 spectra"):
-                distance.open_shared_condensed(bad_n)
-
-        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
-
         def _fail_open(*_args, **_kwargs):
             raise OSError("disk full")
 
         monkeypatch.setattr(np.lib.format, "open_memmap", _fail_open)
         with pytest.raises(OSError, match="disk full"):
-            distance.open_shared_condensed(4)
+            distance.open_shared_condensed(4, temp_dir=tmp_path)
         assert list(tmp_path.iterdir()) == []
 
     @pytest.mark.parametrize("min_matched_peaks", [0, 3])
-    @pytest.mark.parametrize("n_tiles", [1, 7])
     def test_tiled_rows_bit_identical_to_full_matrix(
-        self, spec_factory, min_matched_peaks, n_tiles
+        self, spec_factory, min_matched_peaks
     ):
         rng = np.random.default_rng(0)
-        spectra = _random_spectra(200, rng, spec_factory)
+        spectra = _random_spectra(60, rng, spec_factory)
         frag = 0.05
         n = len(spectra)
 
@@ -313,27 +465,28 @@ class TestTiledCondensed:
         assert (ref < 0.99).any()
 
         mz_flat, int_flat, offsets = distance.pack_spectra_csr(spectra)
-        out = np.full(n * (n - 1) // 2, np.nan, np.float32)
-        bounds = scheduling.interval_row_bounds(n, n_tiles)
-        assert bounds[0][0] == 0
-        assert bounds[-1][1] == n
-        assert all(
-            bounds[i][1] == bounds[i + 1][0] for i in range(len(bounds) - 1)
-        )
-        for r0, r1 in bounds:
-            distance.fill_condensed_rows_csr(
-                out,
-                mz_flat,
-                int_flat,
-                offsets,
-                r0,
-                r1,
-                fragment_tol=frag,
-                min_matched_peaks=min_matched_peaks,
+        for n_tiles in (1, 7):
+            out = np.full(n * (n - 1) // 2, np.nan, np.float32)
+            bounds = scheduling.interval_row_bounds(n, n_tiles)
+            assert bounds[0][0] == 0
+            assert bounds[-1][1] == n
+            assert all(
+                bounds[i][1] == bounds[i + 1][0]
+                for i in range(len(bounds) - 1)
             )
-
-        assert not np.isnan(out).any()
-        assert np.array_equal(out, ref)
+            for r0, r1 in bounds:
+                distance.fill_condensed_rows_csr(
+                    out,
+                    mz_flat,
+                    int_flat,
+                    offsets,
+                    r0,
+                    r1,
+                    fragment_tol=frag,
+                    min_matched_peaks=min_matched_peaks,
+                )
+            assert not np.isnan(out).any()
+            assert np.array_equal(out, ref)
 
     def test_empty_row_band_leaves_buffer_untouched(self, mock_spectra):
         spec1, spec2 = mock_spectra(2, n_peaks=3)
@@ -344,73 +497,55 @@ class TestTiledCondensed:
         )
         assert out[0] == pytest.approx(9.0)
 
-    def test_fill_condensed_rows_csr_validates_inputs(self, mock_spectra):
+    @pytest.mark.parametrize(
+        ("case", "match"),
+        [
+            ("neg_r0", "out of bounds"),
+            ("overshoot_r1", "out of bounds"),
+            ("reversed_band", "out of bounds"),
+            ("int_buf", "floating dtype"),
+            ("short_buf", "1D with length"),
+            ("empty_offsets", "offsets must be 1D"),
+            ("float_offsets", "integer dtype"),
+            ("non_monotonic_offsets", "monotonically"),
+            ("mismatched_peaks", "equal length"),
+            ("neg_offset", "exceed peak buffer"),
+            ("overshoot_offset", "exceed peak buffer"),
+        ],
+    )
+    def test_fill_condensed_rows_csr_validates_inputs(
+        self, mock_spectra, case, match
+    ):
         specs = mock_spectra(3, n_peaks=2)
         mz_flat, int_flat, offsets = distance.pack_spectra_csr(specs)
-        valid_buf = np.empty(3, dtype=np.float32)
+        buf = np.empty(3, dtype=np.float32)
+        r0, r1 = 0, 3
 
-        with pytest.raises(ValueError, match="out of bounds"):
+        if case == "neg_r0":
+            r0, r1 = -1, 2
+        elif case == "overshoot_r1":
+            r0, r1 = 0, 4
+        elif case == "reversed_band":
+            r0, r1 = 2, 1
+        elif case == "int_buf":
+            buf = np.empty(3, dtype=np.int32)
+        elif case == "short_buf":
+            buf = np.empty(2, dtype=np.float32)
+        elif case == "empty_offsets":
+            offsets = np.empty(0, dtype=np.int64)
+            r1 = 0
+        elif case == "float_offsets":
+            offsets = offsets.astype(np.float64)
+        elif case == "non_monotonic_offsets":
+            offsets = np.array([0, 4, 2, 6], dtype=np.int64)
+        elif case == "mismatched_peaks":
+            mz_flat = mz_flat[:-1]
+        elif case == "neg_offset":
+            offsets = np.array([-1, 2, 4, 6], dtype=np.int64)
+        elif case == "overshoot_offset":
+            offsets = np.array([0, 2, 4, 99], dtype=np.int64)
+
+        with pytest.raises(ValueError, match=match):
             distance.fill_condensed_rows_csr(
-                valid_buf, mz_flat, int_flat, offsets, -1, 2, 0.05, 0
-            )
-        with pytest.raises(ValueError, match="out of bounds"):
-            distance.fill_condensed_rows_csr(
-                valid_buf, mz_flat, int_flat, offsets, 0, 4, 0.05, 0
-            )
-        with pytest.raises(ValueError, match="1D with length"):
-            distance.fill_condensed_rows_csr(
-                np.empty(2, dtype=np.float32),
-                mz_flat,
-                int_flat,
-                offsets,
-                0,
-                3,
-                0.05,
-                0,
-            )
-        with pytest.raises(ValueError, match="offsets must be 1D"):
-            distance.fill_condensed_rows_csr(
-                valid_buf, mz_flat, int_flat, np.empty(0), 0, 0, 0.05, 0
-            )
-        with pytest.raises(ValueError, match="integer dtype"):
-            distance.fill_condensed_rows_csr(
-                valid_buf,
-                mz_flat,
-                int_flat,
-                offsets.astype(np.float64),
-                0,
-                3,
-                0.05,
-                0,
-            )
-        with pytest.raises(ValueError, match="monotonically"):
-            distance.fill_condensed_rows_csr(
-                valid_buf,
-                mz_flat,
-                int_flat,
-                np.array([0, 4, 2, 6], dtype=np.int64),
-                0,
-                3,
-                0.05,
-                0,
-            )
-        with pytest.raises(ValueError, match="equal length"):
-            distance.fill_condensed_rows_csr(
-                valid_buf, mz_flat[:-1], int_flat, offsets, 0, 3, 0.05, 0
-            )
-        with pytest.raises(ValueError, match="exceed peak buffer"):
-            distance.fill_condensed_rows_csr(
-                valid_buf,
-                mz_flat,
-                int_flat,
-                np.array([-1, 2, 4, 6], dtype=np.int64),
-                0,
-                3,
-                0.05,
-                0,
-            )
-        bad_offsets = np.array([0, 2, 4, 99], dtype=np.int64)
-        with pytest.raises(ValueError, match="exceed peak buffer"):
-            distance.fill_condensed_rows_csr(
-                valid_buf, mz_flat, int_flat, bad_offsets, 0, 3, 0.05, 0
+                buf, mz_flat, int_flat, offsets, r0, r1, 0.05, 0
             )

@@ -3,6 +3,7 @@
 import pyarrow as pa
 import pytest
 
+import falcon.dataset as dataset_mod
 from falcon.dataset import (
     BUCKET_PREFIX,
     BUCKET_SUFFIX,
@@ -62,6 +63,9 @@ class TestDatasetSchemaAndConstants:
         assert set(CANONICAL_SORT_COLUMNS) <= schema_names
         assert set(METADATA_COLUMNS) <= schema_names
         assert set(INTERVAL_COLUMNS) == schema_names
+        assert "SPECTRUM_SCHEMA" in dir(dataset_mod)
+        with pytest.raises(AttributeError, match="nonexistent_attr"):
+            _ = dataset_mod.nonexistent_attr
 
 
 class TestBucketNamingHelpers:
@@ -119,6 +123,14 @@ class TestBucketNamingHelpers:
     def test_format_bucket_label_rejects_invalid_types(self, bad_bucket):
         with pytest.raises(TypeError, match="Unsupported bucket key type"):
             format_bucket_label(bad_bucket)
+
+    @pytest.mark.parametrize(
+        "helper",
+        [bucket_key_to_str, bucket_dataset_name, format_bucket_label],
+    )
+    def test_bucket_helpers_reject_empty_tuple(self, helper):
+        with pytest.raises(ValueError, match="must not be empty"):
+            helper(())
 
     def test_is_bucket_dataset_name_and_sorted_interval_columns(self):
         assert is_bucket_dataset_name("spectra_charge_2.lance")

@@ -16,6 +16,8 @@ import zlib
 from pathlib import Path
 from typing import IO, TYPE_CHECKING, Any, cast
 
+from ..types import PathLike
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
@@ -23,6 +25,8 @@ if TYPE_CHECKING:
     import spectrum_utils.spectrum as sus
 
 logger = logging.getLogger(__name__)
+
+SourceType = IO[Any] | PathLike
 
 # Per-spectrum parsing exceptions recovered by skipping the entry.
 PARSE_EXCEPTIONS = (
@@ -36,24 +40,104 @@ PARSE_EXCEPTIONS = (
 
 __all__ = [
     "PARSE_EXCEPTIONS",
+    "SourceType",
     "base_filename",
     "build_msms_spectrum",
     "iter_xml_spectra",
     "log_skipped_spectrum",
     "normalize_source",
+    "parse_optional_charge",
+    "parse_optional_rt",
     "path_stem",
 ]
 
 
-def normalize_source(
-    source: IO[Any] | str | os.PathLike[str],
-) -> IO[Any] | str:
+def _is_blank(value: Any) -> bool:
+    """Return True if ``value`` is ``None`` or a blank string."""
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
+def parse_optional_rt(raw_rt: Any) -> float:
+    """
+    Parse an optional retention time scalar or MGF ``(lo, hi)`` range.
+
+    Missing, blank, or empty sequence values become ``NaN``. Two-element
+    ranges (MGF ``RTINSECONDS``) return their midpoint after rejecting
+    non-finite endpoints that could otherwise cancel into ``NaN``.
+
+    Parameters
+    ----------
+    raw_rt : Any
+        Raw retention time value from a Pyteomics spectrum record.
+
+    Returns
+    -------
+    float
+        Parsed numeric retention time or ``NaN`` when absent.
+
+    Raises
+    ------
+    ValueError
+        If a range endpoint is infinite or numeric conversion fails.
+    """
+    if _is_blank(raw_rt):
+        return float("nan")
+    if isinstance(raw_rt, (tuple, list)):
+        if not raw_rt:
+            return float("nan")
+        if len(raw_rt) >= 2:
+            lo = float(raw_rt[0])
+            hi = float(raw_rt[1])
+            if math.isinf(lo) or math.isinf(hi):
+                raise ValueError(
+                    "Retention time range endpoints must be finite or NaN, "
+                    f"got ({lo!r}, {hi!r})"
+                )
+            return (lo + hi) / 2.0
+        return float(raw_rt[0])
+    return float(raw_rt)
+
+
+def parse_optional_charge(
+    raw_charge: Any, *, negative: bool = False
+) -> int | None:
+    """
+    Extract an optional integer charge from a scalar or sequence.
+
+    When a sequence is provided (e.g., MGF ``ChargeList`` or multi-value
+    mzML ``possible charge state``), uses the first entry. Blank,
+    ``None``, or empty inputs return ``None``.
+
+    Parameters
+    ----------
+    raw_charge : Any
+        Raw charge scalar or sequence from a Pyteomics spectrum record.
+    negative : bool, default=False
+        When ``True``, negate the charge magnitude for negative-mode
+        scans.
+
+    Returns
+    -------
+    int | None
+        Signed integer charge state, or ``None`` when absent.
+    """
+    if isinstance(raw_charge, (list, tuple)):
+        if not raw_charge:
+            return None
+        raw_charge = raw_charge[0]
+    if _is_blank(raw_charge):
+        return None
+    charge = int(raw_charge)
+    return -abs(charge) if negative else charge
+
+
+def normalize_source(source: SourceType) -> IO[Any] | str:
     """
     Convert ``os.PathLike`` inputs to ``str`` for Pyteomics readers.
 
     Parameters
     ----------
-    source : IO[Any] | str | os.PathLike[str]
+    source : SourceType
         Peak file path or open file object.
 
     Returns
@@ -79,11 +163,13 @@ def path_stem(value: Any) -> str | None:
     -------
     str | None
         Filename stem without its final suffix, or ``None`` if
-        ``value`` is not path-like or yields an empty stem.
+        ``value`` is not path-like or yields an empty/whitespace/``..``
+        stem.
     """
     if not isinstance(value, (str, bytes, os.PathLike)):
         return None
-    return Path(os.fsdecode(os.fspath(value))).stem or None
+    stem = Path(os.fsdecode(os.fspath(value))).stem
+    return stem if stem.strip() and stem != ".." else None
 
 
 def base_filename(
@@ -199,7 +285,7 @@ def build_msms_spectrum(
 
 
 def log_skipped_spectrum(
-    source: IO[Any] | str | os.PathLike[str],
+    source: SourceType,
     identifier: Any,
     exc: Exception,
     log: logging.Logger = logger,
@@ -213,7 +299,7 @@ def log_skipped_spectrum(
 
     Parameters
     ----------
-    source : IO[Any] | str | os.PathLike[str]
+    source : SourceType
         Peak file path or open file object being read.
     identifier : Any
         Spectrum identifier or title if available.
@@ -229,7 +315,7 @@ def log_skipped_spectrum(
 
 
 def iter_xml_spectra(
-    source: IO[Any] | str | os.PathLike[str],
+    source: SourceType,
     reader_cls: Callable[[IO[Any] | str], Any],
     ms_level_key: str,
     extract_scan_nr: Callable[[dict[str, Any]], str | None],
@@ -246,7 +332,7 @@ def iter_xml_spectra(
 
     Parameters
     ----------
-    source : IO[Any] | str | os.PathLike[str]
+    source : SourceType
         Path or open file object for the XML peak source.
     reader_cls : Callable[[IO[Any] | str], Any]
         Pyteomics XML reader class or opener callable (e.g. ``MzML``,

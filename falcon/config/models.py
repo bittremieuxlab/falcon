@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, Literal, Self, TypeVar
 
@@ -15,9 +16,18 @@ from pydantic import (
 
 from ..types import (
     AUTO_SENTINEL,
+    DEFAULT_MAX_MZ,
+    DEFAULT_MIN_MZ,
+    DEFAULT_OUTLIER_CUTOFF_LOWER,
+    DEFAULT_OUTLIER_CUTOFF_UPPER,
+    INT8_MAX,
+    INT8_MIN,
     INT32_MAX,
     NONE_SENTINEL,
-    ChargeBucket,
+    ConsensusMethod,
+    LinkageMethod,
+    PrecursorTolMode,
+    ScalingMethod,
     mz_bin_bounds,
     parse_optional_charge_buckets,
 )
@@ -26,18 +36,9 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from pydantic import GetJsonSchemaHandler
+    from pydantic.fields import FieldInfo
     from pydantic.json_schema import JsonSchemaValue
     from pydantic_core import core_schema
-
-DEFAULT_MIN_MZ: float = 101.0
-DEFAULT_MAX_MZ: float = 1500.0
-DEFAULT_OUTLIER_CUTOFF_LOWER: float = 1.5
-DEFAULT_OUTLIER_CUTOFF_UPPER: float = 1.5
-
-PrecursorTolMode = Literal["ppm", "Da"]
-ScalingMethod = Literal["off", "root", "log", "rank"]
-LinkageMethod = Literal["single", "complete", "average"]
-ConsensusMethod = Literal["medoid", "average"]
 
 __all__ = [
     "DEFAULT_MAX_MZ",
@@ -59,6 +60,8 @@ __all__ = [
     "PrecursorTolerance",
     "PreprocessingConfig",
     "ScalingMethod",
+    "sentinel_for_field",
+    "validate_file_path",
 ]
 
 _T = TypeVar("_T")
@@ -80,17 +83,57 @@ class _AllowSentinelSchema:
         handler: GetJsonSchemaHandler,
     ) -> JsonSchemaValue:
         json_schema = handler(schema)
-        if "anyOf" in json_schema:
-            json_schema["anyOf"] = [
-                *json_schema["anyOf"],
-                {"type": "string", "const": self.sentinel},
-            ]
+        json_schema["anyOf"] = [
+            *json_schema["anyOf"],
+            {"type": "string", "const": self.sentinel},
+        ]
         return json_schema
+
+
+class _RelaxUnionSchema:
+    """Relax a discriminated union's ``oneOf`` to ``anyOf``."""
+
+    def __get_pydantic_json_schema__(
+        self,
+        schema: core_schema.CoreSchema,
+        handler: GetJsonSchemaHandler,
+    ) -> JsonSchemaValue:
+        json_schema = handler(schema)
+        json_schema["anyOf"] = json_schema.pop("oneOf")
+        return json_schema
+
+
+def sentinel_for_field(field_info: FieldInfo) -> str | None:
+    """
+    Return the TOML/CLI disable sentinel configured on ``field_info``.
+
+    Parameters
+    ----------
+    field_info : FieldInfo
+        Pydantic field metadata object.
+
+    Returns
+    -------
+    str | None
+        Configured sentinel literal (e.g. ``"none"`` or ``"auto"``), or
+        ``None`` if the field has no sentinel.
+    """
+    for meta in field_info.metadata:
+        if isinstance(meta, _AllowSentinelSchema):
+            return meta.sentinel
+    return None
 
 
 def _none_sentinel(value: Any) -> Any:
     """Normalize the TOML/CLI ``"none"`` sentinel to ``None``."""
     return None if value == NONE_SENTINEL else value
+
+
+def _default_consensus_method(value: Any) -> Any:
+    """Default an omitted ``consensus.method`` key to ``"medoid"``."""
+    if isinstance(value, Mapping) and "method" not in value:
+        return {"method": "medoid", **value}
+    return value
 
 
 def _optional(
@@ -111,30 +154,39 @@ def _optional(
 _DIR_LIKE_SUFFIXES: tuple[str, ...] = ("/", "\\", "/.", "\\.", "/..", "\\..")
 
 
-def _parse_path(value: Any) -> Path:
+def _parse_path(value: Any, *, label: str = "Path") -> Path:
     """Validate and convert a non-empty string or Path to ``Path``."""
-    if isinstance(value, Path):
-        if not str(value).strip():
-            raise ValueError("Path must not be empty or whitespace")
-        return value
-    if isinstance(value, str):
-        if not value.strip():
-            raise ValueError("Path must not be empty or whitespace")
-        return Path(value)
-    raise ValueError(
-        f"Expected a path string or Path, got {type(value).__name__}"
-    )
+    if not isinstance(value, (str, Path)):
+        raise ValueError(
+            f"Expected a path string or Path for {label}, got "
+            f"{type(value).__name__}"
+        )
+    if not str(value).strip():
+        raise ValueError(f"{label} must not be empty or whitespace")
+    return value if isinstance(value, Path) else Path(value)
 
 
 def validate_file_path(value: Any, *, label: str) -> Path:
-    """Validate a file or prefix path (rejecting directory paths)."""
-    if isinstance(value, str) and not value.strip():
-        raise ValueError(f"{label} must not be empty or whitespace")
+    """
+    Validate a file or prefix path, rejecting directory-like paths.
+
+    Parameters
+    ----------
+    value : Any
+        Raw path string or ``Path`` instance.
+    label : str
+        Human-readable label included in validation errors.
+
+    Returns
+    -------
+    Path
+        Validated file or prefix path.
+    """
     if isinstance(value, str) and value.endswith(_DIR_LIKE_SUFFIXES):
         raise ValueError(
             f"{label} is a directory path, expected a file path: {value!r}"
         )
-    path = _parse_path(value)
+    path = _parse_path(value, label=label)
     if not path.name.strip() or path.name in (".", ".."):
         raise ValueError(
             f"{label} must include a non-empty file name, got {str(path)!r}"
@@ -165,6 +217,19 @@ def _parse_input_filenames(value: Any) -> tuple[str, ...]:
 
 _NonNegFloat = Annotated[float, Field(ge=0.0, allow_inf_nan=False)]
 _PosFloat = Annotated[float, Field(gt=0.0, allow_inf_nan=False)]
+_NonEmptyStr = Annotated[str, Field(json_schema_extra={"minLength": 1})]
+_NonEmptyPath = Annotated[Path, Field(json_schema_extra={"minLength": 1})]
+_InputPatterns = Annotated[tuple[_NonEmptyStr, ...], Field(min_length=1)]
+
+_SchemaChargeInt = Annotated[int, Field(ge=INT8_MIN, le=INT8_MAX)]
+_SchemaChargeGroup = Annotated[
+    tuple[_SchemaChargeInt | Literal["unknown"], ...],
+    Field(min_length=1, json_schema_extra={"uniqueItems": True}),
+]
+_SchemaChargeBucket = _SchemaChargeGroup | Literal["other"]
+_SchemaChargeBuckets = Annotated[
+    tuple[_SchemaChargeBucket, ...], Field(min_length=1)
+]
 
 _OptionalNonNegFloat = Annotated[
     _NonNegFloat | None,
@@ -182,12 +247,12 @@ _OptionalPosInt = Annotated[
     _AllowSentinelSchema(NONE_SENTINEL),
 ]
 _OptionalWorkDir = Annotated[
-    Path | None,
+    _NonEmptyPath | None,
     BeforeValidator(_optional(_parse_path, allow_none_sentinel=True)),
     _AllowSentinelSchema(NONE_SENTINEL),
 ]
 _OptionalChargeBuckets = Annotated[
-    tuple[ChargeBucket, ...] | None,
+    _SchemaChargeBuckets | None,
     BeforeValidator(parse_optional_charge_buckets),
     _AllowSentinelSchema(AUTO_SENTINEL),
 ]
@@ -200,8 +265,14 @@ class PrecursorTolerance(BaseModel):
 
     model_config = _STRICT_MODEL_CONFIG
 
-    mass: _NonNegFloat = 20.0
-    mode: PrecursorTolMode = "ppm"
+    mass: _NonNegFloat = Field(
+        default=20.0,
+        description="Precursor mass tolerance value",
+    )
+    mode: PrecursorTolMode = Field(
+        default="ppm",
+        description='Precursor mass tolerance unit ("ppm" or "Da")',
+    )
 
 
 class PreprocessingConfig(BaseModel):
@@ -209,16 +280,46 @@ class PreprocessingConfig(BaseModel):
 
     model_config = _STRICT_MODEL_CONFIG
 
-    min_peaks: Annotated[int, Field(ge=1)] = 5
-    min_mz_range: _NonNegFloat = 250.0
-    min_mz: _NonNegFloat = DEFAULT_MIN_MZ
-    max_mz: _PosFloat = DEFAULT_MAX_MZ
-    remove_precursor_tol: _OptionalPosFloat = 1.5
+    min_peaks: Annotated[int, Field(ge=1)] = Field(
+        default=5,
+        description="Minimum number of peaks per spectrum",
+    )
+    min_mz_range: _NonNegFloat = Field(
+        default=250.0,
+        description="Minimum fragment m/z span per spectrum",
+    )
+    min_mz: _NonNegFloat = Field(
+        default=DEFAULT_MIN_MZ,
+        description="Minimum peak m/z inclusive",
+    )
+    max_mz: _PosFloat = Field(
+        default=DEFAULT_MAX_MZ,
+        description="Maximum peak m/z inclusive",
+    )
+    remove_precursor_tol: _OptionalPosFloat = Field(
+        default=1.5,
+        description=(
+            "Window (Da) around precursor m/z to remove peaks, or "
+            f"'{NONE_SENTINEL}' to disable"
+        ),
+    )
     min_intensity: Annotated[
         float, Field(ge=0.0, lt=1.0, allow_inf_nan=False)
-    ] = 0.01
-    max_peaks_used: _OptionalPosInt = 50
-    scaling: ScalingMethod = "off"
+    ] = Field(
+        default=0.01,
+        description="Minimum peak intensity relative to base peak in [0, 1)",
+    )
+    max_peaks_used: _OptionalPosInt = Field(
+        default=50,
+        description=(
+            f"Maximum most-intense peaks to retain, or '{NONE_SENTINEL}' "
+            "for all"
+        ),
+    )
+    scaling: ScalingMethod = Field(
+        default="off",
+        description="Peak intensity scaling method",
+    )
 
     @model_validator(mode="after")
     def _validate_invariants(self) -> Self:
@@ -249,17 +350,44 @@ class ClusteringConfig(BaseModel):
     model_config = _STRICT_MODEL_CONFIG
 
     precursor_tol: PrecursorTolerance = Field(
-        default_factory=PrecursorTolerance
+        default_factory=PrecursorTolerance,
+        description="Precursor mass tolerance value and unit",
     )
-    rt_tol: _OptionalNonNegFloat = None
-    fragment_tol: _PosFloat = 0.05
-    linkage: LinkageMethod = "complete"
+    rt_tol: _OptionalNonNegFloat = Field(
+        default=None,
+        description=(
+            f"Retention time tolerance, or '{NONE_SENTINEL}' to disable"
+        ),
+    )
+    fragment_tol: _PosFloat = Field(
+        default=0.05,
+        description="Fragment mass tolerance in m/z",
+    )
+    linkage: LinkageMethod = Field(
+        default="complete",
+        description="Hierarchical clustering linkage criterion",
+    )
     distance_threshold: Annotated[
         float, Field(gt=0.0, lt=1.0, allow_inf_nan=False)
-    ] = 0.1
-    min_matched_peaks: Annotated[int, Field(ge=0)] = 0
-    batch_size: Annotated[int, Field(ge=1)] = 2**15
-    precursor_charge_buckets: _OptionalChargeBuckets = None
+    ] = Field(
+        default=0.1,
+        description="Cosine distance threshold in (0, 1)",
+    )
+    min_matched_peaks: Annotated[int, Field(ge=0)] = Field(
+        default=0,
+        description="Minimum matched fragment peaks",
+    )
+    batch_size: Annotated[int, Field(ge=1)] = Field(
+        default=2**15,
+        description="Maximum spectra per precursor m/z batch",
+    )
+    precursor_charge_buckets: _OptionalChargeBuckets = Field(
+        default=None,
+        description=(
+            "Precursor charge groupings, or "
+            f"'{AUTO_SENTINEL}' to cluster each observed charge separately"
+        ),
+    )
 
 
 class MedoidConsensusConfig(BaseModel):
@@ -267,7 +395,10 @@ class MedoidConsensusConfig(BaseModel):
 
     model_config = _STRICT_MODEL_CONFIG
 
-    method: Literal["medoid"] = "medoid"
+    method: Literal["medoid"] = Field(
+        default="medoid",
+        description="Representative spectrum method",
+    )
 
 
 class AverageConsensusConfig(BaseModel):
@@ -275,14 +406,31 @@ class AverageConsensusConfig(BaseModel):
 
     model_config = _STRICT_MODEL_CONFIG
 
-    method: Literal["average"] = "average"
-    outlier_cutoff_lower: _PosFloat = DEFAULT_OUTLIER_CUTOFF_LOWER
-    outlier_cutoff_upper: _PosFloat = DEFAULT_OUTLIER_CUTOFF_UPPER
+    method: Literal["average"] = Field(
+        default="average",
+        description="Representative spectrum method",
+    )
+    outlier_cutoff_lower: _PosFloat = Field(
+        default=DEFAULT_OUTLIER_CUTOFF_LOWER,
+        description=(
+            "Lower sigma cutoff for consensus averaging (only valid when "
+            "consensus.method = 'average')"
+        ),
+    )
+    outlier_cutoff_upper: _PosFloat = Field(
+        default=DEFAULT_OUTLIER_CUTOFF_UPPER,
+        description=(
+            "Upper sigma cutoff for consensus averaging (only valid when "
+            "consensus.method = 'average')"
+        ),
+    )
 
 
 ConsensusConfig = Annotated[
     MedoidConsensusConfig | AverageConsensusConfig,
     Field(discriminator="method"),
+    BeforeValidator(_default_consensus_method),
+    _RelaxUnionSchema(),
 ]
 
 
@@ -291,35 +439,55 @@ class _BaseIOConfig(BaseModel):
 
     model_config = _STRICT_MODEL_CONFIG
 
-    work_dir: _OptionalWorkDir = None
-    overwrite: bool = False
-    export_representatives: bool = False
+    work_dir: _OptionalWorkDir = Field(
+        default=None,
+        description=(
+            f"Working directory for Lance staging cache, or "
+            f"'{NONE_SENTINEL}' for a temporary directory"
+        ),
+    )
+    overwrite: bool = Field(
+        default=False,
+        description="Overwrite existing results and cached staging files",
+    )
+    export_representatives: bool = Field(
+        default=False,
+        description="Export cluster representative spectra to an MGF file",
+    )
 
 
 class PartialIOConfig(_BaseIOConfig):
     """Input/output settings where paths may be omitted in overlays."""
 
     input_filenames: Annotated[
-        tuple[str, ...] | None,
+        _InputPatterns | None,
         BeforeValidator(_optional(_parse_input_filenames)),
-    ] = None
+    ] = Field(
+        default=None,
+        description="Input peak file path(s) or glob patterns",
+    )
     output_filename: Annotated[
-        Path | None,
+        _NonEmptyPath | None,
         BeforeValidator(_optional(_parse_output_prefix)),
-    ] = None
+    ] = Field(
+        default=None,
+        description="Output file prefix for cluster CSV and optional MGF",
+    )
 
 
 class IOConfig(_BaseIOConfig):
     """Complete input/output settings required to execute a run."""
 
     input_filenames: Annotated[
-        tuple[str, ...],
+        _InputPatterns,
         BeforeValidator(_parse_input_filenames),
-    ]
+    ] = Field(description="Input peak file path(s) or glob patterns")
     output_filename: Annotated[
-        Path,
+        _NonEmptyPath,
         BeforeValidator(_parse_output_prefix),
-    ]
+    ] = Field(
+        description="Output file prefix for cluster CSV and optional MGF"
+    )
 
     @property
     def csv_path(self) -> Path:

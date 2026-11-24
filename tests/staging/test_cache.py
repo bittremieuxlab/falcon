@@ -1,6 +1,7 @@
 """Unit tests for falcon.staging.cache (manifests and cache reuse)."""
 
 import json
+import logging
 import os
 from types import SimpleNamespace
 
@@ -9,6 +10,7 @@ import pytest
 from falcon import staging
 from falcon.dataset import bucket_dataset_name, spectra_dir
 from falcon.staging import cache as staging_cache
+from falcon.staging import ingest as staging_ingest
 
 
 def _bump_file(path, content):
@@ -31,7 +33,7 @@ def _forbid_stage_spectra(monkeypatch):
     def _fail(*_args, **_kwargs):
         raise AssertionError("stage_spectra should not be called")
 
-    monkeypatch.setattr(staging_cache, "stage_spectra", _fail)
+    monkeypatch.setattr(staging_ingest, "stage_spectra", _fail)
 
 
 @pytest.fixture
@@ -240,24 +242,77 @@ class TestStagingManifest:
         assert not target.exists()
         assert list(tmp_path.glob(".staging_cache_*.tmp")) == []
 
-    def test_clear_directory_unlinks_symlink_to_dir_preserving_target(
-        self, tmp_path
+    def test_diff_staging_manifests_rejects_bool_for_numeric_values(
+        self, tmp_path, config_factory
     ):
-        external = tmp_path / "external_dir"
+        src = tmp_path / "a.mgf"
+        src.write_bytes(b"x")  # size == 1 (matches Python True == 1)
+        cfg = config_factory(
+            input_filenames=[str(src)],
+            output_filename=tmp_path / "out",
+            preprocessing={"min_peaks": 1},
+            clustering={
+                "fragment_tol": 1.0,
+                "precursor_charge_buckets": [[1]],
+            },
+        )
+        expected = staging.build_staging_manifest(cfg, [src], buckets=[(1,)])
+
+        # JSON int/float numeric equality (1 == 1.0) still matches.
+        int_tol = {**expected, "fragment_tol": 1}
+        assert staging.diff_staging_manifests(int_tol, expected) == []
+
+        # Booleans must never compare equal to 0/1/1.0 in any section.
+        bad_inputs = {
+            **expected,
+            "inputs": [{**expected["inputs"][0], "size": True}],
+        }
+        assert staging.diff_staging_manifests(bad_inputs, expected) == [
+            "inputs"
+        ]
+        bad_prep = {
+            **expected,
+            "preprocessing": {**expected["preprocessing"], "min_peaks": True},
+        }
+        assert staging.diff_staging_manifests(bad_prep, expected) == [
+            "preprocessing"
+        ]
+        bad_tol = {**expected, "fragment_tol": True}
+        assert staging.diff_staging_manifests(bad_tol, expected) == [
+            "fragment_tol"
+        ]
+        bad_buckets = {**expected, "precursor_charge_buckets": [[True]]}
+        assert staging.diff_staging_manifests(bad_buckets, expected) == [
+            "precursor_charge_buckets"
+        ]
+
+    def test_overwrite_unlinks_symlink_to_dir_preserving_target(
+        self, cache_env, monkeypatch
+    ):
+        external = cache_env.work_dir / "external_dir"
         external.mkdir()
         keep_file = external / "keep.txt"
         keep_file.write_text("important", encoding="utf-8")
 
-        target = tmp_path / "clear_me"
-        target.mkdir()
-        (target / "sub").mkdir()
-        (target / "file.txt").write_text("bye", encoding="utf-8")
-        link = target / "linked_dir"
+        (cache_env.s_dir / "sub").mkdir()
+        (cache_env.s_dir / "file.txt").write_text("bye", encoding="utf-8")
+        link = cache_env.s_dir / "linked_dir"
         link.symlink_to(external)
 
-        staging_cache._clear_directory(target)
-        assert list(target.iterdir()) == []
+        monkeypatch.setattr(
+            staging_ingest,
+            "stage_spectra",
+            lambda _inputs, _wd, _proc, _buckets: [],
+        )
+        cfg = cache_env.make_cfg(io={"overwrite": True})
+        assert (
+            staging.load_or_stage_buckets(
+                cfg, cache_env.work_dir, lambda _s: None
+            )
+            == []
+        )
         assert not link.is_symlink()
+        assert not (cache_env.s_dir / "sub").exists()
         assert keep_file.read_text(encoding="utf-8") == "important"
 
 
@@ -281,7 +336,7 @@ class TestLoadOrStageBuckets:
             io={"work_dir": str(fresh_work_dir)},
         )
         monkeypatch.setattr(
-            staging_cache,
+            staging_ingest,
             "stage_spectra",
             lambda _inputs, _wd, _proc, _buckets: [(2,)],
         )
@@ -296,7 +351,7 @@ class TestLoadOrStageBuckets:
         ).is_file()
 
     def test_reuses_matching_cache_across_clustering_and_consensus_changes(
-        self, cache_env, monkeypatch
+        self, cache_env, monkeypatch, caplog
     ):
         orig_cfg = cache_env.make_cfg(
             output_name="out1",
@@ -318,9 +373,15 @@ class TestLoadOrStageBuckets:
             consensus={"method": "average"},
         )
         _forbid_stage_spectra(monkeypatch)
-        assert staging.load_or_stage_buckets(
-            sweep_cfg, cache_env.work_dir, lambda _s: None
-        ) == [(1,), (2,)]
+        with caplog.at_level(logging.INFO, logger="falcon"):
+            reused = staging.load_or_stage_buckets(
+                sweep_cfg, cache_env.work_dir, lambda _s: None
+            )
+        assert reused == [(1,), (2,)]
+        assert any(
+            "Reusing validated staging cache" in r.message
+            for r in caplog.records
+        )
 
     @pytest.mark.parametrize(
         ("override_sections", "expected_section"),
@@ -433,7 +494,7 @@ class TestLoadOrStageBuckets:
 
         cfg = cache_env.make_cfg(io={"overwrite": True})
         monkeypatch.setattr(
-            staging_cache,
+            staging_ingest,
             "stage_spectra",
             lambda _inputs, _wd, _proc, _buckets: [(2,)],
         )
@@ -463,7 +524,7 @@ class TestLoadOrStageBuckets:
             return [(2,), ("unknown",), "other"]
 
         monkeypatch.setattr(
-            staging_cache, "stage_spectra", _stage_while_input_changes
+            staging_ingest, "stage_spectra", _stage_while_input_changes
         )
 
         buckets = staging.load_or_stage_buckets(
@@ -509,7 +570,7 @@ class TestLoadOrStageBuckets:
                 (cache_env.s_dir / name).mkdir()
             return [(2, 1), ("unknown",), "other"]
 
-        monkeypatch.setattr(staging_cache, "stage_spectra", _fake_stage)
+        monkeypatch.setattr(staging_ingest, "stage_spectra", _fake_stage)
 
         staging.load_or_stage_buckets(cfg, cache_env.work_dir, lambda _s: None)
 

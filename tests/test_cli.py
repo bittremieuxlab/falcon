@@ -1,6 +1,8 @@
 """Unit tests for falcon.cli argument parsing and entry point."""
 
+import argparse
 import json
+import logging
 import tomllib
 from pathlib import Path
 
@@ -10,6 +12,7 @@ from pydantic import ValidationError
 from falcon import __version__, pipeline
 from falcon.cli import (
     DumpSchemaAction,
+    NewlineTextHelpFormatter,
     PrintConfigAction,
     RunAction,
     build_parser,
@@ -436,13 +439,31 @@ class TestCliUtilityActionsAndErrorFormatting:
             "c.mzxml",
         )
 
-    def test_newline_help_formatter_preserves_initial_indent(self):
-        from falcon.cli import NewlineTextHelpFormatter
+    def test_newline_help_formatter_wraps_and_preserves_newlines_and_indent(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("COLUMNS", "50")
+        help_text = build_parser().format_help()
+        lines = help_text.splitlines()
+        assert f"falcon version {__version__}" in lines
+        assert any(
+            line.startswith("Configuration layers apply in order:")
+            for line in lines
+        )
 
-        fmt = NewlineTextHelpFormatter(prog="falcon")
-        filled = fmt._fill_text("hello world from falcon", 15, "  ")
-        for line in filled.splitlines():
-            assert line.startswith("  ")
+        # Group descriptions pass a non-empty indent to the formatter.
+        monkeypatch.setenv("COLUMNS", "22")
+        parser = argparse.ArgumentParser(
+            prog="falcon", formatter_class=NewlineTextHelpFormatter
+        )
+        parser.add_argument_group(
+            "Wrapped", description="hello world from falcon\nsecond line"
+        )
+        group_help = parser.format_help().split("Wrapped:\n", 1)[1]
+        group_lines = [line for line in group_help.splitlines() if line]
+        assert len(group_lines) >= 3
+        assert all(line.startswith("  ") for line in group_lines)
+        assert group_lines[-1] == "  second line"
 
 
 class TestCliMain:
@@ -464,8 +485,6 @@ class TestCliMain:
     def test_main_preserves_unrelated_logging_handlers(
         self, monkeypatch, isolated_root_logger
     ):
-        import logging
-
         class _TrackingHandler(logging.NullHandler):
             closed = False
 

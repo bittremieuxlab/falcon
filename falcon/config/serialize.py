@@ -6,19 +6,20 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .. import __version__
-from ..types import INT8_MAX, INT8_MIN, NONE_SENTINEL
-from ..utils import expand_input_globs, paths_alias, resolve_path
+from ..types import NONE_SENTINEL
+from ..utils import expand_input_globs, find_path_alias, resolve_path
 from .models import (
     ConfigError,
     FalconSettings,
     PrecursorTolerance,
-    _AllowSentinelSchema,
+    sentinel_for_field,
     validate_file_path,
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from pydantic import BaseModel
-    from pydantic.fields import FieldInfo
 
     from .models import FalconConfig
 
@@ -29,16 +30,21 @@ __all__ = [
     "write_saved_config",
 ]
 
-_TOML_ESCAPES: dict[str, str] = {
-    "\\": "\\\\",
-    '"': '\\"',
+_CONTROL_ESCAPES: dict[str, str] = {
     "\b": "\\b",
     "\t": "\\t",
     "\n": "\\n",
     "\f": "\\f",
     "\r": "\\r",
 }
+_TOML_ESCAPES: dict[str, str] = {
+    "\\": "\\\\",
+    '"': '\\"',
+    **_CONTROL_ESCAPES,
+}
 
+# I/O fields handled explicitly by TOML formatting (custom ordering /
+# comment fallbacks) and omitted from generic metadata lines.
 _IO_CUSTOM_FIELDS: frozenset[str] = frozenset(
     {"input_filenames", "output_filename", "work_dir"}
 )
@@ -106,14 +112,6 @@ def _format_optional_toml(
     return f"{prefix}{key} = {_toml_literal(sentinel)}"
 
 
-def _sentinel_for_field(field_info: FieldInfo) -> str | None:
-    """Return the configured TOML sentinel for ``field_info``."""
-    for meta in field_info.metadata:
-        if isinstance(meta, _AllowSentinelSchema):
-            return meta.sentinel
-    return None
-
-
 def _format_model_toml_lines(
     section: BaseModel,
     *,
@@ -125,7 +123,7 @@ def _format_model_toml_lines(
         if name in skip:
             continue
         value = getattr(section, name)
-        sentinel = _sentinel_for_field(field_info)
+        sentinel = sentinel_for_field(field_info)
         if sentinel is not None:
             lines.append(
                 _format_optional_toml(
@@ -147,14 +145,15 @@ def _format_metadata_value(value: Any) -> str:
         return text
     parts: list[str] = []
     for ch in text:
-        if ch in _TOML_ESCAPES and ch not in ('"', "\\"):
-            parts.append(_TOML_ESCAPES[ch])
+        escaped = _CONTROL_ESCAPES.get(ch)
+        if escaped is not None:
+            parts.append(escaped)
+            continue
+        code = ord(ch)
+        if code < 0x20 or code == 0x7F:
+            parts.append(f"\\x{code:02x}")
         else:
-            code = ord(ch)
-            if code < 0x20 or code == 0x7F:
-                parts.append(f"\\x{code:02x}")
-            else:
-                parts.append(ch)
+            parts.append(ch)
     return "".join(parts)
 
 
@@ -171,9 +170,10 @@ def _format_model_metadata_lines(
             continue
         value = getattr(section, name)
         if isinstance(value, PrecursorTolerance):
-            lines.append(f"{prefix}.{name} = {value.mass} {value.mode}")
+            formatted = f"{value.mass} {value.mode}"
         else:
-            lines.append(f"{prefix}.{name} = {value}")
+            formatted = _format_metadata_value(value)
+        lines.append(f"{prefix}.{name} = {formatted}")
     return lines
 
 
@@ -268,51 +268,13 @@ def format_metadata_lines(
     """
     effective_work_dir = cfg.io.work_dir if work_dir is None else work_dir
     return [
-        f"falcon version {__version__}",
+        f"falcon version {_format_metadata_value(__version__)}",
         f"io.work_dir = {_format_metadata_value(effective_work_dir)}",
         *_format_model_metadata_lines("io", cfg.io, skip=_IO_CUSTOM_FIELDS),
         *_format_model_metadata_lines("preprocessing", cfg.preprocessing),
         *_format_model_metadata_lines("clustering", cfg.clustering),
         *_format_model_metadata_lines("consensus", cfg.consensus),
     ]
-
-
-def _enrich_json_schema_constraints(schema: dict[str, Any]) -> None:
-    """Attach runtime validator constraints to the Pydantic schema."""
-    # Allow empty [consensus] tables (defaulting to medoid) by relaxing
-    # oneOf -> anyOf while preserving per-variant additionalProperties.
-    consensus_prop = schema.get("properties", {}).get("consensus")
-    if isinstance(consensus_prop, dict) and "oneOf" in consensus_prop:
-        consensus_prop["anyOf"] = consensus_prop.pop("oneOf")
-
-    defs = schema.get("$defs", {})
-    io_props = defs.get("PartialIOConfig", {}).get("properties", {})
-    if "input_filenames" in io_props:
-        for branch in io_props["input_filenames"].get("anyOf", ()):
-            if branch.get("type") == "array":
-                branch["minItems"] = 1
-                branch["items"] = {"type": "string", "minLength": 1}
-    for path_field in ("output_filename", "work_dir"):
-        if path_field in io_props:
-            for branch in io_props[path_field].get("anyOf", ()):
-                if branch.get("type") == "string" and "const" not in branch:
-                    branch["minLength"] = 1
-
-    clust_props = defs.get("ClusteringConfig", {}).get("properties", {})
-    buckets_schema = clust_props.get("precursor_charge_buckets", {})
-    for branch in buckets_schema.get("anyOf", ()):
-        if branch.get("type") != "array":
-            continue
-        branch["minItems"] = 1
-        for item_branch in branch.get("items", {}).get("anyOf", ()):
-            if item_branch.get("type") != "array":
-                continue
-            item_branch["minItems"] = 1
-            item_branch["uniqueItems"] = True
-            for elem in item_branch.get("items", {}).get("anyOf", ()):
-                if elem.get("type") == "integer":
-                    elem["minimum"] = INT8_MIN
-                    elem["maximum"] = INT8_MAX
 
 
 def build_json_schema() -> dict[str, Any]:
@@ -348,14 +310,13 @@ def build_json_schema() -> dict[str, Any]:
         },
         **schema.get("properties", {}),
     }
-    _enrich_json_schema_constraints(schema)
     return schema
 
 
 def _validate_save_destination(
     config: FalconConfig, destination: str | Path
 ) -> Path:
-    """Ensure ``destination`` is a file path distinct from I/O files."""
+    """Ensure ``destination`` is a file path distinct from I/O paths."""
     try:
         dest = validate_file_path(destination, label="Config output path")
     except ValueError as exc:
@@ -371,30 +332,25 @@ def _validate_save_destination(
             f"Config output path is a directory, expected a file path: {dest}"
         )
 
-    dest_exists = dest.exists()
-    for candidate in expand_input_globs(
-        config.io.input_filenames, keep_unmatched_literals=True
-    ):
-        if paths_alias(
-            dest,
-            candidate,
-            resolved_target=resolved_dest,
-            target_exists=dest_exists,
-        ):
+    alias_checks: list[tuple[str, Iterable[Path]]] = [
+        (
+            "input file",
+            expand_input_globs(
+                config.io.input_filenames, keep_unmatched_literals=True
+            ),
+        ),
+        ("output file", (config.io.csv_path, config.io.mgf_path)),
+    ]
+    if config.io.work_dir is not None:
+        alias_checks.append(("working directory", (config.io.work_dir,)))
+    for kind, candidates in alias_checks:
+        alias = find_path_alias(
+            dest, candidates, resolved_target=resolved_dest
+        )
+        if alias is not None:
             raise ConfigError(
-                f"Config output path {dest} aliases input file "
-                f"{candidate}; choose a distinct destination"
-            )
-    for out_path in (config.io.csv_path, config.io.mgf_path):
-        if paths_alias(
-            dest,
-            out_path,
-            resolved_target=resolved_dest,
-            target_exists=dest_exists,
-        ):
-            raise ConfigError(
-                f"Config output path {dest} aliases output file "
-                f"{out_path}; choose a distinct destination"
+                f"Config output path {dest} aliases {kind} "
+                f"{alias}; choose a distinct destination"
             )
     return dest
 
@@ -409,13 +365,13 @@ def write_saved_config(config: FalconConfig, destination: str | Path) -> None:
         Validated run configuration to serialize.
     destination : str | Path
         Target TOML file path (must not be a directory or alias any
-        configured input or output file).
+        configured input, output, or working-directory path).
 
     Raises
     ------
     ConfigError
-        If ``destination`` is a directory, aliases an input or output
-        file, or cannot be written.
+        If ``destination`` is a directory, aliases an input, output, or
+        working-directory path, or cannot be written.
     """
     dest = _validate_save_destination(config, destination)
     try:

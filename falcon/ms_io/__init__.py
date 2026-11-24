@@ -7,12 +7,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    import os
     from collections.abc import Iterable, Iterator
 
     import spectrum_utils.spectrum as sus
 
-    from ..types import ConsensusTuple
+    from ..types import ConsensusTuple, PathLike
     from . import mgf_io, mzml_io, mzxml_io
 
 _LAZY_SUBMODULES = frozenset({"mgf_io", "mzml_io", "mzxml_io"})
@@ -34,9 +33,7 @@ def __dir__() -> list[str]:
     return sorted({*globals(), *__all__})
 
 
-def get_spectra(
-    filename: str | os.PathLike[str],
-) -> Iterator[sus.MsmsSpectrum]:
+def get_spectra(filename: PathLike) -> Iterator[sus.MsmsSpectrum]:
     """
     Read MS/MS spectra from a peak file based on its extension.
 
@@ -45,7 +42,7 @@ def get_spectra(
 
     Parameters
     ----------
-    filename : str | os.PathLike[str]
+    filename : PathLike
         Path to the input peak file.
 
     Returns
@@ -87,7 +84,7 @@ def get_spectra(
 
 
 def write_spectra(
-    filename: str | os.PathLike[str], spectra: Iterable[ConsensusTuple]
+    filename: PathLike, spectra: Iterable[ConsensusTuple]
 ) -> None:
     """
     Write representative spectra to a peak file.
@@ -96,7 +93,7 @@ def write_spectra(
 
     Parameters
     ----------
-    filename : str | os.PathLike[str]
+    filename : PathLike
         Destination peak file path.
     spectra : Iterable[ConsensusTuple]
         Representative spectra to serialize.

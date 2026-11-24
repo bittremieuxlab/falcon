@@ -8,17 +8,20 @@ never pull in peak-file readers or parallel staging machinery.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
-import pyarrow as pa
+from .types import OTHER_BUCKET
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
     import lance
     import pandas as pd
+    import pyarrow as pa
 
     from .types import ChargeBucket
+
+    SPECTRUM_SCHEMA: pa.Schema
 
 SPECTRA_SUBDIR = "spectra"
 BUCKET_PREFIX = "spectra_charge_"
@@ -52,16 +55,6 @@ SORTED_INTERVAL_COLUMNS: tuple[str, ...] = (
     "mz",
     "intensity",
 )
-SPECTRUM_SCHEMA = pa.schema(
-    [
-        pa.field("identifier", pa.string()),
-        pa.field("precursor_mz", pa.float32()),
-        pa.field("precursor_charge", pa.int8()),
-        pa.field("mz", pa.list_(pa.float32())),
-        pa.field("intensity", pa.list_(pa.float32())),
-        pa.field("retention_time", pa.float32()),
-    ]
-)
 
 __all__ = [
     "BUCKET_PREFIX",
@@ -83,6 +76,31 @@ __all__ = [
 ]
 
 
+def __getattr__(name: str) -> Any:
+    """Lazily construct ``SPECTRUM_SCHEMA`` to defer PyArrow."""
+    if name == "SPECTRUM_SCHEMA":
+        import pyarrow as pa
+
+        schema = pa.schema(
+            [
+                pa.field("identifier", pa.string()),
+                pa.field("precursor_mz", pa.float32()),
+                pa.field("precursor_charge", pa.int8()),
+                pa.field("mz", pa.list_(pa.float32())),
+                pa.field("intensity", pa.list_(pa.float32())),
+                pa.field("retention_time", pa.float32()),
+            ]
+        )
+        globals()[name] = schema
+        return schema
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    """Include lazy ``SPECTRUM_SCHEMA`` in ``dir(falcon.dataset)``."""
+    return sorted({*globals(), *__all__})
+
+
 def spectra_dir(work_dir: Path) -> Path:
     """Return the ``spectra`` staging directory under ``work_dir``."""
     return work_dir / SPECTRA_SUBDIR
@@ -95,6 +113,17 @@ def is_bucket_dataset_name(name: str) -> bool:
         and name.startswith(BUCKET_PREFIX)
         and name.endswith(BUCKET_SUFFIX)
     )
+
+
+def _join_bucket(bucket: ChargeBucket, sep: str) -> str:
+    """Validate and join a canonical charge bucket with ``sep``."""
+    if bucket == OTHER_BUCKET:
+        return OTHER_BUCKET
+    if isinstance(bucket, tuple):
+        if len(bucket) == 0:
+            raise ValueError("Charge bucket must not be empty")
+        return sep.join(str(part) for part in bucket)
+    raise TypeError(f"Unsupported bucket key type: {type(bucket).__name__}")
 
 
 def bucket_key_to_str(bucket: ChargeBucket) -> str:
@@ -113,11 +142,7 @@ def bucket_key_to_str(bucket: ChargeBucket) -> str:
         Filename component without leading underscore (e.g. ``"1_2"``,
         ``"3_unknown"``, ``"other"``).
     """
-    if bucket == "other":
-        return "other"
-    if isinstance(bucket, tuple):
-        return "_".join(str(part) for part in bucket)
-    raise TypeError(f"Unsupported bucket key type: {type(bucket).__name__}")
+    return _join_bucket(bucket, "_")
 
 
 def bucket_dataset_name(bucket: ChargeBucket) -> str:
@@ -138,11 +163,7 @@ def format_bucket_label(bucket: ChargeBucket) -> str:
     ``"1, 2"``, ``("unknown",)`` becomes ``"unknown"``, and ``"other"``
     becomes ``"other"``.
     """
-    if bucket == "other":
-        return "other"
-    if isinstance(bucket, tuple):
-        return ", ".join(str(part) for part in bucket)
-    raise TypeError(f"Unsupported bucket key type: {type(bucket).__name__}")
+    return _join_bucket(bucket, ", ")
 
 
 def bucket_label_from_uri(uri: str, fallback: str) -> str:
@@ -162,7 +183,7 @@ def bucket_label_from_uri(uri: str, fallback: str) -> str:
     str
         Formatted charge label (e.g. ``"1, 2"`` or ``"unknown"``).
     """
-    name = Path(uri.rstrip("/")).name
+    name = Path(uri).name
     if is_bucket_dataset_name(name):
         key = name[len(BUCKET_PREFIX) : -len(BUCKET_SUFFIX)]
         return key.replace("_", ", ")

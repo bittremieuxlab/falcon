@@ -28,6 +28,8 @@ from .models import (
     PrecursorTolMode,
     PreprocessingConfig,
     ScalingMethod,
+    sentinel_for_field,
+    validate_file_path,
 )
 from .serialize import (
     build_json_schema,
@@ -63,5 +65,7 @@ __all__ = [
     "load_settings",
     "load_toml_file",
     "merge_config_dicts",
+    "sentinel_for_field",
+    "validate_file_path",
     "write_saved_config",
 ]

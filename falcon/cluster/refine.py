@@ -2,18 +2,20 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, get_args
 
 import numba as nb
 import numpy as np
 import scipy.cluster.hierarchy as sch
 
+from ..types import PrecursorTolMode
+
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-    from ..config.models import ClusteringConfig
+    from ..config import ClusteringConfig
 
-_VALID_TOL_MODES = frozenset({None, "Da", "ppm"})
+_VALID_TOL_MODES = frozenset({None, *get_args(PrecursorTolMode)})
 
 __all__ = [
     "cut_linkage",
@@ -168,6 +170,56 @@ def linkage_1d(values: np.ndarray, tol_mode: str | None = None) -> np.ndarray:
     return _linkage_1d_nb(values_f64, use_ppm)
 
 
+def _split_group_by_rt(group_rts: np.ndarray, rt_tol: float) -> np.ndarray:
+    """Return 0-based RT sub-cluster IDs for one precursor m/z group."""
+    valid_mask = np.isfinite(group_rts)
+    n_valid = int(np.count_nonzero(valid_mask))
+    n_group = group_rts.shape[0]
+    if n_valid == 0:
+        return np.zeros(n_group, dtype=np.int32)
+    if n_valid == n_group:
+        return cut_linkage(linkage_1d(group_rts), rt_tol)
+    rt_labels = np.empty(n_group, dtype=np.int32)
+    if n_valid >= 2:
+        valid_labels = cut_linkage(linkage_1d(group_rts[valid_mask]), rt_tol)
+        rt_labels[valid_mask] = valid_labels
+        n_rt = int(valid_labels.max()) + 1
+    else:
+        rt_labels[valid_mask] = 0
+        n_rt = 1
+    rt_labels[~valid_mask] = n_rt
+    return rt_labels
+
+
+def _refine_assignments_by_rt(
+    assignments: np.ndarray,
+    cluster_rts: np.ndarray,
+    rt_tol: float,
+    min_split_size: int,
+) -> np.ndarray:
+    """Split each m/z group independently by 1D RT complete linkage."""
+    counts = np.bincount(assignments)
+    if len(counts) == 1:
+        return _split_group_by_rt(cluster_rts, rt_tol)
+    if int(np.max(counts)) < min_split_size:
+        return assignments
+
+    mz_order = np.argsort(assignments, kind="stable")
+    sorted_mz = assignments[mz_order]
+    refined = np.empty(assignments.shape[0], dtype=np.int32)
+    next_id = 0
+    for start_i, stop_i in iter_cluster_groups(sorted_mz):
+        idx = mz_order[start_i:stop_i]
+        if stop_i - start_i >= min_split_size:
+            sub_labels = _split_group_by_rt(cluster_rts[idx], rt_tol)
+            refined[idx] = sub_labels + next_id
+            next_id += int(sub_labels.max()) + 1
+        else:
+            refined[idx] = next_id
+            next_id += 1
+    return refined
+
+
 def postprocess_cluster(
     cluster_labels: np.ndarray,
     cluster_mzs: np.ndarray,
@@ -181,9 +233,11 @@ def postprocess_cluster(
     """
     Refine an initial cluster by precursor m/z and optional RT span.
 
-    Writes contiguous output labels starting at ``start_label`` into
-    ``cluster_labels`` in place; groups smaller than ``min_samples``
-    receive unique singleton labels.
+    Splits first by full precursor m/z span via 1D complete linkage,
+    then optionally runs 1D RT complete linkage independently within
+    each m/z sub-cluster. Writes contiguous output labels starting at
+    ``start_label`` into ``cluster_labels`` in place; groups smaller
+    than ``min_samples`` receive unique singleton labels.
 
     Parameters
     ----------
@@ -192,8 +246,9 @@ def postprocess_cluster(
     cluster_mzs : np.ndarray
         Precursor m/z values of spectra in the initial cluster.
     cluster_rts : np.ndarray
-        Retention times aligned with ``cluster_mzs``. Non-finite entries
-        skip RT linkage and stay separate from finite-RT spectra.
+        Retention times aligned with ``cluster_mzs``. Within each m/z
+        sub-cluster, non-finite entries skip RT linkage and stay
+        separate from finite-RT spectra.
     precursor_tol_mass : float
         Maximum precursor m/z span within a refined cluster.
     precursor_tol_mode : {"Da", "ppm"}
@@ -219,28 +274,13 @@ def postprocess_cluster(
     mz_linkage = linkage_1d(cluster_mzs, precursor_tol_mode)
     assignments = cut_linkage(mz_linkage, precursor_tol_mass)
 
-    # Optionally intersect with an RT partition. Finite-RT spectra
-    # undergo 1D RT linkage; non-finite-RT spectra receive a dedicated
-    # RT code so they stay grouped by m/z without merging into
-    # finite-RT groups.
+    # Optionally refine each m/z sub-cluster independently by 1D RT
+    # complete linkage so interleaved RTs across distinct m/z groups
+    # never split valid (m/z, RT) pairs.
     if rt_tol is not None:
-        non_finite_mask = ~np.isfinite(cluster_rts)
-        if not non_finite_mask.all():
-            valid_mask = ~non_finite_mask
-            valid_rts = cluster_rts[valid_mask]
-            rt_labels = np.zeros(n_points, dtype=np.int32)
-            if len(valid_rts) >= 2:
-                valid_rt_labels = cut_linkage(linkage_1d(valid_rts), rt_tol)
-                rt_labels[valid_mask] = valid_rt_labels
-                n_rt = int(valid_rt_labels.max()) + 1
-            else:
-                n_rt = 1
-            rt_labels[non_finite_mask] = n_rt
-            # Injective mixed-radix encoding of (m/z, RT) pairs.
-            assignments = np.unique(
-                assignments.astype(np.int64) * (n_rt + 1) + rt_labels,
-                return_inverse=True,
-            )[1].astype(np.int32)
+        assignments = _refine_assignments_by_rt(
+            assignments, cluster_rts, rt_tol, max(2, min_samples)
+        )
 
     counts = np.bincount(assignments)
     n_groups = len(counts)
@@ -306,7 +346,24 @@ def refine_clusters(
         ``refined_labels[k]`` is the refined int32 label for canonical
         input index ``label_order[k]``, and ``n_clusters`` is the total
         number of refined clusters (including singletons).
+
+    Raises
+    ------
+    ValueError
+        If ``labels``, ``precursor_mzs``, and ``rts`` are not 1D arrays
+        of equal length.
     """
+    if labels.ndim != 1 or precursor_mzs.ndim != 1 or rts.ndim != 1:
+        raise ValueError("labels, precursor_mzs, and rts must be 1D arrays")
+    if (
+        precursor_mzs.shape[0] != labels.shape[0]
+        or rts.shape[0] != labels.shape[0]
+    ):
+        raise ValueError(
+            "labels, precursor_mzs, and rts must have matching lengths, "
+            f"got {labels.shape[0]}, {precursor_mzs.shape[0]}, and "
+            f"{rts.shape[0]}"
+        )
     label_order = np.argsort(labels, kind="stable")
     refined_labels = np.array(labels[label_order], dtype=np.int32, copy=True)
     mzs_ord = precursor_mzs[label_order]

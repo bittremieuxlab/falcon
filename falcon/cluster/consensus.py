@@ -3,25 +3,25 @@
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import numba as nb
 import numpy as np
 
-from ..config.models import (
+from ..types import (
     DEFAULT_OUTLIER_CUTOFF_LOWER,
     DEFAULT_OUTLIER_CUTOFF_UPPER,
-    AverageConsensusConfig,
-    MedoidConsensusConfig,
+    ConsensusTuple,
+    make_consensus_tuple,
+    mz_bin_bounds,
 )
-from ..types import ConsensusTuple, make_consensus_tuple, mz_bin_bounds
 from .distance import condensed_index, pack_spectra_csr
 from .refine import iter_cluster_groups
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from ..config.models import ConsensusConfig
+    from ..config import AverageConsensusConfig, ConsensusConfig
     from ..types import SpectrumTuple
 
 # Minimum cluster size required to select a medoid; 1- and 2-member
@@ -91,16 +91,18 @@ def get_representative_spectra(
         If ``consensus`` is unsupported or required mode-specific
         arguments are omitted.
     """
-    if isinstance(consensus, MedoidConsensusConfig):
+    method = getattr(consensus, "method", None)
+    if method == "medoid":
         if pdist is None:
             raise ValueError("pdist is required for medoid consensus")
         return get_cluster_medoids(spectra, labels, rts, order_map, pdist)
-    if isinstance(consensus, AverageConsensusConfig):
+    if method == "average":
         if min_mz is None or max_mz is None or fragment_tol is None:
             raise ValueError(
                 "min_mz, max_mz, and fragment_tol are required for "
                 "average consensus"
             )
+        avg_cfg = cast("AverageConsensusConfig", consensus)
         return get_cluster_averages(
             spectra,
             labels,
@@ -109,8 +111,8 @@ def get_representative_spectra(
             min_mz=min_mz,
             max_mz=max_mz,
             fragment_tol=fragment_tol,
-            outlier_cutoff_lower=consensus.outlier_cutoff_lower,
-            outlier_cutoff_upper=consensus.outlier_cutoff_upper,
+            outlier_cutoff_lower=avg_cfg.outlier_cutoff_lower,
+            outlier_cutoff_upper=avg_cfg.outlier_cutoff_upper,
         )
     raise ValueError(f"Unsupported consensus config: {consensus!r}")
 
@@ -314,7 +316,7 @@ def bin_cluster_peaks(
 
     # Stable sort preserves per-spectrum ordering inside each bin so
     # spec_ids is non-decreasing within every bin slice.
-    order = np.argsort(bin_idx_i64, kind="mergesort")
+    order = np.argsort(bin_idx_i64, kind="stable")
     sorted_bins = bin_idx_i64[order]
     sorted_mz = all_mz[order]
     sorted_int = all_int[order]
@@ -367,7 +369,8 @@ def sigma_clip(
     prevent float32 accumulation drift on large clusters while keeping
     the returned arrays in their input dtypes. Stops once at most two
     observations remain, the standard deviation reaches zero, or an
-    iteration removes no values.
+    iteration removes no values. Callers must pass 1D arrays of equal
+    length.
 
     Parameters
     ----------
