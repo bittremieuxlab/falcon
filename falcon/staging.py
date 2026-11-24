@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import collections
 import contextlib
+import fcntl
 import glob
 import json
 import logging
 import math
 import os
 import shutil
+import threading
 from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypedDict, cast
@@ -36,7 +38,8 @@ from .config import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Generator, Sequence
+    from typing import IO
 
     import pandas as pd
     import spectrum_utils.spectrum as sus
@@ -53,6 +56,7 @@ BUCKET_PREFIX = "spectra_charge_"
 BUCKET_SUFFIX = ".lance"
 STAGING_CACHE_SCHEMA_VERSION = 1
 STAGING_CACHE_FILENAME = "staging_cache.json"
+STAGING_LOCK_FILENAME = ".staging.lock"
 
 # Canonical ordering shared across staging, clustering, and export so
 # positional cluster labels always bind to the exact same spectra.
@@ -457,6 +461,73 @@ def _read_and_process_file(
     return spectra, low_quality
 
 
+class _WorkDirLockEntry:
+    """Reference-counted per-directory reentrant staging lock state."""
+
+    __slots__ = ("depth", "refcount", "rlock")
+
+    def __init__(self) -> None:
+        self.rlock = threading.RLock()
+        self.refcount = 0
+        self.depth = 0
+
+
+_WORK_DIR_LOCKS_GUARD = threading.Lock()
+_WORK_DIR_LOCKS: dict[tuple[int, int], _WorkDirLockEntry] = {}
+
+
+@contextlib.contextmanager
+def _staging_lock(work_dir: Path) -> Generator[None, None, None]:
+    """
+    Serialize staging operations that share ``work_dir``.
+
+    Combines a per-directory ``RLock`` (keyed by ``(st_dev, st_ino)``)
+    with ``fcntl.flock`` on ``work_dir / STAGING_LOCK_FILENAME`` so
+    both threads and processes serialize without breaking reentrant
+    calls on the same thread. The lock file lives outside ``spectra/``
+    so ``--overwrite`` cannot remove it.
+    """
+    work_dir.mkdir(parents=True, exist_ok=True)
+    st = os.stat(work_dir)
+    key = (st.st_dev, st.st_ino)
+    with _WORK_DIR_LOCKS_GUARD:
+        entry = _WORK_DIR_LOCKS.get(key)
+        if entry is None:
+            entry = _WorkDirLockEntry()
+            _WORK_DIR_LOCKS[key] = entry
+        entry.refcount += 1
+
+    try:
+        entry.rlock.acquire()
+        try:
+            lock_file: IO[bytes] | None = None
+            if entry.depth == 0:
+                lock_path = work_dir / STAGING_LOCK_FILENAME
+                lock_file = lock_path.open("a+b")
+                try:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                except BaseException:
+                    lock_file.close()
+                    raise
+            entry.depth += 1
+            try:
+                yield
+            finally:
+                entry.depth -= 1
+                if lock_file is not None:
+                    try:
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                    finally:
+                        lock_file.close()
+        finally:
+            entry.rlock.release()
+    finally:
+        with _WORK_DIR_LOCKS_GUARD:
+            entry.refcount -= 1
+            if entry.refcount == 0:
+                _WORK_DIR_LOCKS.pop(key, None)
+
+
 def stage_spectra(
     input_filenames: Sequence[PathLike],
     work_dir: PathLike,
@@ -472,9 +543,6 @@ def stage_spectra(
     # stay unaffected by os.chdir() while preserving symlink stems.
     resolved_files = [Path(os.path.abspath(fn)) for fn in input_filenames]
     work_path = Path(work_dir)
-    (work_path / SPECTRA_SUBDIR).mkdir(parents=True, exist_ok=True)
-    logger.info("Reading spectra from %d peak file(s)...", len(resolved_files))
-
     prep = config.preprocessing
     _, min_mz, max_mz = mz_bin_bounds(
         prep.min_mz, prep.max_mz, config.clustering.fragment_tol
@@ -485,31 +553,38 @@ def stage_spectra(
     max_workers = min(len(resolved_files), n_workers)
     low_quality = 0
 
-    if max_workers == 1:
-        for path in resolved_files:
-            for spec in ms_io.get_spectra(path):
-                processed = process_spectrum(
-                    spec, prep, min_mz=min_mz, max_mz=max_mz
-                )
-                if processed is None:
-                    low_quality += 1
-                else:
-                    writer.add(processed)
-    else:
-        parallel_iter = joblib.Parallel(
-            n_jobs=max_workers,
-            backend="loky",
-            return_as="generator_unordered",
-        )(
-            joblib.delayed(_read_and_process_file)(path, prep, min_mz, max_mz)
-            for path in resolved_files
+    with _staging_lock(work_path):
+        (work_path / SPECTRA_SUBDIR).mkdir(parents=True, exist_ok=True)
+        logger.info(
+            "Reading spectra from %d peak file(s)...", len(resolved_files)
         )
-        with contextlib.closing(parallel_iter) as file_results:
-            for file_spectra, lqc in file_results:
-                low_quality += lqc
-                for spec in file_spectra:
-                    writer.add(spec)
-    writer.flush()
+        if max_workers == 1:
+            for path in resolved_files:
+                for spec in ms_io.get_spectra(path):
+                    processed = process_spectrum(
+                        spec, prep, min_mz=min_mz, max_mz=max_mz
+                    )
+                    if processed is None:
+                        low_quality += 1
+                    else:
+                        writer.add(processed)
+        else:
+            parallel_iter = joblib.Parallel(
+                n_jobs=max_workers,
+                backend="loky",
+                return_as="generator_unordered",
+            )(
+                joblib.delayed(_read_and_process_file)(
+                    path, prep, min_mz, max_mz
+                )
+                for path in resolved_files
+            )
+            with contextlib.closing(parallel_iter) as file_results:
+                for file_spectra, lqc in file_results:
+                    low_quality += lqc
+                    for spec in file_spectra:
+                        writer.add(spec)
+        writer.flush()
 
     counts = writer.written_counts
     if charge_buckets is None:
@@ -653,33 +728,39 @@ def load_or_stage_buckets(
     target_dir = work_dir / SPECTRA_SUBDIR
     cache_path = target_dir / STAGING_CACHE_FILENAME
 
-    if config.io.overwrite:
-        shutil.rmtree(target_dir, ignore_errors=True)
-        target_dir.mkdir(parents=True, exist_ok=True)
-    else:
-        target_dir.mkdir(parents=True, exist_ok=True)
-        if cache_path.is_file():
-            cached_buckets = _validate_cached_manifest(
-                cache_path, expected_manifest, target_dir, work_dir
-            )
-            logger.info(
-                "Reusing validated staging cache in %s (%d bucket(s))",
-                work_dir,
-                len(cached_buckets),
-            )
-            return cached_buckets
-        if any(_is_bucket_dataset_name(e.name) for e in target_dir.iterdir()):
-            raise ValueError(
-                f"Working directory {work_dir} contains unverified staged "
-                f"datasets without {STAGING_CACHE_FILENAME}; {_CACHE_HINT}"
-            )
+    with _staging_lock(work_dir):
+        if config.io.overwrite:
+            shutil.rmtree(target_dir, ignore_errors=True)
+            target_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            target_dir.mkdir(parents=True, exist_ok=True)
+            if cache_path.is_file():
+                cached_buckets = _validate_cached_manifest(
+                    cache_path, expected_manifest, target_dir, work_dir
+                )
+                logger.info(
+                    "Reusing validated staging cache in %s (%d bucket(s))",
+                    work_dir,
+                    len(cached_buckets),
+                )
+                return cached_buckets
+            if any(
+                _is_bucket_dataset_name(e.name) for e in target_dir.iterdir()
+            ):
+                raise ValueError(
+                    f"Working directory {work_dir} contains unverified "
+                    f"staged datasets without {STAGING_CACHE_FILENAME}; "
+                    f"{_CACHE_HINT}"
+                )
 
-    charge_buckets = stage_spectra(resolved_inputs, work_dir, config)
-    manifest = {
-        **expected_manifest,
-        "buckets": _serialize_buckets(charge_buckets),
-    }
-    with ms_io.atomic_write_text(cache_path, prefix=".staging_cache_") as out:
-        json.dump(manifest, out, indent=2, allow_nan=False)
-        out.write("\n")
-    return charge_buckets
+        charge_buckets = stage_spectra(resolved_inputs, work_dir, config)
+        manifest = {
+            **expected_manifest,
+            "buckets": _serialize_buckets(charge_buckets),
+        }
+        with ms_io.atomic_write_text(
+            cache_path, prefix=".staging_cache_"
+        ) as out:
+            json.dump(manifest, out, indent=2, allow_nan=False)
+            out.write("\n")
+        return charge_buckets

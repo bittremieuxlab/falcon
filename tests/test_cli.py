@@ -140,6 +140,47 @@ class TestCliParsingAndMain:
         assert rc == 2
         assert "falcon: error:" in capsys.readouterr().err
 
+    def test_save_config_rejects_input_alias_before_running(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        spec_a = data_dir / "a.mgf"
+        spec_b = data_dir / "b.mgf"
+        spec_a.write_text("MGF_A\n", encoding="utf-8")
+        spec_b.write_text("MGF_B\n", encoding="utf-8")
+
+        def _fail_run(_cfg):
+            raise AssertionError("run() must not execute on save-config error")
+
+        monkeypatch.setattr(pipeline, "run", _fail_run)
+
+        rc = cli.main(
+            [
+                str(data_dir / "*.mgf"),
+                str(tmp_path / "out"),
+                "--save-config",
+                str(spec_b),
+            ]
+        )
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "falcon: error:" in err
+        assert "aliases input file" in err
+        assert spec_b.read_text(encoding="utf-8") == "MGF_B\n"
+
+        run_toml = tmp_path / "run.toml"
+        run_toml.write_text(
+            "[io]\n"
+            f'input_filenames = ["{data_dir / "*.mgf"}"]\n'
+            f'output_filename = "{tmp_path / "out"}"\n',
+            encoding="utf-8",
+        )
+        rc2 = cli.main(["-c", str(run_toml), "--save-config", str(spec_a)])
+        assert rc2 == 2
+        assert "aliases input file" in capsys.readouterr().err
+        assert spec_a.read_text(encoding="utf-8") == "MGF_A\n"
+
     def test_lightweight_cli_inspection_defers_heavy_imports(self):
         script = (
             "import sys\n"

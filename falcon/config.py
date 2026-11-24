@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import glob
 import json
 import math
 import os
@@ -811,8 +812,77 @@ def build_json_schema() -> dict[str, Any]:
     return schema
 
 
+def _expand_input_candidates(patterns: Sequence[str]) -> list[Path]:
+    """Expand input patterns into glob matches and literal paths."""
+    candidates: list[Path] = []
+    for pattern in patterns:
+        matches = sorted(glob.glob(pattern))
+        if matches:
+            candidates.extend(Path(match) for match in matches)
+        else:
+            candidates.append(Path(pattern))
+    return candidates
+
+
+def _resolve_path(path: Path) -> Path:
+    """Resolve ``path`` strictly, falling back only when missing."""
+    try:
+        return path.resolve(strict=True)
+    except FileNotFoundError:
+        return path.resolve(strict=False)
+
+
+def _paths_alias(
+    destination: Path,
+    resolved_dest: Path,
+    dest_exists: bool,
+    candidate: Path,
+) -> bool:
+    """Return ``True`` if ``destination`` aliases ``candidate``."""
+    try:
+        if resolved_dest == _resolve_path(candidate):
+            return True
+    except (OSError, RuntimeError):
+        return False
+    if dest_exists and candidate.exists():
+        try:
+            return os.path.samefile(destination, candidate)
+        except OSError:
+            return False
+    return False
+
+
+def _validate_save_destination(config: FalconConfig, dest: Path) -> None:
+    """Ensure ``dest`` does not alias any configured peak input."""
+    try:
+        resolved_dest = _resolve_path(dest)
+    except (OSError, RuntimeError) as exc:
+        raise ConfigError(
+            f"Failed to resolve config output path {dest}: {exc}"
+        ) from exc
+
+    dest_exists = dest.exists()
+    for candidate in _expand_input_candidates(config.io.input_filenames):
+        if _paths_alias(dest, resolved_dest, dest_exists, candidate):
+            raise ConfigError(
+                f"Config output path {dest} aliases input file "
+                f"{candidate}; choose a distinct destination"
+            )
+
+
 def write_saved_config(config: FalconConfig, destination: str | Path) -> None:
-    """Write a resolved ``FalconConfig`` as TOML to ``destination``."""
+    """
+    Write a resolved ``FalconConfig`` as TOML to ``destination``.
+
+    Validates ``destination`` against all configured peak inputs
+    (literal paths and glob matches) before atomically replacing it.
+
+    Raises
+    ------
+    ConfigError
+        If ``destination`` is invalid, is a directory, cannot be
+        resolved, aliases any peak input file, or cannot be written.
+    """
     from .ms_io import atomic_write_text
 
     try:
@@ -823,6 +893,7 @@ def write_saved_config(config: FalconConfig, destination: str | Path) -> None:
         raise ConfigError(
             f"Config output path is a directory, expected a file path: {dest}"
         )
+    _validate_save_destination(config, dest)
     try:
         with atomic_write_text(dest, prefix=".config_") as f_out:
             f_out.write(format_toml(config))

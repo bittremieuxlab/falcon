@@ -41,11 +41,12 @@ _OUTPUT_COLUMNS = [*METADATA_COLUMNS, "cluster"]
 
 def prepare_outputs(io_cfg: IOConfig) -> bool:
     """
-    Validate output paths before running and report whether to proceed.
+    Validate output paths before running and remove them on overwrite.
 
-    Verifies the output directory exists, rejects directory targets, and
+    Verifies the output directory exists, rejects directory targets,
     returns ``False`` when an output already exists without
-    ``overwrite``.
+    ``overwrite``, and unlinks existing outputs before input glob
+    resolution when ``overwrite`` is enabled.
     """
     parent_dir = io_cfg.csv_path.parent
     if not parent_dir.is_dir():
@@ -85,6 +86,7 @@ def prepare_outputs(io_cfg: IOConfig) -> bool:
             path,
             desc,
         )
+        path.unlink()
     return True
 
 
@@ -127,11 +129,6 @@ def export_results(
         clusters_df = clusters_df.iloc[
             natsort.index_natsorted(clusters_df["identifier"])
         ]
-
-    if config.io.overwrite:
-        for out_path in (config.io.csv_path, config.io.mgf_path):
-            if out_path.is_file() or out_path.is_symlink():
-                out_path.unlink()
 
     logger.info(
         "Export cluster assignments of %d spectra to %d unique "

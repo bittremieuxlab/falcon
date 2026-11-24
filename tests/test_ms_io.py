@@ -6,6 +6,7 @@ import shutil
 
 import numpy as np
 import pytest
+from pyteomics.auxiliary import PyteomicsError
 
 from falcon import ms_io
 from tests.helpers import (
@@ -89,6 +90,35 @@ class TestMgfReaderAndWriter:
         assert spectra[1].precursor_charge == -3
         assert math.isnan(spectra[1].retention_time)
         assert spectra[2].precursor_charge is None
+
+    @pytest.mark.parametrize(
+        ("bad_entry", "exc_type"),
+        [
+            (
+                "BEGIN IONS\nPEPMASS=500.0\n100.0 not_a_number\nEND IONS\n",
+                PyteomicsError,
+            ),
+            (
+                "BEGIN IONS\nPEPMASS=not_a_float\n100.0 10.0\nEND IONS\n",
+                ValueError,
+            ),
+        ],
+    )
+    def test_propagates_pyteomics_iterator_errors(
+        self, tmp_path, bad_entry, exc_type
+    ):
+        mgf = write_mgf(
+            tmp_path / "corrupt.mgf",
+            [
+                "BEGIN IONS\nPEPMASS=400.0\nSCANS=1\n100.0 10.0\nEND IONS\n",
+                bad_entry,
+                "BEGIN IONS\nPEPMASS=600.0\nSCANS=3\n100.0 10.0\nEND IONS\n",
+            ],
+        )
+        spectra_iter = ms_io.read_mgf(mgf)
+        assert next(spectra_iter).identifier == "corrupt:scan:1"
+        with pytest.raises(exc_type):
+            next(spectra_iter)
 
     def test_mgf_writer_roundtrip_scaling_and_atomic_failure(self, tmp_path):
         reps = [

@@ -1,12 +1,15 @@
 """Unit tests for falcon.config models, TOML loading, and serialization."""
 
 import json
+import os
 import tomllib
 from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
+import falcon.config as config_mod
+import falcon.ms_io as ms_io
 from falcon.config import (
     ClusteringConfig,
     ConfigError,
@@ -251,3 +254,136 @@ class TestTomlLoadingAndSerialization:
         assert "extends" in schema["properties"]
         assert '"const": "none"' in serialized
         assert '"const": "auto"' in serialized
+
+    def test_write_saved_config_rejects_input_aliases_before_atomic_open(
+        self, tmp_path, monkeypatch
+    ):
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        spec_a = data_dir / "a.mgf"
+        spec_b = data_dir / "b.mgf"
+        bracket = data_dir / "sample_[1].mgf"
+        spec_a.write_text("MGF_A\n", encoding="utf-8")
+        spec_b.write_text("MGF_B\n", encoding="utf-8")
+        bracket.write_text("MGF_BRACKET\n", encoding="utf-8")
+
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        rel_alias = sub / ".." / "data" / "a.mgf"
+        sym_dest = tmp_path / "sym_config.toml"
+        sym_dest.symlink_to(spec_a)
+        hard_dest = tmp_path / "hard_config.toml"
+        os.link(spec_a, hard_dest)
+        sym_in = tmp_path / "in_link.mgf"
+        sym_in.symlink_to(spec_a)
+        missing = tmp_path / "missing.mgf"
+        dangling = tmp_path / "dangling.toml"
+        dangling.symlink_to(missing)
+        loop = tmp_path / "loop.toml"
+        loop.symlink_to(loop)
+
+        def _fail_atomic_write(*_args, **_kwargs):
+            raise AssertionError("atomic_write_text must not open aliases")
+
+        monkeypatch.setattr(ms_io, "atomic_write_text", _fail_atomic_write)
+
+        glob_pat = str(data_dir / "*.mgf")
+        alias_cases = (
+            ([str(spec_a)], spec_a),
+            ([str(spec_a)], rel_alias),
+            ([glob_pat], spec_b),
+            ([str(bracket)], bracket),
+            ([str(spec_a)], sym_dest),
+            ([str(spec_a)], hard_dest),
+            ([glob_pat], sym_dest),
+            ([glob_pat], hard_dest),
+            ([str(sym_in)], spec_a),
+            ([str(missing)], missing),
+            ([str(missing)], dangling),
+        )
+        for inputs, dest in alias_cases:
+            cfg = make_falcon_config(
+                io={
+                    "input_filenames": inputs,
+                    "output_filename": tmp_path / "out",
+                }
+            )
+            with pytest.raises(ConfigError, match="aliases input file"):
+                write_saved_config(cfg, dest)
+
+        cfg_loop = make_falcon_config(
+            io={
+                "input_filenames": [str(spec_a)],
+                "output_filename": tmp_path / "out",
+            }
+        )
+        with pytest.raises(ConfigError, match="Failed to resolve"):
+            write_saved_config(cfg_loop, loop)
+
+        assert spec_a.read_text(encoding="utf-8") == "MGF_A\n"
+        assert spec_b.read_text(encoding="utf-8") == "MGF_B\n"
+        assert bracket.read_text(encoding="utf-8") == "MGF_BRACKET\n"
+        assert not missing.exists()
+
+    def test_write_saved_config_preserves_atomic_replace_for_distinct_dests(
+        self, tmp_path, monkeypatch
+    ):
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        spec_a = data_dir / "a.mgf"
+        spec_a.write_text("MGF_A\n", encoding="utf-8")
+        glob_cfg = make_falcon_config(
+            io={
+                "input_filenames": [str(data_dir / "*.mgf")],
+                "output_filename": tmp_path / "out",
+            }
+        )
+
+        # Distinct new destination in the glob directory.
+        new_dest = data_dir / "saved.toml"
+        write_saved_config(glob_cfg, new_dest)
+        assert load_config(config_files=[new_dest]) == glob_cfg
+
+        # Existing distinct destination is replaced atomically.
+        existing = tmp_path / "existing.toml"
+        existing.write_text("# old\n", encoding="utf-8")
+        old_ino = existing.stat().st_ino
+
+        def _boom(_cfg):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(config_mod, "format_toml", _boom)
+        with pytest.raises(ConfigError, match="Failed to write"):
+            write_saved_config(glob_cfg, existing)
+        assert existing.read_text(encoding="utf-8") == "# old\n"
+        assert not list(tmp_path.glob(".config_*.tmp"))
+
+        monkeypatch.undo()
+        write_saved_config(glob_cfg, existing)
+        assert existing.stat().st_ino != old_ino
+        assert load_config(config_files=[existing]) == glob_cfg
+        assert not list(tmp_path.glob(".config_*.tmp"))
+
+        # Unmatched globs and loop inputs still allow distinct saves.
+        unmatched_cfg = make_falcon_config(
+            io={
+                "input_filenames": [str(tmp_path / "none_*.mgf")],
+                "output_filename": tmp_path / "out",
+            }
+        )
+        unmatched_dest = tmp_path / "unmatched.toml"
+        write_saved_config(unmatched_cfg, unmatched_dest)
+        assert unmatched_dest.is_file()
+
+        bad_input = tmp_path / "bad_input.mgf"
+        bad_input.symlink_to(bad_input)
+        loop_in_cfg = make_falcon_config(
+            io={
+                "input_filenames": [str(bad_input)],
+                "output_filename": tmp_path / "out",
+            }
+        )
+        distinct_dest = tmp_path / "distinct.toml"
+        write_saved_config(loop_in_cfg, distinct_dest)
+        assert distinct_dest.is_file()
+        assert spec_a.read_text(encoding="utf-8") == "MGF_A\n"

@@ -1,15 +1,21 @@
 """Unit tests for falcon.staging (preprocessing, ingestion, and cache)."""
 
+import contextlib
 import json
 import math
 import os
+import subprocess
+import sys
+import threading
+import time
 
 import lance
 import numpy as np
 import pytest
 import spectrum_utils.spectrum as sus
+from pyteomics.auxiliary import PyteomicsError
 
-from falcon import staging
+from falcon import ms_io, staging
 from falcon.config import PreprocessingConfig
 from tests.helpers import (
     LOW_QUALITY_PEAKS,
@@ -433,3 +439,600 @@ class TestStagingAndCache:
         cache_path.write_text(json.dumps(manifest), encoding="utf-8")
         with pytest.raises(ValueError, match="do not match cached buckets"):
             staging.load_or_stage_buckets(cfg, wd)
+
+    @pytest.mark.parametrize(
+        ("bad_entry", "exc_type"),
+        [
+            (
+                "BEGIN IONS\nPEPMASS=500.0\n100.0 not_a_number\nEND IONS\n",
+                PyteomicsError,
+            ),
+            (
+                "BEGIN IONS\nPEPMASS=not_a_float\n100.0 10.0\nEND IONS\n",
+                ValueError,
+            ),
+        ],
+    )
+    def test_mgf_iterator_failure_does_not_publish_partial_cache(
+        self, tmp_path, monkeypatch, bad_entry, exc_type
+    ):
+        mgf = write_mgf(
+            tmp_path / "corrupt.mgf",
+            [
+                format_mgf_spectrum(TOY_PEAKS_5, 500.0, charge=2, scan=1),
+                bad_entry,
+                format_mgf_spectrum(TOY_PEAKS_5, 600.0, charge=2, scan=3),
+            ],
+        )
+        wd = tmp_path / "work"
+        cfg = make_falcon_config(
+            input_filenames=[str(mgf)],
+            output_filename=tmp_path / "out",
+            io={"work_dir": str(wd)},
+        )
+        monkeypatch.setattr(staging, "_LANCE_WRITE_BATCH_SIZE", 1)
+
+        with pytest.raises(exc_type):
+            staging.load_or_stage_buckets(cfg, wd)
+
+        cache_path = (
+            wd / staging.SPECTRA_SUBDIR / staging.STAGING_CACHE_FILENAME
+        )
+        assert not cache_path.exists()
+        assert staging.bucket_dataset_path(wd, (2,)).is_dir()
+        with pytest.raises(ValueError, match="unverified staged"):
+            staging.load_or_stage_buckets(cfg, wd)
+
+    def test_multi_file_mgf_iterator_failure_propagates_without_cache(
+        self, tmp_path
+    ):
+        good = write_mgf(
+            tmp_path / "good.mgf",
+            [format_mgf_spectrum(TOY_PEAKS_5, 500.0, charge=2, scan=1)],
+        )
+        corrupt = write_mgf(
+            tmp_path / "corrupt.mgf",
+            [
+                format_mgf_spectrum(TOY_PEAKS_5, 550.0, charge=2, scan=1),
+                "BEGIN IONS\nPEPMASS=600.0\n100.0 not_a_number\nEND IONS\n",
+            ],
+        )
+        wd = tmp_path / "work"
+        cfg = make_falcon_config(
+            input_filenames=[str(good), str(corrupt)],
+            output_filename=tmp_path / "out",
+            io={"work_dir": str(wd)},
+        )
+
+        with pytest.raises(PyteomicsError):
+            staging.load_or_stage_buckets(cfg, wd)
+
+        cache_path = (
+            wd / staging.SPECTRA_SUBDIR / staging.STAGING_CACHE_FILENAME
+        )
+        assert not cache_path.exists()
+
+    def test_concurrent_non_overwrite_staging_serializes_through_manifest(
+        self, tmp_path, monkeypatch
+    ):
+        mgf = write_mgf(
+            tmp_path / "in.mgf",
+            [format_mgf_spectrum(TOY_PEAKS_5, 500.0, charge=2, scan=1)],
+        )
+        wd = tmp_path / "work"
+        wd.mkdir()
+        wd_alias = tmp_path / "work_alias"
+        wd_alias.symlink_to(wd)
+        cfg = make_falcon_config(
+            input_filenames=[str(mgf)],
+            output_filename=tmp_path / "out",
+            io={"work_dir": str(wd)},
+        )
+
+        real_stage = staging.stage_spectra
+        real_atomic_write = ms_io.atomic_write_text
+        entered_stage = threading.Event()
+        release_stage = threading.Event()
+        before_replace = threading.Event()
+        release_manifest = threading.Event()
+        stage_calls = 0
+        call_lock = threading.Lock()
+
+        def gated_stage(*args, **kwargs):
+            nonlocal stage_calls
+            with call_lock:
+                stage_calls += 1
+            entered_stage.set()
+            assert release_stage.wait(timeout=5.0)
+            return real_stage(*args, **kwargs)
+
+        @contextlib.contextmanager
+        def gated_atomic_write(path, **kwargs):
+            with real_atomic_write(path, **kwargs) as out:
+                yield out
+                before_replace.set()
+                assert release_manifest.wait(timeout=5.0)
+
+        monkeypatch.setattr(staging, "stage_spectra", gated_stage)
+        monkeypatch.setattr(ms_io, "atomic_write_text", gated_atomic_write)
+
+        results: dict[str, list] = {}
+        errors: list[BaseException] = []
+
+        def worker(name, work_path):
+            try:
+                results[name] = staging.load_or_stage_buckets(cfg, work_path)
+            except BaseException as exc:  # pragma: no cover
+                errors.append(exc)
+
+        t1 = threading.Thread(target=worker, args=("t1", wd))
+        t2 = threading.Thread(target=worker, args=("t2", wd_alias))
+        t1.start()
+        try:
+            assert entered_stage.wait(timeout=5.0)
+            t2.start()
+            # Run 2 must block during stage_spectra rather than racing
+            # past the empty-directory check.
+            time.sleep(0.15)
+            assert t2.is_alive()
+            assert stage_calls == 1
+            assert errors == []
+
+            release_stage.set()
+            assert before_replace.wait(timeout=5.0)
+            cache_path = (
+                wd / staging.SPECTRA_SUBDIR / staging.STAGING_CACHE_FILENAME
+            )
+            assert staging.bucket_dataset_path(wd, (2,)).is_dir()
+            assert not cache_path.exists()
+
+            # Run 2 must remain blocked through manifest replacement.
+            time.sleep(0.15)
+            assert t2.is_alive()
+            assert stage_calls == 1
+            assert errors == []
+        finally:
+            release_stage.set()
+            release_manifest.set()
+            t1.join(timeout=5.0)
+            if t2.ident is not None:
+                t2.join(timeout=5.0)
+
+        assert not t1.is_alive()
+        assert not t2.is_alive()
+        assert errors == []
+        assert stage_calls == 1
+        assert results == {"t1": [(2,)], "t2": [(2,)]}
+        assert (
+            wd / staging.SPECTRA_SUBDIR / staging.STAGING_CACHE_FILENAME
+        ).is_file()
+
+    def test_concurrent_overwrite_waits_for_staging_window(
+        self, tmp_path, monkeypatch
+    ):
+        mgf_a = write_mgf(
+            tmp_path / "a.mgf",
+            [format_mgf_spectrum(TOY_PEAKS_5, 500.0, charge=2, scan=1)],
+        )
+        mgf_b = write_mgf(
+            tmp_path / "b.mgf",
+            [format_mgf_spectrum(TOY_PEAKS_5, 600.0, charge=3, scan=1)],
+        )
+        wd = tmp_path / "work"
+        cfg_a = make_falcon_config(
+            input_filenames=[str(mgf_a)],
+            output_filename=tmp_path / "out_a",
+            io={"work_dir": str(wd)},
+        )
+        cfg_b = make_falcon_config(
+            input_filenames=[str(mgf_b)],
+            output_filename=tmp_path / "out_b",
+            io={"work_dir": str(wd), "overwrite": True},
+        )
+
+        real_atomic_write = ms_io.atomic_write_text
+        before_replace = threading.Event()
+        release_manifest = threading.Event()
+        gated = True
+
+        @contextlib.contextmanager
+        def gated_atomic_write(path, **kwargs):
+            nonlocal gated
+            with real_atomic_write(path, **kwargs) as out:
+                yield out
+                if gated:
+                    gated = False
+                    before_replace.set()
+                    assert release_manifest.wait(timeout=5.0)
+
+        monkeypatch.setattr(ms_io, "atomic_write_text", gated_atomic_write)
+
+        results: dict[str, list] = {}
+        errors: list[BaseException] = []
+
+        def run_load(name, cfg):
+            try:
+                results[name] = staging.load_or_stage_buckets(cfg, wd)
+            except BaseException as exc:  # pragma: no cover
+                errors.append(exc)
+
+        t1 = threading.Thread(target=run_load, args=("non_ow", cfg_a))
+        t2 = threading.Thread(target=run_load, args=("ow", cfg_b))
+        t1.start()
+        try:
+            assert before_replace.wait(timeout=5.0)
+            t2.start()
+            time.sleep(0.15)
+            # Overwrite run must not wipe or replace buckets while the
+            # non-overwrite run holds the staging window.
+            assert t2.is_alive()
+            assert staging.bucket_dataset_path(wd, (2,)).is_dir()
+            assert not staging.bucket_dataset_path(wd, (3,)).exists()
+        finally:
+            release_manifest.set()
+            t1.join(timeout=5.0)
+            if t2.ident is not None:
+                t2.join(timeout=5.0)
+
+        assert not t1.is_alive()
+        assert not t2.is_alive()
+        assert errors == []
+        assert results == {"non_ow": [(2,)], "ow": [(3,)]}
+        assert staging.bucket_dataset_path(wd, (3,)).is_dir()
+        assert not staging.bucket_dataset_path(wd, (2,)).exists()
+
+    def test_concurrent_direct_stage_spectra_waits_for_staging_window(
+        self, tmp_path, monkeypatch
+    ):
+        mgf_a = write_mgf(
+            tmp_path / "a.mgf",
+            [format_mgf_spectrum(TOY_PEAKS_5, 500.0, charge=2, scan=1)],
+        )
+        mgf_b = write_mgf(
+            tmp_path / "b.mgf",
+            [format_mgf_spectrum(TOY_PEAKS_5, 600.0, charge=3, scan=1)],
+        )
+        wd = tmp_path / "work"
+        cfg_a = make_falcon_config(
+            input_filenames=[str(mgf_a)],
+            output_filename=tmp_path / "out_a",
+            io={"work_dir": str(wd)},
+        )
+        cfg_b = make_falcon_config(
+            input_filenames=[str(mgf_b)],
+            output_filename=tmp_path / "out_b",
+            io={"work_dir": str(wd)},
+        )
+
+        real_atomic_write = ms_io.atomic_write_text
+        before_replace = threading.Event()
+        release_manifest = threading.Event()
+
+        @contextlib.contextmanager
+        def gated_atomic_write(path, **kwargs):
+            with real_atomic_write(path, **kwargs) as out:
+                yield out
+                before_replace.set()
+                assert release_manifest.wait(timeout=5.0)
+
+        monkeypatch.setattr(ms_io, "atomic_write_text", gated_atomic_write)
+
+        results: dict[str, list] = {}
+        errors: list[BaseException] = []
+
+        def run_load():
+            try:
+                results["load"] = staging.load_or_stage_buckets(cfg_a, wd)
+            except BaseException as exc:  # pragma: no cover
+                errors.append(exc)
+
+        def run_direct():
+            try:
+                results["direct"] = staging.stage_spectra([mgf_b], wd, cfg_b)
+            except BaseException as exc:  # pragma: no cover
+                errors.append(exc)
+
+        t1 = threading.Thread(target=run_load)
+        t2 = threading.Thread(target=run_direct)
+        t1.start()
+        try:
+            assert before_replace.wait(timeout=5.0)
+            t2.start()
+            time.sleep(0.15)
+            # Direct stage_spectra must share the same work-dir lock.
+            assert t2.is_alive()
+            assert not staging.bucket_dataset_path(wd, (3,)).exists()
+        finally:
+            release_manifest.set()
+            t1.join(timeout=5.0)
+            if t2.ident is not None:
+                t2.join(timeout=5.0)
+
+        assert not t1.is_alive()
+        assert not t2.is_alive()
+        assert errors == []
+        assert results == {"load": [(2,)], "direct": [(3,)]}
+
+    def test_concurrent_incompatible_and_failed_staging_release_lock(
+        self, tmp_path, monkeypatch
+    ):
+        mgf = write_mgf(
+            tmp_path / "in.mgf",
+            [format_mgf_spectrum(TOY_PEAKS_5, 500.0, charge=2, scan=1)],
+        )
+        wd = tmp_path / "work_mismatch"
+        cfg_a = make_falcon_config(
+            input_filenames=[str(mgf)],
+            output_filename=tmp_path / "out_a",
+            io={"work_dir": str(wd)},
+        )
+        cfg_b = make_falcon_config(
+            input_filenames=[str(mgf)],
+            output_filename=tmp_path / "out_b",
+            io={"work_dir": str(wd)},
+            clustering={"fragment_tol": 0.02},
+        )
+
+        real_stage = staging.stage_spectra
+        entered_stage = threading.Event()
+        release_stage = threading.Event()
+
+        def gated_stage(*args, **kwargs):
+            entered_stage.set()
+            assert release_stage.wait(timeout=5.0)
+            return real_stage(*args, **kwargs)
+
+        monkeypatch.setattr(staging, "stage_spectra", gated_stage)
+
+        errors: dict[str, BaseException] = {}
+        res: list = []
+
+        def run_a():
+            res.append(staging.load_or_stage_buckets(cfg_a, wd))
+
+        def run_b():
+            try:
+                staging.load_or_stage_buckets(cfg_b, wd)
+            except BaseException as exc:
+                errors["b"] = exc
+
+        t1 = threading.Thread(target=run_a)
+        t2 = threading.Thread(target=run_b)
+        t1.start()
+        try:
+            assert entered_stage.wait(timeout=5.0)
+            t2.start()
+            time.sleep(0.15)
+            assert t2.is_alive()
+        finally:
+            release_stage.set()
+            t1.join(timeout=5.0)
+            if t2.ident is not None:
+                t2.join(timeout=5.0)
+
+        assert res == [[(2,)]]
+        assert isinstance(errors.get("b"), ValueError)
+        assert "fragment_tol" in str(errors["b"])
+
+        # Failure mid-staging must release the lock so a waiter sees
+        # the unverified partial datasets instead of deadlocking.
+        monkeypatch.undo()
+        corrupt = write_mgf(
+            tmp_path / "corrupt.mgf",
+            [
+                format_mgf_spectrum(TOY_PEAKS_5, 500.0, charge=2, scan=1),
+                "BEGIN IONS\nPEPMASS=550.0\n100.0 bad\nEND IONS\n",
+            ],
+        )
+        wd_fail = tmp_path / "work_fail"
+        cfg_fail = make_falcon_config(
+            input_filenames=[str(corrupt)],
+            output_filename=tmp_path / "out_fail",
+            io={"work_dir": str(wd_fail)},
+        )
+        monkeypatch.setattr(staging, "_LANCE_WRITE_BATCH_SIZE", 1)
+
+        entered_fail = threading.Event()
+        release_fail = threading.Event()
+        orig_flush = staging._LanceBatchWriter._flush_bucket
+
+        def gated_flush(self, bucket, batch):
+            orig_flush(self, bucket, batch)
+            entered_fail.set()
+            assert release_fail.wait(timeout=5.0)
+
+        monkeypatch.setattr(
+            staging._LanceBatchWriter, "_flush_bucket", gated_flush
+        )
+
+        fail_errors: dict[str, BaseException] = {}
+
+        def run_fail(name):
+            try:
+                staging.load_or_stage_buckets(cfg_fail, wd_fail)
+            except BaseException as exc:
+                fail_errors[name] = exc
+
+        tf1 = threading.Thread(target=run_fail, args=("first",))
+        tf2 = threading.Thread(target=run_fail, args=("second",))
+        tf1.start()
+        try:
+            assert entered_fail.wait(timeout=5.0)
+            tf2.start()
+            time.sleep(0.15)
+            assert tf2.is_alive()
+        finally:
+            release_fail.set()
+            tf1.join(timeout=5.0)
+            if tf2.ident is not None:
+                tf2.join(timeout=5.0)
+
+        assert isinstance(fail_errors.get("first"), PyteomicsError)
+        assert isinstance(fail_errors.get("second"), ValueError)
+        assert "unverified staged" in str(fail_errors["second"])
+
+    def test_concurrent_staging_serializes_across_subprocesses_and_loky(
+        self, tmp_path
+    ):
+        f1 = write_mgf(
+            tmp_path / "run_1.mgf",
+            [format_mgf_spectrum(TOY_PEAKS_5, 500.0, charge=2, scan=1)],
+        )
+        f2 = write_mgf(
+            tmp_path / "run_2.mgf",
+            [format_mgf_spectrum(TOY_PEAKS_5, 600.0, charge=3, scan=1)],
+        )
+        wd = tmp_path / "work"
+
+        holder_code = (
+            "import contextlib, sys, time\n"
+            "from pathlib import Path\n"
+            "from falcon import ms_io, staging\n"
+            "from falcon.config import FalconConfig\n"
+            "f1, f2, wd, ready, release = map(Path, sys.argv[1:6])\n"
+            "overwrite = sys.argv[6] == '1'\n"
+            "cfg = FalconConfig.model_validate({\n"
+            "    'io': {\n"
+            "        'input_filenames': [str(f1), str(f2)],\n"
+            "        'output_filename': str(wd / 'out'),\n"
+            "        'work_dir': str(wd),\n"
+            "        'overwrite': overwrite,\n"
+            "    }\n"
+            "})\n"
+            "real_atomic = ms_io.atomic_write_text\n"
+            "@contextlib.contextmanager\n"
+            "def gated(path, **kwargs):\n"
+            "    with real_atomic(path, **kwargs) as out:\n"
+            "        yield out\n"
+            "        ready.write_text('1', encoding='utf-8')\n"
+            "        deadline = time.monotonic() + 15.0\n"
+            "        while not release.exists():\n"
+            "            if time.monotonic() > deadline:\n"
+            "                raise TimeoutError('release timeout')\n"
+            "            time.sleep(0.02)\n"
+            "ms_io.atomic_write_text = gated\n"
+            "buckets = staging.load_or_stage_buckets(cfg, wd)\n"
+            "assert buckets == [(2,), (3,)], buckets\n"
+        )
+        waiter_code = (
+            "import sys\n"
+            "from pathlib import Path\n"
+            "from falcon import staging\n"
+            "from falcon.config import FalconConfig\n"
+            "f1, f2, wd, started = map(Path, sys.argv[1:])\n"
+            "cfg = FalconConfig.model_validate({\n"
+            "    'io': {\n"
+            "        'input_filenames': [str(f1), str(f2)],\n"
+            "        'output_filename': str(wd / 'out2'),\n"
+            "        'work_dir': str(wd),\n"
+            "    }\n"
+            "})\n"
+            "def forbid_restage(*_a, **_kw):\n"
+            "    raise AssertionError('should reuse validated cache')\n"
+            "staging.stage_spectra = forbid_restage\n"
+            "started.write_text('1', encoding='utf-8')\n"
+            "buckets = staging.load_or_stage_buckets(cfg, wd)\n"
+            "assert buckets == [(2,), (3,)], buckets\n"
+        )
+
+        # Verify both initial non-overwrite staging and a subsequent
+        # overwrite run (whose rmtree(spectra/) must not invalidate the
+        # work-directory lock) serialize concurrent subprocesses.
+        for label, overwrite_flag in (("initial", "0"), ("overwrite", "1")):
+            phase_ready = tmp_path / f"ready_{label}"
+            phase_started = tmp_path / f"started_{label}"
+            phase_release = tmp_path / f"release_{label}"
+            p1 = subprocess.Popen(  # noqa: S603
+                [
+                    sys.executable,
+                    "-c",
+                    holder_code,
+                    str(f1),
+                    str(f2),
+                    str(wd),
+                    str(phase_ready),
+                    str(phase_release),
+                    overwrite_flag,
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            p2 = None
+            try:
+                deadline = time.monotonic() + 15.0
+                while not phase_ready.exists():
+                    if p1.poll() is not None:
+                        _, err1 = p1.communicate(timeout=5.0)
+                        pytest.fail(f"holder ({label}) exited early: {err1}")
+                    assert time.monotonic() < deadline, (
+                        f"holder ({label}) did not reach gate"
+                    )
+                    time.sleep(0.02)
+
+                p2 = subprocess.Popen(  # noqa: S603
+                    [
+                        sys.executable,
+                        "-c",
+                        waiter_code,
+                        str(f1),
+                        str(f2),
+                        str(wd),
+                        str(phase_started),
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                deadline = time.monotonic() + 15.0
+                while not phase_started.exists():
+                    if p2.poll() is not None:
+                        _, err2 = p2.communicate(timeout=5.0)
+                        pytest.fail(f"waiter ({label}) exited early: {err2}")
+                    assert time.monotonic() < deadline, (
+                        f"waiter ({label}) did not start"
+                    )
+                    time.sleep(0.02)
+
+                # Waiter must remain blocked while holder has written
+                # buckets (via multi-file loky workers) but has not yet
+                # replaced staging_cache.json.
+                time.sleep(0.25)
+                assert p2.poll() is None
+
+                phase_release.write_text("1", encoding="utf-8")
+                _, err1 = p1.communicate(timeout=15.0)
+                _, err2 = p2.communicate(timeout=15.0)
+                assert p1.returncode == 0, err1
+                assert p2.returncode == 0, err2
+            finally:
+                phase_release.write_text("1", encoding="utf-8")
+                for proc in (p1, p2):
+                    if proc is not None and proc.poll() is None:
+                        proc.kill()
+                        proc.wait(timeout=5.0)
+
+        # Also confirm warm loky workers from a multi-file stage do not
+        # keep the lock held after load_or_stage_buckets returns.
+        cfg_multi = make_falcon_config(
+            input_filenames=[str(f1), str(f2)],
+            output_filename=tmp_path / "out3",
+            io={"work_dir": str(wd), "overwrite": True},
+        )
+        assert staging.load_or_stage_buckets(cfg_multi, wd) == [(2,), (3,)]
+        probe = subprocess.run(  # noqa: S603
+            [
+                sys.executable,
+                "-c",
+                waiter_code,
+                str(f1),
+                str(f2),
+                str(wd),
+                str(tmp_path / "probe_started"),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15.0,
+            check=False,
+        )
+        assert probe.returncode == 0, probe.stderr

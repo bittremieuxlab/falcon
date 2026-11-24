@@ -136,39 +136,35 @@ def read_mgf(source: PathLike) -> Iterator[sus.MsmsSpectrum]:
     """Read MS/MS spectra from an MGF file."""
     import numpy as np
     import pyteomics.mgf
-    from pyteomics.auxiliary import PyteomicsError
 
     path = Path(source)
     base = path.stem
-    try:
-        with pyteomics.mgf.MGF(
-            str(path), read_charges=False, convert_arrays=1, dtype=np.float32
-        ) as f_in:
-            for idx, spectrum_dict in enumerate(f_in):
-                identifier = f"{base}:index:{idx}"
-                try:
-                    params = spectrum_dict["params"]
-                    identifier = _resolve_mgf_id(params, base, idx)
-                    pepmass = params["pepmass"]
-                    spec = _build_spectrum(
-                        identifier,
-                        pepmass[0],
-                        _parse_charge(params.get("charge")),
-                        spectrum_dict["m/z array"],
-                        spectrum_dict["intensity array"],
-                        _parse_rt(params.get("rtinseconds")),
-                    )
-                except _PARSE_EXCEPTIONS as exc:
-                    logger.debug(
-                        "Skipping unparsable spectrum %s in %s: %s",
-                        identifier,
-                        path,
-                        exc,
-                    )
-                else:
-                    yield spec
-    except (PyteomicsError, ValueError) as exc:
-        logger.warning("Failed to read file %s: %s", path, exc)
+    with pyteomics.mgf.MGF(
+        str(path), read_charges=False, convert_arrays=1, dtype=np.float32
+    ) as f_in:
+        for idx, spectrum_dict in enumerate(f_in):
+            identifier = f"{base}:index:{idx}"
+            try:
+                params = spectrum_dict["params"]
+                identifier = _resolve_mgf_id(params, base, idx)
+                pepmass = params["pepmass"]
+                spec = _build_spectrum(
+                    identifier,
+                    pepmass[0],
+                    _parse_charge(params.get("charge")),
+                    spectrum_dict["m/z array"],
+                    spectrum_dict["intensity array"],
+                    _parse_rt(params.get("rtinseconds")),
+                )
+            except _PARSE_EXCEPTIONS as exc:
+                logger.debug(
+                    "Skipping unparsable spectrum %s in %s: %s",
+                    identifier,
+                    path,
+                    exc,
+                )
+            else:
+                yield spec
 
 
 @functools.lru_cache(maxsize=1)

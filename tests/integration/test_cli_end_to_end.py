@@ -1,5 +1,6 @@
 """End-to-end CLI integration tests on toy peak files."""
 
+import json
 import subprocess
 import sys
 
@@ -327,3 +328,84 @@ class TestCliEndToEnd:
             text=True,
         )
         assert f"falcon {falcon.__version__}" in proc.stdout
+
+    def test_overwrite_rerun_with_glob_excludes_previous_representatives(
+        self, tmp_path
+    ):
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        raw_mgf = write_mgf(
+            data_dir / "raw.mgf",
+            [
+                format_mgf_spectrum(PEAKS_A, 500.0, charge=2, scan=1, rt=10.0),
+                format_mgf_spectrum(
+                    PEAKS_A, 500.002, charge=2, scan=2, rt=11.0
+                ),
+                format_mgf_spectrum(PEAKS_B, 600.0, charge=2, scan=3, rt=20.0),
+            ],
+        )
+        glob_pattern = str(data_dir / "*.mgf")
+        out_prefix = data_dir / "result"
+        work_dir = tmp_path / "work"
+
+        rc1 = falcon_main(
+            [
+                glob_pattern,
+                str(out_prefix),
+                "--work-dir",
+                str(work_dir),
+                "--export-representatives",
+            ]
+        )
+        assert rc1 == 0
+        df1 = pd.read_csv(f"{out_prefix}.csv", comment="#")
+        reps1 = list(ms_io.get_spectra(f"{out_prefix}.mgf"))
+        assert list(df1["identifier"]) == [
+            "raw:scan:1",
+            "raw:scan:2",
+            "raw:scan:3",
+        ]
+        assert len(reps1) == 2
+
+        # Overwrite rerun with the same glob must remove the prior
+        # result.mgf before expanding *.mgf so old representatives never
+        # re-enter staging, cache provenance, or clustering.
+        rc2 = falcon_main(
+            [
+                glob_pattern,
+                str(out_prefix),
+                "--work-dir",
+                str(work_dir),
+                "--overwrite",
+                "--export-representatives",
+            ]
+        )
+        assert rc2 == 0
+        df2 = pd.read_csv(f"{out_prefix}.csv", comment="#")
+        reps2 = list(ms_io.get_spectra(f"{out_prefix}.mgf"))
+        pd.testing.assert_frame_equal(df1, df2)
+        assert len(reps2) == 2
+
+        manifest = json.loads(
+            (work_dir / "spectra" / "staging_cache.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert [entry["path"] for entry in manifest["inputs"]] == [
+            str(raw_mgf)
+        ]
+
+        # Overwrite rerun without representative export also removes
+        # result.mgf upfront and does not leave a stale MGF behind.
+        rc3 = falcon_main(
+            [
+                glob_pattern,
+                str(out_prefix),
+                "--overwrite",
+                "--no-export-representatives",
+            ]
+        )
+        assert rc3 == 0
+        df3 = pd.read_csv(f"{out_prefix}.csv", comment="#")
+        pd.testing.assert_frame_equal(df1, df3)
+        assert not (data_dir / "result.mgf").exists()
