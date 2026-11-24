@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import importlib
 from importlib.metadata import PackageNotFoundError, version
 from typing import TYPE_CHECKING, Any
 
-pkg_name = "falcon-ms"
+_PKG_NAME = "falcon-ms"
 
 try:
-    __version__ = version(pkg_name)
+    __version__ = version(_PKG_NAME)
 except PackageNotFoundError:
     __version__ = "0.0.0.dev0"
 
@@ -19,7 +20,7 @@ if TYPE_CHECKING:
         load_config,
         load_settings,
     )
-    from .falcon import run
+    from .pipeline import run
 
 __all__ = [
     "FalconConfig",
@@ -31,19 +32,26 @@ __all__ = [
 ]
 
 
+_LAZY_EXPORTS: dict[str, str] = {
+    "FalconConfig": ".config",
+    "FalconSettings": ".config",
+    "load_config": ".config",
+    "load_settings": ".config",
+    "run": ".pipeline",
+}
+
+
 def __getattr__(name: str) -> Any:
     """Lazily expose configuration and pipeline APIs at module level."""
-    if name in {
-        "FalconConfig",
-        "FalconSettings",
-        "load_config",
-        "load_settings",
-    }:
-        from . import config
-
-        return getattr(config, name)
-    if name == "run":
-        from .falcon import run
-
-        return run
+    module_name = _LAZY_EXPORTS.get(name)
+    if module_name is not None:
+        module = importlib.import_module(module_name, __name__)
+        value = getattr(module, name)
+        globals()[name] = value
+        return value
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    """Include lazily exposed public API names in ``dir(falcon)``."""
+    return sorted({*globals(), *__all__})

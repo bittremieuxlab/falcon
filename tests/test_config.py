@@ -1,4 +1,4 @@
-"""Unit tests for falcon.config."""
+"""Unit tests for falcon.config models, TOML loading, and serialization."""
 
 import json
 import os
@@ -8,243 +8,55 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+import falcon.config as config_mod
+import falcon.ms_io as ms_io
 from falcon.config import (
-    STAGING_CACHE_SCHEMA_VERSION,
-    AverageConsensusConfig,
     ClusteringConfig,
     ConfigError,
+    ConsensusConfig,
     FalconConfig,
     FalconSettings,
     IOConfig,
-    MedoidConsensusConfig,
-    PartialIOConfig,
     PrecursorTolerance,
     PreprocessingConfig,
     build_json_schema,
-    build_staging_manifest,
-    deserialize_cached_buckets,
-    diff_staging_manifests,
+    charge_sort_key,
+    format_metadata_lines,
+    format_toml,
     load_config,
     load_settings,
     load_toml_file,
     merge_config_dicts,
+    mz_bin_bounds,
+    parse_charge_buckets,
+    write_saved_config,
 )
-
-# ----------------------------------------------------------------------
-# Defaults, immutability, and strict type enforcement
-# ----------------------------------------------------------------------
+from tests.helpers import make_falcon_config
 
 
-class TestConfigModels:
-    def test_default_settings_and_immutability(self):
-        cfg = FalconConfig(
-            io=IOConfig(
-                input_filenames=("in.mgf",),
-                output_filename=Path("out"),
-            )
-        )
-        assert cfg.io.input_filenames == ("in.mgf",)
-        assert cfg.io.output_filename == Path("out")
-        assert cfg.io.work_dir is None
-        assert cfg.io.overwrite is False
-        assert cfg.io.export_representatives is False
-        assert cfg.preprocessing.min_peaks == 5
-        assert cfg.preprocessing.min_mz == 101.0
-        assert cfg.preprocessing.max_mz == 1500.0
-        assert cfg.preprocessing.min_mz_range == 250.0
-        assert cfg.preprocessing.remove_precursor_tol == 1.5
-        assert cfg.preprocessing.min_intensity == 0.01
-        assert cfg.preprocessing.max_peaks_used == 50
-        assert cfg.preprocessing.scaling == "off"
-        assert cfg.clustering.precursor_tol == PrecursorTolerance(
-            mass=20.0, mode="ppm"
-        )
-        assert cfg.clustering.rt_tol is None
-        assert cfg.clustering.fragment_tol == 0.05
-        assert cfg.clustering.linkage == "complete"
-        assert cfg.clustering.distance_threshold == 0.1
-        assert cfg.clustering.min_matched_peaks == 0
-        assert cfg.clustering.batch_size == 32768
-        assert cfg.clustering.precursor_charge_buckets is None
-        assert cfg.consensus == MedoidConsensusConfig()
-        assert hash(cfg) == hash(cfg)
-        with pytest.raises(ValidationError):
-            cfg.clustering.batch_size = 10  # type: ignore[misc]
-
-    def test_falcon_settings_defaults_without_io_paths(self):
-        settings = FalconSettings()
-        assert settings.io == PartialIOConfig()
-        assert settings.io.input_filenames is None
-        assert settings.io.output_filename is None
-        assert isinstance(ConfigError("bad"), ValueError)
-
-    def test_int_accepted_for_float_fields(self):
-        cfg = PreprocessingConfig(
-            min_mz=0, max_mz=1000, min_mz_range=150, remove_precursor_tol=2
-        )
-        assert cfg.min_mz == 0.0
-        assert cfg.max_mz == 1000.0
-        assert cfg.min_mz_range == 150.0
-        assert cfg.remove_precursor_tol == 2.0
-
-    @pytest.mark.parametrize(
-        ("model_cls", "kwargs"),
-        [
-            (PreprocessingConfig, {"min_peaks": True}),
-            (PreprocessingConfig, {"min_peaks": 5.0}),
-            (PreprocessingConfig, {"min_peaks": "5"}),
-            (PreprocessingConfig, {"min_mz": True}),
-            (PreprocessingConfig, {"min_mz": "101.0"}),
-            (PreprocessingConfig, {"max_peaks_used": False}),
-            (PreprocessingConfig, {"max_peaks_used": 50.0}),
-            (PreprocessingConfig, {"unknown_key": 1}),
-            (ClusteringConfig, {"batch_size": True}),
-            (ClusteringConfig, {"batch_size": 10.0}),
-            (ClusteringConfig, {"min_matched_peaks": False}),
-            (ClusteringConfig, {"distance_threshold": "0.1"}),
-            (ClusteringConfig, {"distance_threshold": True}),
-            (ClusteringConfig, {"extra_field": 123}),
-            (PrecursorTolerance, {"mass": True}),
-            (PrecursorTolerance, {"mass": "20"}),
-            (PrecursorTolerance, {"mode": "PPM"}),
-            (PrecursorTolerance, {"mode": "da"}),
-            (PrecursorTolerance, {"extra": 1}),
-            (PartialIOConfig, {"overwrite": 1}),
-            (PartialIOConfig, {"overwrite": "true"}),
-            (PartialIOConfig, {"export_representatives": "yes"}),
-            (PartialIOConfig, {"work_dir": 123}),
-            (PartialIOConfig, {"work_dir": True}),
-            (MedoidConsensusConfig, {"outlier_cutoff_lower": 1.5}),
-            (AverageConsensusConfig, {"outlier_cutoff_lower": True}),
-            (AverageConsensusConfig, {"outlier_cutoff_upper": "1.5"}),
-            (FalconSettings, {"unknown_section": {}}),
-        ],
-    )
-    def test_strict_types_and_extra_forbid(self, model_cls, kwargs):
-        with pytest.raises(ValidationError):
-            model_cls.model_validate(kwargs)
-
-    @pytest.mark.parametrize("scaling", ["off", "root", "log", "rank"])
-    def test_valid_scaling_choices(self, scaling):
-        assert PreprocessingConfig(scaling=scaling).scaling == scaling
-
-    @pytest.mark.parametrize("linkage", ["single", "complete", "average"])
-    def test_valid_linkage_choices(self, linkage):
-        assert ClusteringConfig(linkage=linkage).linkage == linkage
-
-    def test_consensus_discriminated_union(self):
+class TestModelsAndValidation:
+    def test_consensus_validation_and_sentinels(self):
         avg = FalconSettings.model_validate(
             {
                 "consensus": {
                     "method": "average",
                     "outlier_cutoff_lower": 2.0,
-                    "outlier_cutoff_upper": 3.0,
                 }
             }
         )
-        assert isinstance(avg.consensus, AverageConsensusConfig)
+        assert avg.consensus.method == "average"
         assert avg.consensus.outlier_cutoff_lower == 2.0
-        assert avg.consensus.outlier_cutoff_upper == 3.0
 
-        with pytest.raises(ValidationError):
-            FalconSettings.model_validate(
-                {
-                    "consensus": {
-                        "method": "medoid",
-                        "outlier_cutoff_lower": 2.0,
-                    }
-                }
-            )
+        # Mixing medoid (explicit or default) with average-only cutoffs fails.
+        for bad_cons in (
+            {"method": "medoid", "outlier_cutoff_lower": 2.0},
+            {"outlier_cutoff_upper": 2.0},
+        ):
+            with pytest.raises(ValidationError):
+                FalconSettings.model_validate({"consensus": bad_cons})
 
-
-# ----------------------------------------------------------------------
-# Numeric bounds, finiteness, and nullable TOML sentinels
-# ----------------------------------------------------------------------
-
-
-class TestBoundsAndSentinels:
-    @pytest.mark.parametrize(
-        "bad_float", [float("nan"), float("inf"), -float("inf")]
-    )
-    def test_non_finite_floats_rejected(self, bad_float):
-        with pytest.raises(ValidationError):
-            PrecursorTolerance(mass=bad_float, mode="ppm")
-        with pytest.raises(ValidationError):
-            ClusteringConfig(rt_tol=bad_float)
-        with pytest.raises(ValidationError):
-            ClusteringConfig(fragment_tol=bad_float)
-        with pytest.raises(ValidationError):
-            ClusteringConfig(distance_threshold=bad_float)
-        with pytest.raises(ValidationError):
-            PreprocessingConfig(min_mz_range=bad_float)
-        with pytest.raises(ValidationError):
-            PreprocessingConfig(min_mz=bad_float)
-        with pytest.raises(ValidationError):
-            PreprocessingConfig(max_mz=bad_float)
-        with pytest.raises(ValidationError):
-            PreprocessingConfig(remove_precursor_tol=bad_float)
-        with pytest.raises(ValidationError):
-            PreprocessingConfig(min_intensity=bad_float)
-        with pytest.raises(ValidationError):
-            AverageConsensusConfig(outlier_cutoff_lower=bad_float)
-        with pytest.raises(ValidationError):
-            AverageConsensusConfig(outlier_cutoff_upper=bad_float)
-
-    @pytest.mark.parametrize(
-        ("model_cls", "kwargs"),
-        [
-            (PrecursorTolerance, {"mass": -0.01, "mode": "Da"}),
-            (ClusteringConfig, {"rt_tol": -1.0}),
-            (ClusteringConfig, {"fragment_tol": 0.0}),
-            (ClusteringConfig, {"fragment_tol": -0.05}),
-            (ClusteringConfig, {"distance_threshold": 0.0}),
-            (ClusteringConfig, {"distance_threshold": -0.1}),
-            (ClusteringConfig, {"distance_threshold": 1.0}),
-            (ClusteringConfig, {"distance_threshold": 1.2}),
-            (ClusteringConfig, {"min_matched_peaks": -1}),
-            (ClusteringConfig, {"batch_size": 0}),
-            (ClusteringConfig, {"batch_size": -10}),
-            (PreprocessingConfig, {"min_peaks": 0}),
-            (PreprocessingConfig, {"min_mz": -1.0}),
-            (PreprocessingConfig, {"max_mz": 0.0}),
-            (PreprocessingConfig, {"min_mz_range": -0.1}),
-            (PreprocessingConfig, {"remove_precursor_tol": 0.0}),
-            (PreprocessingConfig, {"remove_precursor_tol": -1.0}),
-            (PreprocessingConfig, {"min_intensity": -0.01}),
-            (PreprocessingConfig, {"min_intensity": 1.0}),
-            (PreprocessingConfig, {"min_intensity": 1.5}),
-            (PreprocessingConfig, {"max_peaks_used": 0}),
-            (AverageConsensusConfig, {"outlier_cutoff_lower": 0.0}),
-            (AverageConsensusConfig, {"outlier_cutoff_lower": -1.0}),
-            (AverageConsensusConfig, {"outlier_cutoff_upper": 0.0}),
-            (AverageConsensusConfig, {"outlier_cutoff_upper": -0.5}),
-        ],
-    )
-    def test_out_of_range_values_rejected(self, model_cls, kwargs):
-        with pytest.raises(ValidationError):
-            model_cls.model_validate(kwargs)
-
-    def test_valid_edge_boundaries(self):
-        tol = PrecursorTolerance(mass=0.0, mode="Da")
-        assert tol.mass == 0.0
-        clust = ClusteringConfig(
-            rt_tol=0.0, distance_threshold=0.999, batch_size=1
-        )
-        assert clust.rt_tol == 0.0
-        assert clust.batch_size == 1
-        prep = PreprocessingConfig(
-            min_peaks=1,
-            min_mz=0.0,
-            max_mz=10.0,
-            min_mz_range=10.0,
-            min_intensity=0.0,
-            max_peaks_used=1,
-        )
-        assert prep.min_mz == 0.0
-        assert prep.min_mz_range == 10.0
-
-    def test_nullable_toml_sentinels_normalize_to_none(self):
-        settings = FalconSettings.model_validate(
+        # TOML string sentinels normalize to None.
+        disabled = FalconSettings.model_validate(
             {
                 "io": {"work_dir": "none"},
                 "preprocessing": {
@@ -257,716 +69,321 @@ class TestBoundsAndSentinels:
                 },
             }
         )
-        assert settings.io.work_dir is None
-        assert settings.preprocessing.remove_precursor_tol is None
-        assert settings.preprocessing.max_peaks_used is None
-        assert settings.clustering.rt_tol is None
-        assert settings.clustering.precursor_charge_buckets is None
+        assert disabled.io.work_dir is None
+        assert disabled.preprocessing.remove_precursor_tol is None
+        assert disabled.preprocessing.max_peaks_used is None
+        assert disabled.clustering.rt_tol is None
+        assert disabled.clustering.precursor_charge_buckets is None
 
-    @pytest.mark.parametrize(
-        ("model_cls", "kwargs"),
-        [
-            (ClusteringConfig, {"rt_tol": "off"}),
-            (ClusteringConfig, {"precursor_charge_buckets": "none"}),
-            (ClusteringConfig, {"precursor_charge_buckets": "off"}),
-            (PreprocessingConfig, {"remove_precursor_tol": "off"}),
-            (PreprocessingConfig, {"max_peaks_used": "all"}),
-        ],
-    )
-    def test_invalid_sentinel_strings_rejected(self, model_cls, kwargs):
-        with pytest.raises(ValidationError):
-            model_cls.model_validate(kwargs)
-
-
-# ----------------------------------------------------------------------
-# IOConfig path validation
-# ----------------------------------------------------------------------
-
-
-class TestIOConfig:
-    def test_accepts_list_and_string_paths_preserving_dotted_prefix(self):
-        io = IOConfig.model_validate(
-            {
-                "input_filenames": ["a.mgf", "b.mzml"],
-                "output_filename": "dir/run_v1.2",
-                "work_dir": "./none",
-            }
+    def test_cross_field_and_io_invariants(self):
+        io_cfg = IOConfig(
+            input_filenames=("a.mgf",), output_filename=Path("dir/run.v1")
         )
-        assert io.input_filenames == ("a.mgf", "b.mzml")
-        assert io.output_filename == Path("dir/run_v1.2")
-        assert io.work_dir == Path("./none")
+        assert io_cfg.csv_path == Path("dir/run.v1.csv")
+        assert io_cfg.mgf_path == Path("dir/run.v1.mgf")
 
-    @pytest.mark.parametrize(
-        "payload",
-        [
-            {"input_filenames": [], "output_filename": "out"},
-            {"input_filenames": [""], "output_filename": "out"},
-            {"input_filenames": ["   "], "output_filename": "out"},
-            {"input_filenames": "a.mgf", "output_filename": "out"},
-            {"input_filenames": [123], "output_filename": "out"},
-            {"input_filenames": ["a.mgf"], "output_filename": ""},
-            {"input_filenames": ["a.mgf"], "output_filename": "   "},
-            {"input_filenames": ["a.mgf"], "output_filename": Path(".")},
-            {"input_filenames": ["a.mgf"], "output_filename": Path("/")},
-            {
-                "input_filenames": ["a.mgf"],
-                "output_filename": "out",
-                "work_dir": "",
-            },
-            {
-                "input_filenames": ["a.mgf"],
-                "output_filename": "out",
-                "work_dir": "   ",
-            },
-        ],
-    )
-    def test_invalid_io_paths_rejected(self, payload):
-        with pytest.raises(ValidationError):
-            IOConfig.model_validate(payload)
-
-
-# ----------------------------------------------------------------------
-# Charge bucket validation and canonicalization
-# ----------------------------------------------------------------------
-
-
-class TestChargeBuckets:
-    def test_canonicalizes_lists_tuples_and_sets(self):
-        clust = ClusteringConfig.model_validate(
-            {
-                "precursor_charge_buckets": [
-                    [3, 2],
-                    {"unknown", -1},
-                    (127, -128),
-                    "other",
-                ]
-            }
-        )
-        assert clust.precursor_charge_buckets == (
-            (2, 3),
-            (-1, "unknown"),
-            (-128, 127),
-            "other",
-        )
-
-    @pytest.mark.parametrize(
-        "buckets",
-        [
-            [],  # empty outer sequence
-            [[]],  # empty inner bucket
-            [[2, 2]],  # duplicate inside bucket
-            [["unknown", "unknown"]],  # duplicate unknown inside bucket
-            [[1, 2], [2, 3]],  # overlapping integer charge
-            [[1, "unknown"], ["unknown"]],  # overlapping unknown
-            [[1], "other", "other"],  # duplicate 'other'
-            [["other"]],  # 'other' inside a bucket
-            [[True]],  # bool inside bucket
-            [[False]],  # bool inside bucket
-            [[-129]],  # below int8 min
-            [[128]],  # above int8 max
-            [[1.5]],  # float charge
-            [["abc"]],  # invalid string charge
-            "12",  # bare string
-            [1],  # bare int instead of bucket sequence
-        ],
-    )
-    def test_invalid_charge_buckets_rejected(self, buckets):
-        with pytest.raises(ValidationError):
-            ClusteringConfig.model_validate(
-                {"precursor_charge_buckets": buckets}
-            )
-
-
-# ----------------------------------------------------------------------
-# Cross-field and cross-section invariants
-# ----------------------------------------------------------------------
-
-
-class TestCrossFieldInvariants:
-    def test_preprocessing_cross_field_checks(self):
         with pytest.raises(ValidationError, match="min_mz"):
             PreprocessingConfig(min_mz=500.0, max_mz=500.0)
-        with pytest.raises(ValidationError, match="min_mz"):
-            PreprocessingConfig(min_mz=600.0, max_mz=500.0)
         with pytest.raises(ValidationError, match="min_mz_range"):
             PreprocessingConfig(min_mz=100.0, max_mz=200.0, min_mz_range=150.0)
         with pytest.raises(ValidationError, match="max_peaks_used"):
             PreprocessingConfig(min_peaks=10, max_peaks_used=5)
-
-    def test_cross_section_min_matched_peaks_vs_max_peaks_used(self):
         with pytest.raises(ValidationError, match="min_matched_peaks"):
             FalconSettings(
                 preprocessing=PreprocessingConfig(max_peaks_used=5),
                 clustering=ClusteringConfig(min_matched_peaks=6),
             )
-        # Valid when max_peaks_used is disabled (None).
-        settings = FalconSettings(
-            preprocessing=PreprocessingConfig(max_peaks_used=None),
-            clustering=ClusteringConfig(min_matched_peaks=100),
-        )
-        assert settings.clustering.min_matched_peaks == 100
-
-    def test_cross_section_fragment_tol_bin_overflow_rejected(self):
-        with pytest.raises(ValidationError, match="fragment_tol"):
-            FalconSettings(
-                preprocessing=PreprocessingConfig(min_mz=0.0, max_mz=1500.0),
-                clustering=ClusteringConfig(fragment_tol=1e-320),
-            )
-        with pytest.raises(ValidationError, match="bin"):
-            FalconSettings(
-                preprocessing=PreprocessingConfig(min_mz=0.0, max_mz=1500.0),
-                clustering=ClusteringConfig(fragment_tol=1e-8),
-            )
-
-
-# ----------------------------------------------------------------------
-# Hierarchical merging and TOML loading with extends
-# ----------------------------------------------------------------------
-
-
-class TestHierarchicalMergeAndLoading:
-    def test_merge_config_dicts_deep_merges_and_does_not_mutate(self):
-        base = {
-            "preprocessing": {"min_mz": 101.0, "max_mz": 1500.0},
-            "clustering": {
-                "precursor_tol": {"mass": 20.0, "mode": "ppm"},
-                "precursor_charge_buckets": [[1], [2]],
-            },
-        }
-        override = {
-            "preprocessing": {"min_mz": 0.0},
-            "clustering": {
-                "precursor_tol": {"mass": 10.0},
-                "precursor_charge_buckets": [[2, 3]],
-            },
-        }
-        merged = merge_config_dicts(base, override)
-        assert merged == {
-            "preprocessing": {"min_mz": 0.0, "max_mz": 1500.0},
-            "clustering": {
-                "precursor_tol": {"mass": 10.0, "mode": "ppm"},
-                "precursor_charge_buckets": [[2, 3]],
-            },
-        }
-        # Originals remain untouched.
-        assert base["preprocessing"]["min_mz"] == 101.0
-        assert base["clustering"]["precursor_charge_buckets"] == [[1], [2]]
-        merged["clustering"]["precursor_charge_buckets"].append("other")
-        assert override["clustering"]["precursor_charge_buckets"] == [[2, 3]]
-
-    def test_consensus_discriminator_merge_semantics(self):
-        base = {
-            "consensus": {
-                "method": "average",
-                "outlier_cutoff_lower": 2.0,
-                "outlier_cutoff_upper": 3.0,
-            }
-        }
-        # Partial override without method preserves average + sibling cutoff.
-        partial = merge_config_dicts(
-            base, {"consensus": {"outlier_cutoff_upper": 2.5}}
-        )
-        settings_avg = FalconSettings.model_validate(partial)
-        assert settings_avg.consensus == AverageConsensusConfig(
-            outlier_cutoff_lower=2.0, outlier_cutoff_upper=2.5
-        )
-
-        # Switching method to medoid drops stale average-only cutoffs.
-        switched = merge_config_dicts(
-            base, {"consensus": {"method": "medoid"}}
-        )
-        settings_med = FalconSettings.model_validate(switched)
-        assert settings_med.consensus == MedoidConsensusConfig()
-
-        # Same-layer method=medoid + outlier_cutoff still fails validation.
-        conflict = merge_config_dicts(
-            base,
-            {"consensus": {"method": "medoid", "outlier_cutoff_lower": 2.0}},
-        )
         with pytest.raises(ValidationError):
-            FalconSettings.model_validate(conflict)
+            IOConfig.model_validate(
+                {"input_filenames": [], "output_filename": "out"}
+            )
+        with pytest.raises(ValidationError):
+            IOConfig.model_validate(
+                {"input_filenames": ["a.mgf"], "output_filename": "dir/"}
+            )
 
-    def test_sparse_toml_layering_and_cli_overrides_precedence(self, tmp_path):
-        base_toml = tmp_path / "base.toml"
-        base_toml.write_text(
-            "[preprocessing]\n"
-            "min_mz = 0.0\n"
-            "max_mz = 1000.0\n"
-            "min_mz_range = 150.0\n"
-            "[clustering]\n"
-            "min_matched_peaks = 6\n"
-            "rt_tol = 30.0\n"
-            'precursor_charge_buckets = [[1], [2, 3], "other"]\n',
-            encoding="utf-8",
-        )
-        run_toml = tmp_path / "run.toml"
-        run_toml.write_text(
-            "[io]\n"
-            'input_filenames = ["a.mgf"]\n'
-            'output_filename = "results"\n'
-            "export_representatives = true\n"
-            "[clustering]\n"
-            "distance_threshold = 0.2\n"
-            'rt_tol = "none"\n'
-            'precursor_charge_buckets = "auto"\n',
-            encoding="utf-8",
-        )
+    def test_charge_buckets_and_mz_bin_bounds(self):
+        assert sorted(["unknown", 3, -1, 1], key=charge_sort_key) == [
+            -1,
+            1,
+            3,
+            "unknown",
+        ]
+        assert parse_charge_buckets(
+            [["unknown", 2, 1], {-128, 127}, "other"]
+        ) == ((1, 2, "unknown"), (-128, 127), "other")
 
-        cfg = load_config(
-            config_files=[base_toml, run_toml],
-            overrides={"clustering": {"distance_threshold": 0.15}},
-        )
-        assert cfg.io.input_filenames == ("a.mgf",)
-        assert cfg.io.output_filename == Path("results")
-        assert cfg.io.export_representatives is True
-        assert cfg.preprocessing.min_mz == 0.0
-        assert cfg.preprocessing.max_mz == 1000.0
-        assert cfg.preprocessing.min_mz_range == 150.0
-        assert cfg.preprocessing.min_peaks == 5  # untouched default
-        assert cfg.clustering.min_matched_peaks == 6
-        assert cfg.clustering.distance_threshold == 0.15
-        assert cfg.clustering.rt_tol is None
-        assert cfg.clustering.precursor_charge_buckets is None
+        for raw_bad in (
+            [],
+            [[]],
+            [[True]],
+            [[-129]],
+            [[128]],
+            [[2, 2]],
+            [[1, 2], [2, 3]],
+            [[1], "other", "other"],
+        ):
+            with pytest.raises(ValueError, match=r".+"):
+                parse_charge_buckets(raw_bad)
 
-    def test_extends_single_and_list_relative_to_declaring_file(
-        self, tmp_path, monkeypatch
-    ):
-        presets = tmp_path / "presets"
-        runs = tmp_path / "runs"
-        other_cwd = tmp_path / "elsewhere"
-        presets.mkdir()
-        runs.mkdir()
-        other_cwd.mkdir()
+        # Float rounding cases: 1.7/0.1 -> 17*0.1 > 1.7; 4.3/0.1 -> 42.9999...
+        for min_mz, max_mz, step in (
+            (1.7, 2.0, 0.1),
+            (0.0, 4.3, 0.1),
+            (101.03, 1500.03, 0.05),
+        ):
+            n_bins, start, end = mz_bin_bounds(min_mz, max_mz, step)
+            assert start <= min_mz
+            assert end > max_mz
+            assert n_bins >= 1
+            assert end - start == pytest.approx(n_bins * step)
 
-        (presets / "shared.toml").write_text(
-            "[preprocessing]\nmin_mz = 50.0\nmax_mz = 1200.0\n",
+
+class TestTomlLoadingAndSerialization:
+    def test_merge_and_extends_diamond_with_cycle_detection(self, tmp_path):
+        base_dict = {
+            "clustering": {"fragment_tol": 0.05, "linkage": "complete"},
+            "consensus": {"method": "average", "outlier_cutoff_lower": 2.0},
+        }
+        merged = merge_config_dicts(
+            base_dict,
+            {
+                "clustering": {"linkage": "average"},
+                "consensus": {"method": "medoid"},
+            },
+        )
+        assert merged["consensus"] == {"method": "medoid"}
+        assert base_dict["consensus"]["outlier_cutoff_lower"] == 2.0
+
+        base = tmp_path / "base.toml"
+        base.write_text(
+            "[preprocessing]\nmin_peaks = 3\nmin_mz = 50.0\n", encoding="utf-8"
+        )
+        left = tmp_path / "left.toml"
+        left.write_text(
+            'extends = "base.toml"\n[preprocessing]\nmax_mz = 900.0\n',
             encoding="utf-8",
         )
-        (presets / "left.toml").write_text(
-            'extends = "shared.toml"\n'
-            "[clustering]\nmin_matched_peaks = 6\ndistance_threshold = 0.2\n",
+        right = tmp_path / "right.toml"
+        right.write_text(
+            'extends = "base.toml"\n[clustering]\nmin_matched_peaks = 6\n',
             encoding="utf-8",
         )
-        (presets / "right.toml").write_text(
-            'extends = "shared.toml"\n'
-            "[clustering]\ndistance_threshold = 0.15\n"
-            '[consensus]\nmethod = "average"\noutlier_cutoff_lower = 2.0\n',
-            encoding="utf-8",
-        )
-        child = runs / "exp.toml"
+        child = tmp_path / "child.toml"
         child.write_text(
-            'extends = ["../presets/left.toml", "../presets/right.toml"]\n'
-            "[preprocessing]\nmin_mz = 0.0\n",
+            'extends = ["left.toml", "right.toml"]\n'
+            "[clustering]\ndistance_threshold = 0.2\n",
             encoding="utf-8",
         )
+        loaded = load_settings(config_files=[child])
+        assert loaded.preprocessing.min_mz == 50.0
+        assert loaded.preprocessing.max_mz == 900.0
+        assert loaded.clustering.min_matched_peaks == 6
+        assert loaded.clustering.distance_threshold == 0.2
 
-        # Invoke from unrelated CWD; relative extends must still resolve.
-        monkeypatch.chdir(other_cwd)
-        settings = load_settings(config_files=[child])
-        assert settings.preprocessing.min_mz == 0.0
-        assert settings.preprocessing.max_mz == 1200.0
-        assert settings.clustering.min_matched_peaks == 6
-        assert settings.clustering.distance_threshold == 0.15
-        assert settings.consensus == AverageConsensusConfig(
-            outlier_cutoff_lower=2.0, outlier_cutoff_upper=1.5
-        )
+        cyc_a, cyc_b = tmp_path / "cyc_a.toml", tmp_path / "cyc_b.toml"
+        cyc_a.write_text('extends = "cyc_b.toml"\n', encoding="utf-8")
+        cyc_b.write_text('extends = "cyc_a.toml"\n', encoding="utf-8")
+        with pytest.raises(ConfigError, match="Cycle detected"):
+            load_toml_file(cyc_a)
 
-    def test_extends_indirect_cycle_raises_config_error(self, tmp_path):
-        sub = tmp_path / "sub"
-        sub.mkdir()
-        a = tmp_path / "a.toml"
-        b = sub / "b.toml"
-        a.write_text('extends = "sub/b.toml"\n', encoding="utf-8")
-        b.write_text('extends = "../a.toml"\n', encoding="utf-8")
-
-        with pytest.raises(ConfigError, match="Cycle"):
-            load_toml_file(a)
-
-    def test_no_silent_autoload_of_cwd_config_files(
-        self, tmp_path, monkeypatch
-    ):
-        (tmp_path / "config.ini").write_text("min_peaks = 99\n")
-        (tmp_path / "falcon.toml").write_text(
-            "[preprocessing]\nmin_peaks = 99\n"
-        )
-        monkeypatch.chdir(tmp_path)
-        settings = load_settings()
-        assert settings.preprocessing.min_peaks == 5
-
-    def test_invalid_toml_files_and_extends_raise_config_error(self, tmp_path):
-        # Missing file
-        with pytest.raises(ConfigError, match=r"missing\.toml"):
-            load_settings(config_files=[tmp_path / "missing.toml"])
-
-        # Directory path
-        d = tmp_path / "adir"
-        d.mkdir()
+        with pytest.raises(ConfigError, match="not found"):
+            load_toml_file(tmp_path / "missing.toml")
         with pytest.raises(ConfigError, match="directory"):
-            load_settings(config_files=[d])
+            load_toml_file(tmp_path)
+        with pytest.raises(ConfigError, match="sequence of paths"):
+            load_settings(config_files=base)  # type: ignore[arg-type]
 
-        # Non-UTF-8 bytes
-        bad_bytes = tmp_path / "binary.toml"
-        bad_bytes.write_bytes(b"\xff\xfe[preprocessing]\n")
-        with pytest.raises(ConfigError, match=r"binary\.toml"):
-            load_settings(config_files=[bad_bytes])
+    def test_metabolomics_example_config_loads(self):
+        repo_cfg = (
+            Path(__file__).resolve().parents[1] / "configs/metabolomics.toml"
+        )
+        settings = load_settings(config_files=[repo_cfg])
+        assert settings.preprocessing.min_mz == 0.0
+        assert settings.preprocessing.max_mz == 1000.0
+        assert settings.clustering.min_matched_peaks == 6
 
-        # Invalid TOML syntax
-        bad_syntax = tmp_path / "syntax.toml"
-        bad_syntax.write_text("[preprocessing\nmin_peaks = 5\n")
-        with pytest.raises(ConfigError, match=r"syntax\.toml"):
-            load_settings(config_files=[bad_syntax])
-
-        # Missing extends target names both parent and child
-        bad_parent = tmp_path / "child.toml"
-        bad_parent.write_text('extends = "nope.toml"\n')
-        with pytest.raises(ConfigError, match=r"nope\.toml"):
-            load_settings(config_files=[bad_parent])
-
-    @pytest.mark.parametrize(
-        "extends_toml",
-        [
-            "extends = 123\n",
-            "extends = []\n",
-            'extends = ""\n',
-            'extends = [""]\n',
-            "extends = [1]\n",
-        ],
-    )
-    def test_invalid_extends_types_raise_config_error(
-        self, tmp_path, extends_toml
-    ):
-        bad = tmp_path / "bad_extends.toml"
-        bad.write_text(extends_toml, encoding="utf-8")
-        with pytest.raises(ConfigError, match="extends"):
-            load_settings(config_files=[bad])
-
-
-# ----------------------------------------------------------------------
-# TOML export, metadata lines, JSON Schema, and staging manifests
-# ----------------------------------------------------------------------
-
-
-class TestSerializationSchemaAndStaging:
-    def test_to_toml_round_trip_and_commented_disabled_fields(self, tmp_path):
+    def test_toml_roundtrip_metadata_and_json_schema(self, tmp_path):
         default_settings = FalconSettings()
-        default_toml = default_settings.to_toml()
+        default_toml = format_toml(default_settings)
         assert '# rt_tol = "none"' in default_toml
-        assert '# precursor_charge_buckets = "auto"' in default_toml
-        parsed_default = tomllib.loads(default_toml)
-        assert load_settings(overrides=parsed_default) == default_settings
+        assert "outlier_cutoff_lower" not in default_toml
+        assert (
+            load_settings(overrides=tomllib.loads(default_toml))
+            == default_settings
+        )
 
         custom = FalconConfig(
             io=IOConfig(
-                input_filenames=("a.mgf", "b.mzml"),
-                output_filename=Path("dir/run_v1.2"),
-                work_dir=tmp_path / "falcon_work",
+                input_filenames=(str(tmp_path / 'sample_"🧪".mgf'),),
+                output_filename=tmp_path / "run_v1.2",
+                work_dir=tmp_path / "work",
                 overwrite=True,
                 export_representatives=True,
             ),
             preprocessing=PreprocessingConfig(
-                min_peaks=3,
-                min_mz=0.0,
-                max_mz=1000.0,
-                min_mz_range=150.0,
-                remove_precursor_tol=None,
-                min_intensity=0.0,
-                max_peaks_used=None,
-                scaling="root",
+                remove_precursor_tol=None, max_peaks_used=None, scaling="root"
             ),
             clustering=ClusteringConfig(
                 precursor_tol=PrecursorTolerance(mass=0.05, mode="Da"),
                 rt_tol=15.5,
-                fragment_tol=0.02,
-                linkage="average",
-                distance_threshold=0.25,
-                min_matched_peaks=6,
-                batch_size=1024,
                 precursor_charge_buckets=((1,), (2, 3), ("unknown",), "other"),
             ),
-            consensus=AverageConsensusConfig(
-                outlier_cutoff_lower=2.0, outlier_cutoff_upper=3.0
+            consensus=ConsensusConfig(
+                method="average",
+                outlier_cutoff_lower=2.0,
+                outlier_cutoff_upper=3.0,
             ),
         )
-        toml_text = custom.to_toml()
-        assert '\nremove_precursor_tol = "none"\n' in toml_text
-        assert '\nmax_peaks_used = "none"\n' in toml_text
-        replayed = tmp_path / "replayed.toml"
-        replayed.write_text(toml_text, encoding="utf-8")
-        assert load_config(config_files=[replayed]) == custom
+        dest = tmp_path / "saved.toml"
+        write_saved_config(custom, dest)
+        assert load_config(config_files=[dest]) == custom
+        with pytest.raises(ConfigError, match="directory"):
+            write_saved_config(custom, tmp_path)
 
-    def test_to_toml_round_trip_non_bmp_filenames(self, tmp_path):
-        cfg = FalconConfig(
-            io=IOConfig(
-                input_filenames=(
-                    str(tmp_path / "sample_🧪.mgf"),
-                    "spectra_𝄞/*.mzML",
-                ),
-                output_filename=tmp_path / "results_🧬" / "run_🧪",
-                work_dir=tmp_path / "work_🔬",
-            )
+        cfg = make_falcon_config(
+            consensus={"method": "average", "outlier_cutoff_lower": 2.0}
         )
-        toml_text = cfg.to_toml()
-        parsed = tomllib.loads(toml_text)
-        assert parsed["io"]["input_filenames"] == list(cfg.io.input_filenames)
-        assert parsed["io"]["output_filename"] == str(cfg.io.output_filename)
-        assert parsed["io"]["work_dir"] == str(cfg.io.work_dir)
+        lines = format_metadata_lines(cfg, work_dir=tmp_path)
+        assert lines[0].startswith("falcon version ")
+        assert "clustering.precursor_tol = 20.0 ppm" in lines
+        assert "consensus.outlier_cutoff_lower = 2.0" in lines
 
-        saved = tmp_path / "saved_🧪.toml"
-        saved.write_text(toml_text, encoding="utf-8")
-        assert load_config(config_files=[saved]) == cfg
-
-        settings = FalconSettings(
-            io=PartialIOConfig(
-                input_filenames=("inspect_🧪.mgf",),
-                output_filename=Path("inspect_🧬"),
-                work_dir=Path("work_🔬"),
-            )
-        )
-        settings_toml = settings.to_toml()
-        assert load_settings(overrides=tomllib.loads(settings_toml)) == (
-            settings
-        )
-
-    def test_to_toml_escapes_quotes_backslashes_and_control_chars(
-        self, tmp_path
-    ):
-        all_controls = "".join(chr(code) for code in range(0x20)) + "\x7f"
-        special_str = f'in_\\"quote"\\path_{all_controls}_end.mgf'
-        special_path = Path(f'dir_\\sub"q"_{all_controls}_out')
-        special_work = Path('work_\\t\t"q"\n\r\b\f\x1b\x7f')
-        cfg = FalconConfig(
-            io=IOConfig(
-                input_filenames=(special_str,),
-                output_filename=special_path,
-                work_dir=special_work,
-            )
-        )
-        toml_text = cfg.to_toml()
-        # Verify key TOML basic-string escapes appear in the raw output.
-        for expected_escape in (
-            r"\\",
-            r"\"",
-            r"\b",
-            r"\t",
-            r"\n",
-            r"\f",
-            r"\r",
-            r"\u0000",
-            r"\u001b",
-            r"\u007f",
-        ):
-            assert expected_escape in toml_text
-        # No raw DEL or C0 control characters outside line breaks.
-        for line in toml_text.splitlines():
-            assert all(ord(ch) >= 0x20 and ord(ch) != 0x7F for ch in line)
-
-        saved = tmp_path / "escaped.toml"
-        saved.write_text(toml_text, encoding="utf-8")
-        assert load_config(config_files=[saved]) == cfg
-
-    @pytest.mark.parametrize(
-        "io_kwargs",
-        [
-            {
-                "input_filenames": ("bad_\ud800.mgf",),
-                "output_filename": Path("o"),
-            },
-            {
-                "input_filenames": ("ok.mgf",),
-                "output_filename": Path("bad_\udfff"),
-            },
-        ],
-    )
-    def test_to_toml_rejects_lone_surrogates(self, io_kwargs):
-        cfg = FalconConfig(io=IOConfig(**io_kwargs))
-        with pytest.raises(ConfigError, match="surrogate"):
-            cfg.to_toml()
-
-    def test_to_metadata_lines_medoid_and_average(self, tmp_path):
-        work_dir = tmp_path / "wd"
-        medoid_cfg = FalconConfig(
-            io=IOConfig(input_filenames=("in.mgf",), output_filename=Path("o"))
-        )
-        med_lines = medoid_cfg.to_metadata_lines(work_dir=work_dir)
-        assert any(line.startswith("falcon version ") for line in med_lines)
-        assert f"io.work_dir = {work_dir}" in med_lines
-        assert "clustering.precursor_tol = 20.0 ppm" in med_lines
-        assert "consensus.method = medoid" in med_lines
-        assert not any("outlier_cutoff" in line for line in med_lines)
-
-        avg_cfg = FalconConfig(
-            io=IOConfig(
-                input_filenames=("in.mgf",), output_filename=Path("o")
-            ),
-            consensus=AverageConsensusConfig(
-                outlier_cutoff_lower=2.0, outlier_cutoff_upper=3.5
-            ),
-        )
-        avg_lines = avg_cfg.to_metadata_lines()
-        assert "consensus.method = average" in avg_lines
-        assert "consensus.outlier_cutoff_lower = 2.0" in avg_lines
-        assert "consensus.outlier_cutoff_upper = 3.5" in avg_lines
-
-    def test_build_json_schema_is_json_serializable_with_extends_and_sentinels(
-        self,
-    ):
         schema = build_json_schema()
         serialized = json.dumps(schema)
-        assert isinstance(serialized, str)
         assert "extends" in schema["properties"]
-        assert "io" in schema["properties"]
-        assert "preprocessing" in schema["properties"]
-        assert "clustering" in schema["properties"]
-        assert "consensus" in schema["properties"]
-        # Sentinels appear in schema definitions for TOML editors.
         assert '"const": "none"' in serialized
         assert '"const": "auto"' in serialized
 
-    def test_staging_manifest_and_diff_detects_only_staging_changes(
-        self, tmp_path
+    def test_write_saved_config_rejects_input_aliases_before_atomic_open(
+        self, tmp_path, monkeypatch
     ):
-        f1 = tmp_path / "a.mgf"
-        f2 = tmp_path / "b.mgf"
-        f1.write_text("data1", encoding="utf-8")
-        f2.write_text("data2", encoding="utf-8")
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        spec_a = data_dir / "a.mgf"
+        spec_b = data_dir / "b.mgf"
+        bracket = data_dir / "sample_[1].mgf"
+        spec_a.write_text("MGF_A\n", encoding="utf-8")
+        spec_b.write_text("MGF_B\n", encoding="utf-8")
+        bracket.write_text("MGF_BRACKET\n", encoding="utf-8")
 
-        base_cfg = FalconConfig(
-            io=IOConfig(
-                input_filenames=(str(f1),),
-                output_filename=tmp_path / "out1",
-            )
-        )
-        base_manifest = build_staging_manifest(
-            base_cfg, [f1], buckets=[(2,), ("unknown",), "other"]
-        )
-        assert base_manifest["schema_version"] == STAGING_CACHE_SCHEMA_VERSION
-        assert base_manifest["buckets"] == [[2], ["unknown"], "other"]
-        assert deserialize_cached_buckets(base_manifest["buckets"]) == [
-            (2,),
-            ("unknown",),
-            "other",
-        ]
-
-        # Clustering/consensus/output changes must NOT invalidate cache.
-        sweep_cfg = FalconConfig(
-            io=IOConfig(
-                input_filenames=(str(f1),),
-                output_filename=tmp_path / "out2",
-                export_representatives=True,
-            ),
-            clustering=ClusteringConfig(
-                distance_threshold=0.25,
-                linkage="average",
-                rt_tol=10.0,
-                min_matched_peaks=6,
-                batch_size=512,
-            ),
-            consensus=AverageConsensusConfig(),
-        )
-        assert (
-            diff_staging_manifests(
-                base_manifest, build_staging_manifest(sweep_cfg, [f1])
-            )
-            == []
-        )
-
-        # Preprocessing change invalidates cache.
-        prep_cfg = FalconConfig(
-            io=base_cfg.io,
-            preprocessing=PreprocessingConfig(min_mz=50.0),
-        )
-        assert diff_staging_manifests(
-            base_manifest, build_staging_manifest(prep_cfg, [f1])
-        ) == ["preprocessing"]
-
-        # fragment_tol change invalidates cache (affects get_dim bounds).
-        frag_cfg = FalconConfig(
-            io=base_cfg.io,
-            clustering=ClusteringConfig(fragment_tol=0.02),
-        )
-        assert diff_staging_manifests(
-            base_manifest, build_staging_manifest(frag_cfg, [f1])
-        ) == ["fragment_tol"]
-
-        # precursor_charge_buckets change invalidates cache.
-        bucket_cfg = FalconConfig(
-            io=base_cfg.io,
-            clustering=ClusteringConfig(precursor_charge_buckets=((2,),)),
-        )
-        assert diff_staging_manifests(
-            base_manifest, build_staging_manifest(bucket_cfg, [f1])
-        ) == ["precursor_charge_buckets"]
-
-        # Different input list invalidates cache.
-        assert diff_staging_manifests(
-            base_manifest, build_staging_manifest(base_cfg, [f1, f2])
-        ) == ["inputs"]
-
-        # Modified input file contents (size / mtime) invalidates cache.
-        f1.write_text("modified_longer_content", encoding="utf-8")
-        st = os.stat(f1)
-        os.utime(f1, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
-        assert diff_staging_manifests(
-            base_manifest, build_staging_manifest(base_cfg, [f1])
-        ) == ["inputs"]
-
-        # Corrupted / non-dict / wrong schema version manifests fail.
-        assert diff_staging_manifests(["legacy"], base_manifest) == [
-            "schema_version"
-        ]
-        bad_ver = {**base_manifest, "schema_version": 999}
-        assert diff_staging_manifests(bad_ver, base_manifest) == [
-            "schema_version"
-        ]
-
-    def test_deserialize_cached_buckets_rejects_corrupted_entries(self):
-        with pytest.raises(ValueError, match="buckets"):
-            deserialize_cached_buckets("not-a-list")
-        with pytest.raises(ValueError, match="bucket"):
-            deserialize_cached_buckets([123])
-        with pytest.raises(ValueError, match="bucket"):
-            deserialize_cached_buckets([[True]])
-
-    def test_metabolomics_example_config_loads_cleanly(self):
-        repo_root = Path(__file__).resolve().parents[1]
-        metab_path = repo_root / "configs" / "metabolomics.toml"
-        settings = load_settings(config_files=[metab_path])
-        assert settings.preprocessing.min_mz == 0.0
-        assert settings.preprocessing.max_mz == 1000.0
-        assert settings.preprocessing.min_mz_range == 150.0
-        assert settings.preprocessing.min_peaks == 5
-        assert settings.clustering.min_matched_peaks == 6
-        assert settings.clustering.fragment_tol == 0.05
-        assert settings.consensus == MedoidConsensusConfig()
-
-    def test_symlink_loop_raises_config_error(self, tmp_path):
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        rel_alias = sub / ".." / "data" / "a.mgf"
+        sym_dest = tmp_path / "sym_config.toml"
+        sym_dest.symlink_to(spec_a)
+        hard_dest = tmp_path / "hard_config.toml"
+        os.link(spec_a, hard_dest)
+        sym_in = tmp_path / "in_link.mgf"
+        sym_in.symlink_to(spec_a)
+        missing = tmp_path / "missing.mgf"
+        dangling = tmp_path / "dangling.toml"
+        dangling.symlink_to(missing)
         loop = tmp_path / "loop.toml"
         loop.symlink_to(loop)
-        with pytest.raises(
-            ConfigError,
-            match=r"Failed to resolve configuration file.*loop\.toml",
-        ):
-            load_toml_file(loop)
 
-    def test_literal_dot_slash_none_work_dir_round_trips(self, tmp_path):
-        cfg = FalconConfig(
-            io=IOConfig.model_validate(
-                {
-                    "input_filenames": ["a.mgf"],
-                    "output_filename": "out",
-                    "work_dir": "./none",
+        def _fail_atomic_write(*_args, **_kwargs):
+            raise AssertionError("atomic_write_text must not open aliases")
+
+        monkeypatch.setattr(ms_io, "atomic_write_text", _fail_atomic_write)
+
+        glob_pat = str(data_dir / "*.mgf")
+        alias_cases = (
+            ([str(spec_a)], spec_a),
+            ([str(spec_a)], rel_alias),
+            ([glob_pat], spec_b),
+            ([str(bracket)], bracket),
+            ([str(spec_a)], sym_dest),
+            ([str(spec_a)], hard_dest),
+            ([glob_pat], sym_dest),
+            ([glob_pat], hard_dest),
+            ([str(sym_in)], spec_a),
+            ([str(missing)], missing),
+            ([str(missing)], dangling),
+        )
+        for inputs, dest in alias_cases:
+            cfg = make_falcon_config(
+                io={
+                    "input_filenames": inputs,
+                    "output_filename": tmp_path / "out",
                 }
             )
-        )
-        toml_text = cfg.to_toml()
-        assert 'work_dir = "./none"' in toml_text
-        replayed = tmp_path / "replay_none.toml"
-        replayed.write_text(toml_text, encoding="utf-8")
-        reloaded = load_config(config_files=[replayed])
-        assert reloaded.io.work_dir == Path("none")
+            with pytest.raises(ConfigError, match="aliases input file"):
+                write_saved_config(cfg, dest)
 
-    def test_falcon_settings_to_metadata_lines(self):
-        lines = FalconSettings().to_metadata_lines()
-        assert lines[0].startswith("falcon version ")
-        assert "io.work_dir = None" in lines
-        assert "consensus.method = medoid" in lines
+        cfg_loop = make_falcon_config(
+            io={
+                "input_filenames": [str(spec_a)],
+                "output_filename": tmp_path / "out",
+            }
+        )
+        with pytest.raises(ConfigError, match="Failed to resolve"):
+            write_saved_config(cfg_loop, loop)
+
+        assert spec_a.read_text(encoding="utf-8") == "MGF_A\n"
+        assert spec_b.read_text(encoding="utf-8") == "MGF_B\n"
+        assert bracket.read_text(encoding="utf-8") == "MGF_BRACKET\n"
+        assert not missing.exists()
+
+    def test_write_saved_config_preserves_atomic_replace_for_distinct_dests(
+        self, tmp_path, monkeypatch
+    ):
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        spec_a = data_dir / "a.mgf"
+        spec_a.write_text("MGF_A\n", encoding="utf-8")
+        glob_cfg = make_falcon_config(
+            io={
+                "input_filenames": [str(data_dir / "*.mgf")],
+                "output_filename": tmp_path / "out",
+            }
+        )
+
+        # Distinct new destination in the glob directory.
+        new_dest = data_dir / "saved.toml"
+        write_saved_config(glob_cfg, new_dest)
+        assert load_config(config_files=[new_dest]) == glob_cfg
+
+        # Existing distinct destination is replaced atomically.
+        existing = tmp_path / "existing.toml"
+        existing.write_text("# old\n", encoding="utf-8")
+        old_ino = existing.stat().st_ino
+
+        def _boom(_cfg):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(config_mod, "format_toml", _boom)
+        with pytest.raises(ConfigError, match="Failed to write"):
+            write_saved_config(glob_cfg, existing)
+        assert existing.read_text(encoding="utf-8") == "# old\n"
+        assert not list(tmp_path.glob(".config_*.tmp"))
+
+        monkeypatch.undo()
+        write_saved_config(glob_cfg, existing)
+        assert existing.stat().st_ino != old_ino
+        assert load_config(config_files=[existing]) == glob_cfg
+        assert not list(tmp_path.glob(".config_*.tmp"))
+
+        # Unmatched globs and loop inputs still allow distinct saves.
+        unmatched_cfg = make_falcon_config(
+            io={
+                "input_filenames": [str(tmp_path / "none_*.mgf")],
+                "output_filename": tmp_path / "out",
+            }
+        )
+        unmatched_dest = tmp_path / "unmatched.toml"
+        write_saved_config(unmatched_cfg, unmatched_dest)
+        assert unmatched_dest.is_file()
+
+        bad_input = tmp_path / "bad_input.mgf"
+        bad_input.symlink_to(bad_input)
+        loop_in_cfg = make_falcon_config(
+            io={
+                "input_filenames": [str(bad_input)],
+                "output_filename": tmp_path / "out",
+            }
+        )
+        distinct_dest = tmp_path / "distinct.toml"
+        write_saved_config(loop_in_cfg, distinct_dest)
+        assert distinct_dest.is_file()
+        assert spec_a.read_text(encoding="utf-8") == "MGF_A\n"

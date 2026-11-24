@@ -1,44 +1,164 @@
-"""Strict hierarchical configuration models and loaders for Falcon."""
+"""Strict hierarchical Pydantic/TOML configuration for Falcon."""
 
 from __future__ import annotations
 
 import copy
+import glob
+import json
 import math
 import os
 import tomllib
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Annotated, Any, Literal, Self
+from typing import TYPE_CHECKING, Annotated, Any, Literal, Self
 
 from pydantic import (
     BaseModel,
     BeforeValidator,
     ConfigDict,
     Field,
-    GetJsonSchemaHandler,
     model_validator,
 )
-from pydantic.json_schema import JsonSchemaValue
-from pydantic_core import core_schema
 
-from falcon import __version__
+from . import __version__
 
-STAGING_CACHE_SCHEMA_VERSION = 1
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
-_INT8_MIN = -128
-_INT8_MAX = 127
-_INT32_MAX = 2**31 - 1
+    from pydantic import GetJsonSchemaHandler
+    from pydantic.fields import FieldInfo
+    from pydantic.json_schema import JsonSchemaValue
+    from pydantic_core import core_schema
 
+INT8_MIN = -128
+INT8_MAX = 127
+
+NONE_SENTINEL = "none"
+AUTO_SENTINEL = "auto"
+UNKNOWN_CHARGE: Literal["unknown"] = "unknown"
+OTHER_BUCKET: Literal["other"] = "other"
+
+PrecursorTolMode = Literal["ppm", "Da"]
+ScalingMethod = Literal["off", "root", "log", "rank"]
+LinkageMethod = Literal["single", "complete", "average"]
+ConsensusMethod = Literal["medoid", "average"]
+
+PathLike = str | os.PathLike[str]
 ChargeValue = int | Literal["unknown"]
 ChargeBucket = tuple[ChargeValue, ...] | Literal["other"]
 
+_STRICT_MODEL_CONFIG = ConfigDict(frozen=True, extra="forbid", strict=True)
+_IO_CUSTOM_FIELDS = frozenset(
+    {"input_filenames", "output_filename", "work_dir"}
+)
+_AVERAGE_ONLY_KEYS = frozenset(
+    {"outlier_cutoff_lower", "outlier_cutoff_upper"}
+)
+
 
 class ConfigError(ValueError):
-    """Raised when configuration files or layers are invalid."""
+    """Raised when config files, layers, or save paths are invalid."""
 
 
-class _AllowSentinelSchema:
-    """Pydantic annotation adding a TOML string sentinel literal."""
+# ----------------------------------------------------------------------
+# Charge-bucket parsing and m/z bin grid helpers
+# ----------------------------------------------------------------------
+
+
+def charge_sort_key(value: ChargeValue) -> tuple[bool, int | str]:
+    """Sort numeric precursor charges ascending before ``"unknown"``."""
+    return (isinstance(value, str), value)
+
+
+def _parse_charge_entry(elem: Any) -> ChargeValue:
+    if elem == UNKNOWN_CHARGE:
+        return UNKNOWN_CHARGE
+    if (
+        isinstance(elem, int)
+        and not isinstance(elem, bool)
+        and INT8_MIN <= elem <= INT8_MAX
+    ):
+        return elem
+    raise ValueError(
+        f"Invalid charge bucket entry {elem!r}: expected int8 charge "
+        f"[{INT8_MIN}, {INT8_MAX}] or '{UNKNOWN_CHARGE}'"
+    )
+
+
+def parse_charge_buckets(value: Any) -> tuple[ChargeBucket, ...]:
+    """Validate and canonicalize a non-empty charge-bucket list."""
+    if not isinstance(value, (list, tuple)) or not value:
+        raise ValueError(
+            "Charge buckets must be a non-empty list or tuple of buckets"
+        )
+
+    buckets: list[ChargeBucket] = []
+    seen_values: set[ChargeValue] = set()
+    seen_other = False
+    for raw_bucket in value:
+        if raw_bucket == OTHER_BUCKET:
+            if seen_other:
+                raise ValueError(
+                    "Charge bucket 'other' appears more than once"
+                )
+            seen_other = True
+            buckets.append(OTHER_BUCKET)
+            continue
+
+        if (
+            not isinstance(raw_bucket, (list, tuple, set, frozenset))
+            or not raw_bucket
+        ):
+            raise ValueError(
+                "Each charge bucket must be a non-empty sequence or 'other'"
+            )
+        parsed = [_parse_charge_entry(elem) for elem in raw_bucket]
+        unique = set(parsed)
+        if len(unique) != len(parsed):
+            raise ValueError(
+                f"Duplicate charge value within bucket {raw_bucket!r}"
+            )
+        overlap = unique & seen_values
+        if overlap:
+            raise ValueError(
+                f"Charge value(s) {sorted(overlap, key=charge_sort_key)!r} "
+                "appear in more than one bucket"
+            )
+        seen_values |= unique
+        buckets.append(tuple(sorted(unique, key=charge_sort_key)))
+    return tuple(buckets)
+
+
+def mz_bin_bounds(
+    min_mz: float, max_mz: float, bin_size: float
+) -> tuple[int, float, float]:
+    """
+    Compute outward-aligned m/z bin boundaries and exact bin count.
+
+    Guarantees ``start_dim <= min_mz``, ``end_dim > max_mz``, and
+    ``n_bins >= 1`` in float64 precision.
+    """
+    if bin_size <= 0.0 or min_mz > max_mz:
+        raise ValueError(
+            f"Invalid m/z bin bounds: min_mz={min_mz}, max_mz={max_mz}, "
+            f"bin_size={bin_size}"
+        )
+    start_idx = math.floor(min_mz / bin_size)
+    if start_idx * bin_size > min_mz:
+        start_idx -= 1
+    end_idx = math.floor(max_mz / bin_size) + 1
+    if end_idx * bin_size <= max_mz:
+        end_idx += 1
+    return end_idx - start_idx, start_idx * bin_size, end_idx * bin_size
+
+
+# ----------------------------------------------------------------------
+# Pydantic field validators and schema annotations
+# ----------------------------------------------------------------------
+
+
+class _SentinelMeta:
+    """Annotate an optional field with its TOML/CLI string sentinel."""
 
     def __init__(self, sentinel: str) -> None:
         self.sentinel = sentinel
@@ -49,197 +169,102 @@ class _AllowSentinelSchema:
         handler: GetJsonSchemaHandler,
     ) -> JsonSchemaValue:
         json_schema = handler(schema)
-        if "anyOf" in json_schema:
-            json_schema["anyOf"] = [
-                *json_schema["anyOf"],
-                {"const": self.sentinel},
-            ]
+        json_schema["anyOf"] = [
+            *json_schema["anyOf"],
+            {"type": "string", "const": self.sentinel},
+        ]
         return json_schema
 
 
+def sentinel_for_field(field_info: FieldInfo) -> str | None:
+    """Return the TOML/CLI disable sentinel on ``field_info``."""
+    for meta in field_info.metadata:
+        if isinstance(meta, _SentinelMeta):
+            return meta.sentinel
+    return None
+
+
 def _none_sentinel(value: Any) -> Any:
-    """Normalize the TOML/CLI ``"none"`` sentinel to ``None``."""
-    if value == "none":
+    return None if value == NONE_SENTINEL else value
+
+
+def _parse_optional_charge_buckets(
+    value: Any,
+) -> tuple[ChargeBucket, ...] | None:
+    return (
+        None
+        if value is None or value == AUTO_SENTINEL
+        else parse_charge_buckets(value)
+    )
+
+
+def _parse_work_dir(value: Any) -> Path | None:
+    if value is None or value == NONE_SENTINEL:
         return None
-    return value
+    if not isinstance(value, (str, Path)) or not str(value).strip():
+        raise ValueError("work_dir must be a non-empty path string or Path")
+    return Path(value)
 
 
-def _parse_path(value: Any) -> Path:
-    """Validate and convert a non-empty string or Path to ``Path``."""
-    if isinstance(value, Path):
-        if not str(value).strip():
-            raise ValueError("Path must not be empty")
-        return value
-    if isinstance(value, str):
-        if not value.strip():
-            raise ValueError("Path must not be empty or whitespace")
-        return Path(value)
-    raise ValueError(f"Expected a path string or Path, got {type(value)}")
-
-
-def _parse_optional_path(value: Any) -> Path | None:
-    """Parse an optional path, treating ``"none"`` as ``None``."""
-    if value is None or value == "none":
-        return None
-    return _parse_path(value)
-
-
-def _parse_output_prefix(value: Any) -> Path:
-    """Validate an output file prefix path (non-empty file name)."""
-    path = _parse_path(value)
-    if path.name in ("", ".", ".."):
+def validate_file_path(value: Any, *, label: str) -> Path:
+    """Validate a file or prefix path, rejecting directory paths."""
+    if not isinstance(value, (str, Path)) or not str(value).strip():
+        raise ValueError(f"{label} must be a non-empty path string or Path")
+    if isinstance(value, str) and value.endswith(("/", "/.", "/..")):
         raise ValueError(
-            "output_filename must include a file prefix name, "
-            f"got {str(path)!r}"
+            f"{label} is a directory path, expected a file path: {value!r}"
+        )
+    path = Path(value)
+    if not path.name.strip() or path.name in (".", ".."):
+        raise ValueError(
+            f"{label} must include a non-empty file name, got {str(path)!r}"
         )
     return path
 
 
-def _parse_optional_output_prefix(value: Any) -> Path | None:
-    """Validate an optional output file prefix path."""
-    if value is None:
-        return None
-    return _parse_output_prefix(value)
+def _parse_output_prefix(value: Any) -> Path:
+    return validate_file_path(value, label="output_filename")
 
 
 def _parse_input_filenames(value: Any) -> tuple[str, ...]:
-    """Validate a non-empty sequence of non-blank input patterns."""
-    if not isinstance(value, (list, tuple)):
-        raise ValueError("input_filenames must be a list or tuple of strings")
-    if len(value) == 0:
-        raise ValueError("input_filenames must contain at least one pattern")
-    result: list[str] = []
-    for item in value:
-        if not isinstance(item, str) or not item.strip():
-            raise ValueError(
-                "Each entry in input_filenames must be a non-empty string"
-            )
-        result.append(item)
-    return tuple(result)
-
-
-def _parse_optional_input_filenames(value: Any) -> tuple[str, ...] | None:
-    """Validate an optional sequence of input file patterns."""
-    if value is None:
-        return None
-    return _parse_input_filenames(value)
-
-
-def _charge_sort_key(value: ChargeValue) -> tuple[bool, int | str]:
-    """Sort numeric charges ascending before ``"unknown"``."""
-    return (isinstance(value, str), value)
-
-
-def _parse_single_charge_bucket(
-    raw_bucket: Any,
-    seen_values: set[ChargeValue],
-) -> tuple[ChargeValue, ...]:
-    """Validate and canonicalize one non-``"other"`` charge bucket."""
-    if not isinstance(raw_bucket, (list, tuple, set, frozenset)):
+    if not isinstance(value, (list, tuple)) or not value:
         raise ValueError(
-            "Each charge bucket must be a sequence of charges or 'other'"
+            "input_filenames must be a non-empty list or tuple of strings"
         )
-    if len(raw_bucket) == 0:
-        raise ValueError("Charge bucket must not be empty")
-
-    bucket_seen: set[ChargeValue] = set()
-    for elem in raw_bucket:
-        if isinstance(elem, bool):
-            raise ValueError(
-                "Charge bucket entries must be integers or 'unknown', "
-                "not booleans"
-            )
-        if elem == "unknown":
-            parsed: ChargeValue = "unknown"
-        elif isinstance(elem, int):
-            if not (_INT8_MIN <= elem <= _INT8_MAX):
-                raise ValueError(
-                    f"Precursor charge {elem} is outside int8 range "
-                    f"[{_INT8_MIN}, {_INT8_MAX}]"
-                )
-            parsed = elem
-        else:
-            raise ValueError(
-                f"Invalid charge bucket entry {elem!r}: expected int8 "
-                f"charge or 'unknown'"
-            )
-
-        if parsed in bucket_seen:
-            raise ValueError(
-                f"Duplicate charge value {parsed!r} within the same bucket"
-            )
-        if parsed in seen_values:
-            raise ValueError(
-                f"Charge value {parsed!r} appears in more than one bucket"
-            )
-        bucket_seen.add(parsed)
-
-    seen_values |= bucket_seen
-    return tuple(sorted(bucket_seen, key=_charge_sort_key))
-
-
-def _parse_charge_buckets(
-    value: Any,
-) -> tuple[ChargeBucket, ...] | None:
-    """Validate and canonicalize ``precursor_charge_buckets``."""
-    if value is None or value == "auto":
-        return None
-    if not isinstance(value, (list, tuple)):
+    if any(not isinstance(item, str) or not item.strip() for item in value):
         raise ValueError(
-            "precursor_charge_buckets must be 'auto' or a non-empty list "
-            "of buckets"
+            "Each entry in input_filenames must be a non-empty string"
         )
-    if len(value) == 0:
-        raise ValueError("precursor_charge_buckets must not be empty")
-
-    buckets: list[ChargeBucket] = []
-    seen_values: set[ChargeValue] = set()
-    seen_other = False
-    for raw_bucket in value:
-        if raw_bucket == "other":
-            if seen_other:
-                raise ValueError(
-                    "Charge bucket 'other' appears more than once"
-                )
-            seen_other = True
-            buckets.append("other")
-            continue
-        buckets.append(_parse_single_charge_bucket(raw_bucket, seen_values))
-
-    return tuple(buckets)
+    return tuple(value)
 
 
-FiniteFloat = Annotated[float, Field(allow_inf_nan=False)]
-NonNegFloat = Annotated[float, Field(ge=0.0, allow_inf_nan=False)]
-PosFloat = Annotated[float, Field(gt=0.0, allow_inf_nan=False)]
-
-OptionalNonNegFloat = Annotated[
-    NonNegFloat | None,
-    BeforeValidator(_none_sentinel),
-    _AllowSentinelSchema("none"),
+_NonNegFloat = Annotated[float, Field(ge=0.0, allow_inf_nan=False)]
+_PosFloat = Annotated[float, Field(gt=0.0, allow_inf_nan=False)]
+_NonEmptyPath = Annotated[Path, Field(json_schema_extra={"minLength": 1})]
+_InputPatterns = Annotated[
+    tuple[Annotated[str, Field(json_schema_extra={"minLength": 1})], ...],
+    Field(min_length=1),
 ]
-OptionalPosFloat = Annotated[
-    PosFloat | None,
-    BeforeValidator(_none_sentinel),
-    _AllowSentinelSchema("none"),
-]
-OptionalPosInt = Annotated[
-    Annotated[int, Field(ge=1)] | None,
-    BeforeValidator(_none_sentinel),
-    _AllowSentinelSchema("none"),
-]
-OptionalWorkDir = Annotated[
-    Path | None,
-    BeforeValidator(_parse_optional_path),
-    _AllowSentinelSchema("none"),
-]
-OptionalChargeBuckets = Annotated[
-    tuple[ChargeBucket, ...] | None,
-    BeforeValidator(_parse_charge_buckets),
-    _AllowSentinelSchema("auto"),
+_SchemaChargeBuckets = Annotated[
+    tuple[
+        Annotated[
+            tuple[
+                Annotated[int, Field(ge=INT8_MIN, le=INT8_MAX)]
+                | Literal["unknown"],
+                ...,
+            ],
+            Field(min_length=1, json_schema_extra={"uniqueItems": True}),
+        ]
+        | Literal["other"],
+        ...,
+    ],
+    Field(min_length=1),
 ]
 
-_STRICT_MODEL_CONFIG = ConfigDict(frozen=True, extra="forbid", strict=True)
+
+# ----------------------------------------------------------------------
+# Configuration models
+# ----------------------------------------------------------------------
 
 
 class PrecursorTolerance(BaseModel):
@@ -247,8 +272,13 @@ class PrecursorTolerance(BaseModel):
 
     model_config = _STRICT_MODEL_CONFIG
 
-    mass: NonNegFloat = 20.0
-    mode: Literal["ppm", "Da"] = "ppm"
+    mass: _NonNegFloat = Field(
+        default=20.0, description="Precursor mass tolerance value"
+    )
+    mode: PrecursorTolMode = Field(
+        default="ppm",
+        description='Precursor mass tolerance unit ("ppm" or "Da")',
+    )
 
 
 class PreprocessingConfig(BaseModel):
@@ -256,16 +286,49 @@ class PreprocessingConfig(BaseModel):
 
     model_config = _STRICT_MODEL_CONFIG
 
-    min_peaks: Annotated[int, Field(ge=1)] = 5
-    min_mz_range: NonNegFloat = 250.0
-    min_mz: NonNegFloat = 101.0
-    max_mz: PosFloat = 1500.0
-    remove_precursor_tol: OptionalPosFloat = 1.5
+    min_peaks: Annotated[int, Field(ge=1)] = Field(
+        default=5, description="Minimum number of peaks per spectrum"
+    )
+    min_mz_range: _NonNegFloat = Field(
+        default=250.0, description="Minimum fragment m/z span per spectrum"
+    )
+    min_mz: _NonNegFloat = Field(
+        default=101.0, description="Minimum peak m/z inclusive"
+    )
+    max_mz: _PosFloat = Field(
+        default=1500.0, description="Maximum peak m/z inclusive"
+    )
+    remove_precursor_tol: Annotated[
+        _PosFloat | None,
+        BeforeValidator(_none_sentinel),
+        _SentinelMeta(NONE_SENTINEL),
+    ] = Field(
+        default=1.5,
+        description=(
+            "Window (Da) around precursor m/z to remove peaks, or "
+            f"'{NONE_SENTINEL}' to disable"
+        ),
+    )
     min_intensity: Annotated[
         float, Field(ge=0.0, lt=1.0, allow_inf_nan=False)
-    ] = 0.01
-    max_peaks_used: OptionalPosInt = 50
-    scaling: Literal["off", "root", "log", "rank"] = "off"
+    ] = Field(
+        default=0.01,
+        description="Minimum peak intensity relative to base peak in [0, 1)",
+    )
+    max_peaks_used: Annotated[
+        Annotated[int, Field(ge=1)] | None,
+        BeforeValidator(_none_sentinel),
+        _SentinelMeta(NONE_SENTINEL),
+    ] = Field(
+        default=50,
+        description=(
+            f"Maximum most-intense peaks to retain, or '{NONE_SENTINEL}' "
+            "for all"
+        ),
+    )
+    scaling: ScalingMethod = Field(
+        default="off", description="Peak intensity scaling method"
+    )
 
     @model_validator(mode="after")
     def _validate_invariants(self) -> Self:
@@ -296,89 +359,163 @@ class ClusteringConfig(BaseModel):
     model_config = _STRICT_MODEL_CONFIG
 
     precursor_tol: PrecursorTolerance = Field(
-        default_factory=PrecursorTolerance
+        default_factory=PrecursorTolerance,
+        description="Precursor mass tolerance value and unit",
     )
-    rt_tol: OptionalNonNegFloat = None
-    fragment_tol: PosFloat = 0.05
-    linkage: Literal["single", "complete", "average"] = "complete"
+    rt_tol: Annotated[
+        _NonNegFloat | None,
+        BeforeValidator(_none_sentinel),
+        _SentinelMeta(NONE_SENTINEL),
+    ] = Field(
+        default=None,
+        description=(
+            f"Retention time tolerance, or '{NONE_SENTINEL}' to disable"
+        ),
+    )
+    fragment_tol: _PosFloat = Field(
+        default=0.05, description="Fragment mass tolerance in m/z"
+    )
+    linkage: LinkageMethod = Field(
+        default="complete",
+        description="Hierarchical clustering linkage criterion",
+    )
     distance_threshold: Annotated[
         float, Field(gt=0.0, lt=1.0, allow_inf_nan=False)
-    ] = 0.1
-    min_matched_peaks: Annotated[int, Field(ge=0)] = 0
-    batch_size: Annotated[int, Field(ge=1)] = 2**15
-    precursor_charge_buckets: OptionalChargeBuckets = None
+    ] = Field(default=0.1, description="Cosine distance threshold in (0, 1)")
+    min_matched_peaks: Annotated[int, Field(ge=0)] = Field(
+        default=0, description="Minimum matched fragment peaks"
+    )
+    batch_size: Annotated[int, Field(ge=1)] = Field(
+        default=2**15, description="Maximum spectra per precursor m/z batch"
+    )
+    precursor_charge_buckets: Annotated[
+        _SchemaChargeBuckets | None,
+        BeforeValidator(_parse_optional_charge_buckets),
+        _SentinelMeta(AUTO_SENTINEL),
+    ] = Field(
+        default=None,
+        description=(
+            "Precursor charge groupings, or "
+            f"'{AUTO_SENTINEL}' to cluster each observed charge separately"
+        ),
+    )
 
 
-class MedoidConsensusConfig(BaseModel):
-    """Medoid representative spectrum selection settings."""
+class ConsensusConfig(BaseModel):
+    """Representative spectrum selection settings."""
 
     model_config = _STRICT_MODEL_CONFIG
 
-    method: Literal["medoid"] = "medoid"
+    method: ConsensusMethod = Field(
+        default="medoid", description="Representative spectrum method"
+    )
+    outlier_cutoff_lower: _PosFloat = Field(
+        default=1.5,
+        description=(
+            "Lower sigma cutoff for consensus averaging (only valid when "
+            "consensus.method = 'average')"
+        ),
+    )
+    outlier_cutoff_upper: _PosFloat = Field(
+        default=1.5,
+        description=(
+            "Upper sigma cutoff for consensus averaging (only valid when "
+            "consensus.method = 'average')"
+        ),
+    )
 
-
-class AverageConsensusConfig(BaseModel):
-    """Averaged consensus spectrum with iterative sigma clipping."""
-
-    model_config = _STRICT_MODEL_CONFIG
-
-    method: Literal["average"] = "average"
-    outlier_cutoff_lower: PosFloat = 1.5
-    outlier_cutoff_upper: PosFloat = 1.5
-
-
-ConsensusConfig = Annotated[
-    MedoidConsensusConfig | AverageConsensusConfig,
-    Field(discriminator="method"),
-]
+    @model_validator(mode="after")
+    def _validate_method_fields(self) -> Self:
+        if self.method == "medoid" and (
+            self.model_fields_set & _AVERAGE_ONLY_KEYS
+        ):
+            raise ValueError(
+                "outlier_cutoff_lower and outlier_cutoff_upper are only "
+                "valid when consensus.method = 'average'"
+            )
+        return self
 
 
 class _BaseIOConfig(BaseModel):
-    """Shared optional I/O flags for partial and complete configs."""
-
     model_config = _STRICT_MODEL_CONFIG
 
-    work_dir: OptionalWorkDir = None
-    overwrite: bool = False
-    export_representatives: bool = False
+    work_dir: Annotated[
+        _NonEmptyPath | None,
+        BeforeValidator(_parse_work_dir),
+        _SentinelMeta(NONE_SENTINEL),
+    ] = Field(
+        default=None,
+        description=(
+            f"Working directory for Lance staging cache, or "
+            f"'{NONE_SENTINEL}' for a temporary directory"
+        ),
+    )
+    overwrite: bool = Field(
+        default=False,
+        description="Overwrite existing results and cached staging files",
+    )
+    export_representatives: bool = Field(
+        default=False,
+        description="Export cluster representative spectra to an MGF file",
+    )
 
 
 class PartialIOConfig(_BaseIOConfig):
     """Input/output settings where paths may be omitted in overlays."""
 
     input_filenames: Annotated[
-        tuple[str, ...] | None,
-        BeforeValidator(_parse_optional_input_filenames),
-    ] = None
+        _InputPatterns | None,
+        BeforeValidator(
+            lambda v: None if v is None else _parse_input_filenames(v)
+        ),
+    ] = Field(
+        default=None,
+        description="Input peak file path(s) or glob patterns",
+    )
     output_filename: Annotated[
-        Path | None,
-        BeforeValidator(_parse_optional_output_prefix),
-    ] = None
+        _NonEmptyPath | None,
+        BeforeValidator(
+            lambda v: None if v is None else _parse_output_prefix(v)
+        ),
+    ] = Field(
+        default=None,
+        description="Output file prefix for cluster CSV and optional MGF",
+    )
 
 
 class IOConfig(_BaseIOConfig):
     """Complete input/output settings required to execute a run."""
 
     input_filenames: Annotated[
-        tuple[str, ...],
+        _InputPatterns,
         BeforeValidator(_parse_input_filenames),
-    ]
+    ] = Field(description="Input peak file path(s) or glob patterns")
     output_filename: Annotated[
-        Path,
+        _NonEmptyPath,
         BeforeValidator(_parse_output_prefix),
-    ]
+    ] = Field(
+        description="Output file prefix for cluster CSV and optional MGF"
+    )
+
+    @property
+    def csv_path(self) -> Path:
+        """Return the output cluster-assignment CSV file path."""
+        return Path(f"{self.output_filename}.csv")
+
+    @property
+    def mgf_path(self) -> Path:
+        """Return the output cluster-representatives MGF file path."""
+        return Path(f"{self.output_filename}.mgf")
 
 
 class _BaseFalconConfig(BaseModel):
-    """Shared scientific config sections and cross-section checks."""
-
     model_config = _STRICT_MODEL_CONFIG
 
     preprocessing: PreprocessingConfig = Field(
         default_factory=PreprocessingConfig
     )
     clustering: ClusteringConfig = Field(default_factory=ClusteringConfig)
-    consensus: ConsensusConfig = Field(default_factory=MedoidConsensusConfig)
+    consensus: ConsensusConfig = Field(default_factory=ConsensusConfig)
 
     @model_validator(mode="after")
     def _validate_cross_section(self) -> Self:
@@ -392,24 +529,6 @@ class _BaseFalconConfig(BaseModel):
                 f"({self.clustering.min_matched_peaks}) cannot exceed "
                 f"preprocessing.max_peaks_used ({max_peaks})"
             )
-
-        min_mz = self.preprocessing.min_mz
-        max_mz = self.preprocessing.max_mz
-        frag_tol = self.clustering.fragment_tol
-        span_ratio = (max_mz - min_mz) / frag_tol
-        if not math.isfinite(span_ratio):
-            raise ValueError(
-                f"clustering.fragment_tol ({frag_tol}) causes non-finite "
-                f"m/z bin count over [{min_mz}, {max_mz}]"
-            )
-        start_dim = min_mz - (min_mz % frag_tol)
-        end_dim = max_mz + frag_tol - (max_mz % frag_tol)
-        n_bins_raw = (end_dim - start_dim) / frag_tol
-        if not math.isfinite(n_bins_raw) or math.ceil(n_bins_raw) > _INT32_MAX:
-            raise ValueError(
-                f"m/z bin count for [{min_mz}, {max_mz}] at fragment_tol="
-                f"{frag_tol} exceeds int32 maximum ({_INT32_MAX})"
-            )
         return self
 
 
@@ -418,31 +537,15 @@ class FalconSettings(_BaseFalconConfig):
 
     io: PartialIOConfig = Field(default_factory=PartialIOConfig)
 
-    def to_toml(self, *, work_dir: Path | None = None) -> str:
-        """Serialize resolved settings as deterministic TOML text."""
-        return _format_toml(self, work_dir=work_dir)
-
-    def to_metadata_lines(self, *, work_dir: Path | None = None) -> list[str]:
-        """Return canonical ``section.key = value`` provenance lines."""
-        return _format_metadata_lines(self, work_dir=work_dir)
-
 
 class FalconConfig(_BaseFalconConfig):
     """Complete, immutable, validated configuration for a Falcon run."""
 
     io: IOConfig
 
-    def to_toml(self, *, work_dir: Path | None = None) -> str:
-        """Serialize resolved config as deterministic TOML text."""
-        return _format_toml(self, work_dir=work_dir)
-
-    def to_metadata_lines(self, *, work_dir: Path | None = None) -> list[str]:
-        """Return canonical ``section.key = value`` provenance lines."""
-        return _format_metadata_lines(self, work_dir=work_dir)
-
 
 # ----------------------------------------------------------------------
-# Hierarchical merging and TOML loading
+# Hierarchical TOML loading and merging
 # ----------------------------------------------------------------------
 
 
@@ -453,176 +556,96 @@ def merge_config_dicts(
     """
     Recursively merge two config mappings without mutating inputs.
 
-    Lists and scalar values replace lower-layer entries atomically.
-    When ``override`` switches ``consensus.method`` to a different
-    discriminated variant than ``base``, stale variant-specific keys
-    from ``base["consensus"]`` are discarded.
-
-    Parameters
-    ----------
-    base : Mapping[str, Any]
-        Lower-precedence configuration mapping.
-    override : Mapping[str, Any]
-        Higher-precedence sparse override mapping.
-
-    Returns
-    -------
-    dict[str, Any]
-        Freshly deep-copied merged configuration dictionary.
+    Drops stale average-only keys when ``override`` switches
+    ``consensus.method`` to ``"medoid"``.
     """
-    merged: dict[str, Any] = copy.deepcopy(dict(base))
+    merged: dict[str, Any] = {k: copy.deepcopy(v) for k, v in base.items()}
     for key, val in override.items():
         existing = merged.get(key)
         if isinstance(existing, Mapping) and isinstance(val, Mapping):
             if (
                 key == "consensus"
-                and "method" in val
-                and "method" in existing
-                and val["method"] != existing["method"]
+                and val.get("method") == "medoid"
+                and existing.get("method") in (None, "average")
             ):
-                merged[key] = copy.deepcopy(dict(val))
-            else:
-                merged[key] = merge_config_dicts(existing, val)
+                existing = {
+                    k: v
+                    for k, v in existing.items()
+                    if k not in _AVERAGE_ONLY_KEYS
+                }
+            merged[key] = merge_config_dicts(existing, val)
         else:
             merged[key] = copy.deepcopy(val)
     return merged
 
 
-def _parse_extends_entries(raw_extends: Any, source: Path) -> list[str]:
-    """Validate and normalize a TOML ``extends`` value into paths."""
-    if isinstance(raw_extends, str):
-        if not raw_extends.strip():
-            raise ConfigError(
-                f"Invalid 'extends' in {source}: path string must not be empty"
-            )
-        return [raw_extends]
-    if isinstance(raw_extends, list):
-        if len(raw_extends) == 0:
-            raise ConfigError(
-                f"Invalid 'extends' in {source}: list must not be empty"
-            )
-        entries: list[str] = []
-        for item in raw_extends:
-            if not isinstance(item, str) or not item.strip():
-                raise ConfigError(
-                    f"Invalid 'extends' entry {item!r} in {source}: "
-                    "expected non-empty path string"
-                )
-            entries.append(item)
-        return entries
-    raise ConfigError(
-        f"Invalid 'extends' in {source}: expected a path string or list of "
-        f"path strings, got {type(raw_extends).__name__}"
-    )
-
-
-def load_toml_file(
-    path: Path,
-    *,
-    _stack: tuple[Path, ...] = (),
-    _referenced_by: Path | None = None,
-) -> dict[str, Any]:
-    """
-    Load a TOML configuration file, resolving ``extends`` recursively.
-
-    Relative ``extends`` paths resolve against the declaring file's
-    parent directory. Cycle detection tracks the active resolution
-    stack so valid diamond inheritance succeeds while true cycles raise
-    ``ConfigError``.
-
-    Parameters
-    ----------
-    path : Path
-        Path to the TOML configuration file.
-    _stack : tuple[Path, ...], optional
-        Internal active canonical path stack for cycle detection.
-    _referenced_by : Path | None, optional
-        Internal declaring file path for clearer error messages.
-
-    Returns
-    -------
-    dict[str, Any]
-        Merged configuration dictionary with ``extends`` consumed.
-
-    Raises
-    ------
-    ConfigError
-        If the file is missing, is a directory, cannot be decoded as
-        UTF-8 TOML, has invalid ``extends`` entries, or forms a cycle.
-    """
-    origin = (
-        f" (referenced by {_referenced_by})"
-        if _referenced_by is not None
-        else ""
-    )
+def _load_toml_file(path: Path, stack: tuple[Path, ...]) -> dict[str, Any]:
     try:
-        try:
-            resolved = path.resolve(strict=True)
-        except FileNotFoundError:
-            resolved = path.resolve(strict=False)
-    except (OSError, RuntimeError) as exc:
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
         raise ConfigError(
-            f"Failed to resolve configuration file {path}{origin}: {exc}"
+            f"Configuration file not found or inaccessible: {path}: {exc}"
         ) from exc
-    if resolved in _stack:
-        cycle_start = _stack.index(resolved)
-        cycle_trace = " -> ".join(
-            str(p) for p in (*_stack[cycle_start:], resolved)
+    if resolved in stack:
+        cycle = " -> ".join(
+            str(p) for p in (*stack[stack.index(resolved) :], resolved)
         )
-        raise ConfigError(f"Cycle detected in config 'extends': {cycle_trace}")
-
-    if not path.exists():
-        raise ConfigError(f"Configuration file not found: {path}{origin}")
-    if path.is_dir():
+        raise ConfigError(f"Cycle detected in config 'extends': {cycle}")
+    if resolved.is_dir():
         raise ConfigError(
-            f"Configuration path is a directory, expected a TOML file: "
-            f"{path}{origin}"
+            f"Configuration path is a directory, expected a TOML file: {path}"
         )
 
     try:
-        raw_text = path.read_bytes().decode("utf-8")
-    except (OSError, UnicodeDecodeError) as exc:
+        data = tomllib.loads(resolved.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
         raise ConfigError(
-            f"Failed to read configuration file {path}{origin}: {exc}"
+            f"Failed to load TOML configuration {path}: {exc}"
         ) from exc
 
-    try:
-        data = tomllib.loads(raw_text)
-    except tomllib.TOMLDecodeError as exc:
+    if "extends" not in data:
+        return data
+
+    raw_extends = data.pop("extends")
+    entries = [raw_extends] if isinstance(raw_extends, str) else raw_extends
+    if (
+        not isinstance(entries, list)
+        or not entries
+        or any(not isinstance(e, str) or not e.strip() for e in entries)
+    ):
         raise ConfigError(
-            f"Invalid TOML syntax in {path}{origin}: {exc}"
-        ) from exc
+            f"Invalid 'extends' in {path}: expected a non-empty path "
+            "string or list of path strings"
+        )
 
     merged: dict[str, Any] = {}
-    if "extends" in data:
-        extends_entries = _parse_extends_entries(data.pop("extends"), path)
-        next_stack = (*_stack, resolved)
-        for entry in extends_entries:
-            parent_path = Path(entry)
-            if not parent_path.is_absolute():
-                parent_path = path.parent / parent_path
-            parent_data = load_toml_file(
-                parent_path,
-                _stack=next_stack,
-                _referenced_by=path,
-            )
-            merged = merge_config_dicts(merged, parent_data)
-
+    for entry in entries:
+        parent = Path(entry)
+        if not parent.is_absolute():
+            parent = resolved.parent / parent
+        merged = merge_config_dicts(
+            merged, _load_toml_file(parent, (*stack, resolved))
+        )
     return merge_config_dicts(merged, data)
+
+
+def load_toml_file(path: str | Path) -> dict[str, Any]:
+    """Load a TOML config file, resolving ``extends`` recursively."""
+    return _load_toml_file(Path(path), ())
 
 
 def _resolve_layers(
     config_files: Sequence[str | Path] = (),
     overrides: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Merge explicit TOML files left-to-right, then apply overrides."""
-    # Seed the default consensus discriminator so partial consensus
-    # overrides (or empty [consensus] tables) resolve against medoid
-    # rather than failing with a missing-discriminator error.
-    merged: dict[str, Any] = {"consensus": {"method": "medoid"}}
+    if isinstance(config_files, (str, bytes, os.PathLike)):
+        raise ConfigError(
+            "config_files must be a sequence of paths (e.g. [path]), "
+            f"not a single {type(config_files).__name__}"
+        )
+    merged: dict[str, Any] = {}
     for cfg_file in config_files:
-        layer = load_toml_file(Path(cfg_file))
-        merged = merge_config_dicts(merged, layer)
+        merged = merge_config_dicts(merged, load_toml_file(cfg_file))
     if overrides is not None:
         merged = merge_config_dicts(merged, overrides)
     return merged
@@ -632,89 +655,28 @@ def load_settings(
     config_files: Sequence[str | Path] = (),
     overrides: Mapping[str, Any] | None = None,
 ) -> FalconSettings:
-    """
-    Load and validate Falcon settings from TOML layers and overrides.
-
-    Parameters
-    ----------
-    config_files : Sequence[str | Path], default=()
-        Explicit TOML files applied left-to-right (later files override
-        earlier ones). No file in the working directory is auto-loaded.
-    overrides : Mapping[str, Any] | None, default=None
-        Highest-precedence sparse override dictionary (e.g., from CLI).
-
-    Returns
-    -------
-    FalconSettings
-        Validated immutable settings (run I/O paths may be omitted).
-    """
-    merged = _resolve_layers(config_files=config_files, overrides=overrides)
-    return FalconSettings.model_validate(merged)
+    """Load and validate Falcon settings from TOML and overrides."""
+    return FalconSettings.model_validate(
+        _resolve_layers(config_files=config_files, overrides=overrides)
+    )
 
 
 def load_config(
     config_files: Sequence[str | Path] = (),
     overrides: Mapping[str, Any] | None = None,
 ) -> FalconConfig:
-    """
-    Load and validate a complete runnable ``FalconConfig``.
-
-    Parameters
-    ----------
-    config_files : Sequence[str | Path], default=()
-        Explicit TOML files applied left-to-right.
-    overrides : Mapping[str, Any] | None, default=None
-        Highest-precedence sparse override dictionary (e.g., from CLI).
-
-    Returns
-    -------
-    FalconConfig
-        Validated immutable run configuration with required I/O paths.
-    """
+    """Load and validate a complete runnable ``FalconConfig``."""
     merged = _resolve_layers(config_files=config_files, overrides=overrides)
+    merged.setdefault("io", {})
     return FalconConfig.model_validate(merged)
 
 
 # ----------------------------------------------------------------------
-# Deterministic TOML serialization, metadata comments, and JSON Schema
+# TOML, metadata, JSON Schema, and saved-config serialization
 # ----------------------------------------------------------------------
 
 
-_TOML_ESCAPES: dict[str, str] = {
-    "\\": "\\\\",
-    '"': '\\"',
-    "\b": "\\b",
-    "\t": "\\t",
-    "\n": "\\n",
-    "\f": "\\f",
-    "\r": "\\r",
-}
-
-
-def _toml_string(value: str) -> str:
-    """Encode ``value`` as a valid TOML 1.0 basic string literal."""
-    parts: list[str] = ['"']
-    for ch in value:
-        escaped = _TOML_ESCAPES.get(ch)
-        if escaped is not None:
-            parts.append(escaped)
-            continue
-        code = ord(ch)
-        if 0xD800 <= code <= 0xDFFF:
-            raise ConfigError(
-                f"Cannot serialize lone surrogate code point U+{code:04X} "
-                "to TOML."
-            )
-        if code < 0x20 or code == 0x7F:
-            parts.append(f"\\u{code:04x}")
-        else:
-            parts.append(ch)
-    parts.append('"')
-    return "".join(parts)
-
-
 def _toml_literal(value: Any) -> str:
-    """Format a validated scalar or nested list as a TOML literal."""
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, int):
@@ -722,181 +684,114 @@ def _toml_literal(value: Any) -> str:
     if isinstance(value, float):
         return repr(float(value))
     if isinstance(value, (Path, str)):
-        return _toml_string(str(value))
+        return json.dumps(str(value), ensure_ascii=False).replace(
+            "\x7f", "\\u007f"
+        )
     if isinstance(value, (list, tuple)):
         return "[" + ", ".join(_toml_literal(v) for v in value) + "]"
-    raise TypeError(f"Unsupported TOML value type: {type(value)}")
+    raise TypeError(f"Unsupported TOML value type: {type(value).__name__}")
 
 
-def _format_toml(
-    cfg: FalconSettings | FalconConfig,
-    *,
-    work_dir: Path | None = None,
-) -> str:
-    """Render a validated config as canonical round-trippable TOML."""
-    effective_work_dir = cfg.io.work_dir if work_dir is None else work_dir
-    lines: list[str] = ["[io]"]
-    if cfg.io.input_filenames is not None:
-        lines.append(
-            f"input_filenames = {_toml_literal(cfg.io.input_filenames)}"
-        )
-    else:
-        lines.append("# input_filenames = []")
-    if cfg.io.output_filename is not None:
-        lines.append(
-            f"output_filename = {_toml_literal(cfg.io.output_filename)}"
-        )
-    else:
-        lines.append('# output_filename = ""')
-    if effective_work_dir is not None:
-        work_dir_str = (
-            "./none"
-            if effective_work_dir == Path("none")
-            else str(effective_work_dir)
-        )
-        lines.append(f"work_dir = {_toml_literal(work_dir_str)}")
-    else:
-        lines.append('# work_dir = "none"')
-    lines.append(f"overwrite = {_toml_literal(cfg.io.overwrite)}")
-    lines.append(
-        f"export_representatives = "
-        f"{_toml_literal(cfg.io.export_representatives)}"
-    )
-
-    prep = cfg.preprocessing
-    lines.extend(
-        [
-            "",
-            "[preprocessing]",
-            f"min_peaks = {_toml_literal(prep.min_peaks)}",
-            f"min_mz_range = {_toml_literal(prep.min_mz_range)}",
-            f"min_mz = {_toml_literal(prep.min_mz)}",
-            f"max_mz = {_toml_literal(prep.max_mz)}",
-            (
-                f"remove_precursor_tol = "
-                f"{_toml_literal(prep.remove_precursor_tol)}"
-                if prep.remove_precursor_tol is not None
-                else 'remove_precursor_tol = "none"'
-            ),
-            f"min_intensity = {_toml_literal(prep.min_intensity)}",
-            (
-                f"max_peaks_used = {_toml_literal(prep.max_peaks_used)}"
-                if prep.max_peaks_used is not None
-                else 'max_peaks_used = "none"'
-            ),
-            f"scaling = {_toml_literal(prep.scaling)}",
-        ]
-    )
-
-    clust = cfg.clustering
-    lines.extend(
-        [
-            "",
-            "[clustering]",
-            (
-                f"rt_tol = {_toml_literal(clust.rt_tol)}"
-                if clust.rt_tol is not None
-                else '# rt_tol = "none"'
-            ),
-            f"fragment_tol = {_toml_literal(clust.fragment_tol)}",
-            f"linkage = {_toml_literal(clust.linkage)}",
-            f"distance_threshold = {_toml_literal(clust.distance_threshold)}",
-            f"min_matched_peaks = {_toml_literal(clust.min_matched_peaks)}",
-            f"batch_size = {_toml_literal(clust.batch_size)}",
-            (
-                f"precursor_charge_buckets = "
-                f"{_toml_literal(clust.precursor_charge_buckets)}"
-                if clust.precursor_charge_buckets is not None
-                else '# precursor_charge_buckets = "auto"'
-            ),
-            "",
-            "[clustering.precursor_tol]",
-            f"mass = {_toml_literal(clust.precursor_tol.mass)}",
-            f"mode = {_toml_literal(clust.precursor_tol.mode)}",
-            "",
-            "[consensus]",
-            f"method = {_toml_literal(cfg.consensus.method)}",
-        ]
-    )
-    if isinstance(cfg.consensus, AverageConsensusConfig):
-        lines.append(
-            f"outlier_cutoff_lower = "
-            f"{_toml_literal(cfg.consensus.outlier_cutoff_lower)}"
-        )
-        lines.append(
-            f"outlier_cutoff_upper = "
-            f"{_toml_literal(cfg.consensus.outlier_cutoff_upper)}"
-        )
-    return "\n".join(lines) + "\n"
-
-
-def _format_metadata_lines(
-    cfg: FalconSettings | FalconConfig,
-    *,
-    work_dir: Path | None = None,
+def _format_section_toml(
+    section: BaseModel, *, skip: frozenset[str] = frozenset()
 ) -> list[str]:
-    """Return canonical metadata lines for logs and CSV headers."""
-    effective_work_dir = cfg.io.work_dir if work_dir is None else work_dir
-    prep = cfg.preprocessing
-    clust = cfg.clustering
-    lines = [
-        f"falcon version {__version__}",
-        f"io.work_dir = {effective_work_dir}",
-        f"io.overwrite = {cfg.io.overwrite}",
-        f"io.export_representatives = {cfg.io.export_representatives}",
-        f"preprocessing.min_peaks = {prep.min_peaks}",
-        f"preprocessing.min_mz_range = {prep.min_mz_range}",
-        f"preprocessing.min_mz = {prep.min_mz}",
-        f"preprocessing.max_mz = {prep.max_mz}",
-        f"preprocessing.remove_precursor_tol = {prep.remove_precursor_tol}",
-        f"preprocessing.min_intensity = {prep.min_intensity}",
-        f"preprocessing.max_peaks_used = {prep.max_peaks_used}",
-        f"preprocessing.scaling = {prep.scaling}",
-        (
-            f"clustering.precursor_tol = "
-            f"{clust.precursor_tol.mass} {clust.precursor_tol.mode}"
-        ),
-        f"clustering.rt_tol = {clust.rt_tol}",
-        f"clustering.fragment_tol = {clust.fragment_tol}",
-        f"clustering.linkage = {clust.linkage}",
-        f"clustering.distance_threshold = {clust.distance_threshold}",
-        f"clustering.min_matched_peaks = {clust.min_matched_peaks}",
-        f"clustering.batch_size = {clust.batch_size}",
-        (
-            f"clustering.precursor_charge_buckets = "
-            f"{clust.precursor_charge_buckets}"
-        ),
-        f"consensus.method = {cfg.consensus.method}",
-    ]
-    if isinstance(cfg.consensus, AverageConsensusConfig):
-        lines.append(
-            f"consensus.outlier_cutoff_lower = "
-            f"{cfg.consensus.outlier_cutoff_lower}"
-        )
-        lines.append(
-            f"consensus.outlier_cutoff_upper = "
-            f"{cfg.consensus.outlier_cutoff_upper}"
-        )
+    lines: list[str] = []
+    for name, field_info in type(section).model_fields.items():
+        if name in skip:
+            continue
+        value = getattr(section, name)
+        sentinel = sentinel_for_field(field_info)
+        if sentinel is not None and value is None:
+            prefix = "# " if field_info.default is None else ""
+            lines.append(f"{prefix}{name} = {_toml_literal(sentinel)}")
+        else:
+            lines.append(f"{name} = {_toml_literal(value)}")
     return lines
 
 
+def format_toml(
+    cfg: FalconSettings | FalconConfig, *, work_dir: Path | None = None
+) -> str:
+    """Render a validated config as canonical round-trippable TOML."""
+    effective_wd = cfg.io.work_dir if work_dir is None else work_dir
+    cons_skip = (
+        _AVERAGE_ONLY_KEYS if cfg.consensus.method == "medoid" else frozenset()
+    )
+    lines = [
+        "[io]",
+        (
+            f"input_filenames = {_toml_literal(cfg.io.input_filenames)}"
+            if cfg.io.input_filenames is not None
+            else "# input_filenames = []"
+        ),
+        (
+            f"output_filename = {_toml_literal(cfg.io.output_filename)}"
+            if cfg.io.output_filename is not None
+            else '# output_filename = ""'
+        ),
+        (
+            f"work_dir = {_toml_literal(effective_wd)}"
+            if effective_wd is not None
+            else f'# work_dir = "{NONE_SENTINEL}"'
+        ),
+        *_format_section_toml(cfg.io, skip=_IO_CUSTOM_FIELDS),
+        "",
+        "[preprocessing]",
+        *_format_section_toml(cfg.preprocessing),
+        "",
+        "[clustering]",
+        *_format_section_toml(
+            cfg.clustering, skip=frozenset({"precursor_tol"})
+        ),
+        "",
+        "[clustering.precursor_tol]",
+        *_format_section_toml(cfg.clustering.precursor_tol),
+        "",
+        "[consensus]",
+        *_format_section_toml(cfg.consensus, skip=cons_skip),
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _format_section_metadata(
+    prefix: str, section: BaseModel, *, skip: frozenset[str] = frozenset()
+) -> list[str]:
+    lines: list[str] = []
+    for name in type(section).model_fields:
+        if name in skip:
+            continue
+        value = getattr(section, name)
+        formatted = (
+            f"{value.mass} {value.mode}"
+            if isinstance(value, PrecursorTolerance)
+            else str(value)
+        )
+        lines.append(f"{prefix}.{name} = {formatted}")
+    return lines
+
+
+def format_metadata_lines(
+    cfg: FalconSettings | FalconConfig, *, work_dir: Path | None = None
+) -> list[str]:
+    """Return canonical metadata lines for logs and CSV headers."""
+    effective_wd = cfg.io.work_dir if work_dir is None else work_dir
+    cons_skip = (
+        _AVERAGE_ONLY_KEYS if cfg.consensus.method == "medoid" else frozenset()
+    )
+    return [
+        f"falcon version {__version__}",
+        f"io.work_dir = {effective_wd}",
+        *_format_section_metadata("io", cfg.io, skip=_IO_CUSTOM_FIELDS),
+        *_format_section_metadata("preprocessing", cfg.preprocessing),
+        *_format_section_metadata("clustering", cfg.clustering),
+        *_format_section_metadata("consensus", cfg.consensus, skip=cons_skip),
+    ]
+
+
 def build_json_schema() -> dict[str, Any]:
-    """
-    Build a JSON Schema for sparse hierarchical TOML configs.
-
-    Includes optional top-level ``extends`` (single path or list of
-    paths) alongside optional ``[io]`` paths and TOML string sentinels
-    (``"none"`` and ``"auto"``) so editor tooling validates partial
-    overlay files cleanly.
-
-    Returns
-    -------
-    dict[str, Any]
-        JSON-serializable schema dictionary.
-    """
+    """Build a JSON Schema for sparse hierarchical TOML configs."""
     schema = FalconSettings.model_json_schema()
-    properties = dict(schema.get("properties", {}))
-    properties = {
+    schema["properties"] = {
         "extends": {
             "title": "Extends",
             "description": (
@@ -912,160 +807,97 @@ def build_json_schema() -> dict[str, Any]:
                 },
             ],
         },
-        **properties,
+        **schema.get("properties", {}),
     }
-    schema["properties"] = properties
     return schema
 
 
-# ----------------------------------------------------------------------
-# Staging cache manifest helpers
-# ----------------------------------------------------------------------
-
-
-def serialize_cached_buckets(
-    buckets: Sequence[Any] | None,
-) -> list[list[int | str] | str] | None:
-    """
-    Serialize charge bucket keys for ``staging_cache.json``.
-
-    Parameters
-    ----------
-    buckets : Sequence[Any] | None
-        Charge bucket keys (tuples of charges/``"unknown"`` or
-        ``"other"``), or ``None`` when unset.
-
-    Returns
-    -------
-    list[list[int | str] | str] | None
-        Deterministic JSON-serializable representation, or ``None``.
-    """
-    if buckets is None:
-        return None
-    serialized: list[list[int | str] | str] = []
-    for bucket in buckets:
-        if bucket == "other":
-            serialized.append("other")
+def _expand_input_candidates(patterns: Sequence[str]) -> list[Path]:
+    """Expand input patterns into glob matches and literal paths."""
+    candidates: list[Path] = []
+    for pattern in patterns:
+        matches = sorted(glob.glob(pattern))
+        if matches:
+            candidates.extend(Path(match) for match in matches)
         else:
-            sorted_vals = sorted(bucket, key=_charge_sort_key)
-            serialized.append(list(sorted_vals))
-    return serialized
+            candidates.append(Path(pattern))
+    return candidates
 
 
-def build_staging_manifest(
-    config: FalconConfig,
-    resolved_inputs: Sequence[Path],
-    buckets: Sequence[Any] | None = None,
-) -> dict[str, Any]:
+def _resolve_path(path: Path) -> Path:
+    """Resolve ``path`` strictly, falling back only when missing."""
+    try:
+        return path.resolve(strict=True)
+    except FileNotFoundError:
+        return path.resolve(strict=False)
+
+
+def _paths_alias(
+    destination: Path,
+    resolved_dest: Path,
+    dest_exists: bool,
+    candidate: Path,
+) -> bool:
+    """Return ``True`` if ``destination`` aliases ``candidate``."""
+    try:
+        if resolved_dest == _resolve_path(candidate):
+            return True
+    except (OSError, RuntimeError):
+        return False
+    if dest_exists and candidate.exists():
+        try:
+            return os.path.samefile(destination, candidate)
+        except OSError:
+            return False
+    return False
+
+
+def _validate_save_destination(config: FalconConfig, dest: Path) -> None:
+    """Ensure ``dest`` does not alias any configured peak input."""
+    try:
+        resolved_dest = _resolve_path(dest)
+    except (OSError, RuntimeError) as exc:
+        raise ConfigError(
+            f"Failed to resolve config output path {dest}: {exc}"
+        ) from exc
+
+    dest_exists = dest.exists()
+    for candidate in _expand_input_candidates(config.io.input_filenames):
+        if _paths_alias(dest, resolved_dest, dest_exists, candidate):
+            raise ConfigError(
+                f"Config output path {dest} aliases input file "
+                f"{candidate}; choose a distinct destination"
+            )
+
+
+def write_saved_config(config: FalconConfig, destination: str | Path) -> None:
     """
-    Build a JSON-serializable staging cache provenance manifest.
+    Write a resolved ``FalconConfig`` as TOML to ``destination``.
 
-    Captures every parameter that affects staged Lance datasets:
-    resolved input files (canonical path, byte size, mtime_ns),
-    ``preprocessing``, ``clustering.fragment_tol``, and
-    ``clustering.precursor_charge_buckets``.
-
-    Parameters
-    ----------
-    config : FalconConfig
-        Validated run configuration.
-    resolved_inputs : Sequence[Path]
-        Expanded input peak file paths in deterministic staging order.
-    buckets : Sequence[Any] | None, default=None
-        Staged charge bucket keys written to disk, if already computed.
-
-    Returns
-    -------
-    dict[str, Any]
-        JSON-serializable manifest dictionary.
-    """
-    input_entries: list[dict[str, Any]] = []
-    for input_path in resolved_inputs:
-        resolved = input_path.resolve()
-        st = os.stat(resolved)
-        input_entries.append(
-            {
-                "path": str(resolved),
-                "size": st.st_size,
-                "mtime_ns": st.st_mtime_ns,
-            }
-        )
-
-    return {
-        "schema_version": STAGING_CACHE_SCHEMA_VERSION,
-        "falcon_version": str(__version__),
-        "inputs": input_entries,
-        "preprocessing": config.preprocessing.model_dump(mode="json"),
-        "fragment_tol": config.clustering.fragment_tol,
-        "precursor_charge_buckets": serialize_cached_buckets(
-            config.clustering.precursor_charge_buckets
-        ),
-        "buckets": serialize_cached_buckets(buckets),
-    }
-
-
-def diff_staging_manifests(
-    cached: Any,
-    expected: Mapping[str, Any],
-) -> list[str]:
-    """
-    Return staging manifest section names that differ from ``expected``.
-
-    Parameters
-    ----------
-    cached : Any
-        Parsed JSON payload loaded from ``staging_cache.json``.
-    expected : Mapping[str, Any]
-        Expected staging manifest for the current run.
-
-    Returns
-    -------
-    list[str]
-        Names of mismatched sections (empty list when the cache is
-        valid and reusable).
-    """
-    if not isinstance(cached, Mapping) or cached.get(
-        "schema_version"
-    ) != expected.get("schema_version"):
-        return ["schema_version"]
-
-    mismatches: list[str] = []
-    for key in (
-        "inputs",
-        "preprocessing",
-        "fragment_tol",
-        "precursor_charge_buckets",
-    ):
-        if cached.get(key) != expected.get(key):
-            mismatches.append(key)
-    return mismatches
-
-
-def deserialize_cached_buckets(raw_buckets: Any) -> list[ChargeBucket]:
-    """
-    Validate and deserialize bucket keys from ``staging_cache.json``.
-
-    Parameters
-    ----------
-    raw_buckets : Any
-        JSON-decoded ``buckets`` field from a staging cache manifest.
-
-    Returns
-    -------
-    list[ChargeBucket]
-        Validated charge bucket keys (tuples of charges/``"unknown"``
-        or ``"other"``).
+    Validates ``destination`` against all configured peak inputs
+    (literal paths and glob matches) before atomically replacing it.
 
     Raises
     ------
-    ValueError
-        If ``raw_buckets`` is malformed or contains invalid bucket keys.
+    ConfigError
+        If ``destination`` is invalid, is a directory, cannot be
+        resolved, aliases any peak input file, or cannot be written.
     """
-    if not isinstance(raw_buckets, list):
-        raise ValueError("Cached staging manifest has invalid 'buckets' field")
-    if len(raw_buckets) == 0:
-        return []
-    parsed = _parse_charge_buckets(raw_buckets)
-    if parsed is None:
-        raise ValueError("Cached staging manifest has invalid 'buckets' field")
-    return list(parsed)
+    from .ms_io import atomic_write_text
+
+    try:
+        dest = validate_file_path(destination, label="Config output path")
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
+    if dest.is_dir():
+        raise ConfigError(
+            f"Config output path is a directory, expected a file path: {dest}"
+        )
+    _validate_save_destination(config, dest)
+    try:
+        with atomic_write_text(dest, prefix=".config_") as f_out:
+            f_out.write(format_toml(config))
+    except OSError as exc:
+        raise ConfigError(
+            f"Failed to write configuration to {dest}: {exc}"
+        ) from exc

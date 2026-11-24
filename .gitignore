@@ -156,6 +156,9 @@ cython_debug/
 .ruff_cache/
 .ty/
 
+# Agent scratch workspaces
+.superpowers/
+
 # PyCharm
 .idea/
 
