@@ -8,7 +8,7 @@ import numpy as np
 __all__ = ["cosine_fast_arrays"]
 
 
-@nb.njit(cache=True, fastmath=True, boundscheck=False)
+@nb.njit(cache=True)
 def cosine_fast_arrays(
     mz1: np.ndarray,
     intensity1: np.ndarray,
@@ -40,20 +40,28 @@ def cosine_fast_arrays(
     """
     n1 = len(mz1)
     n2 = len(mz2)
+    if n1 == 0 or n2 == 0:
+        return 0.0, 0
+
     other_idx = 0
     peak_matches = []
     for i in range(n1):
         peak_mz = mz1[i]
         peak_intensity = intensity1[i]
-        while other_idx < n2 - 1 and peak_mz - fragment_tol > mz2[other_idx]:
+        while other_idx < n2 and peak_mz - mz2[other_idx] > fragment_tol:
             other_idx += 1
+        if other_idx == n2:
+            break
         j = other_idx
-        while j < n2 and abs(peak_mz - mz2[j]) <= fragment_tol:
+        while j < n2 and mz2[j] - peak_mz <= fragment_tol:
             # Negate score so plain tuple sort orders by descending
             # score with ascending (i, j) tie-breaking and stays
             # Numba-cacheable (no key-lambda closure).
             peak_matches.append((-(peak_intensity * intensity2[j]), i, j))
             j += 1
+
+    if len(peak_matches) == 0:
+        return 0.0, 0
 
     # Greedily accumulate highest-scoring one-to-one peak matches.
     score = 0.0

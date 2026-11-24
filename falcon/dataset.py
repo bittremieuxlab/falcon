@@ -45,6 +45,13 @@ INTERVAL_COLUMNS: tuple[str, ...] = (
     "mz",
     "intensity",
 )
+SORTED_INTERVAL_COLUMNS: tuple[str, ...] = (
+    "precursor_mz",
+    "precursor_charge",
+    "retention_time",
+    "mz",
+    "intensity",
+)
 SPECTRUM_SCHEMA = pa.schema(
     [
         pa.field("identifier", pa.string()),
@@ -62,6 +69,7 @@ __all__ = [
     "CANONICAL_SORT_COLUMNS",
     "INTERVAL_COLUMNS",
     "METADATA_COLUMNS",
+    "SORTED_INTERVAL_COLUMNS",
     "SPECTRA_SUBDIR",
     "SPECTRUM_SCHEMA",
     "bucket_dataset_name",
@@ -69,6 +77,7 @@ __all__ = [
     "bucket_key_to_str",
     "bucket_label_from_uri",
     "format_bucket_label",
+    "is_bucket_dataset_name",
     "read_canonical_metadata",
     "spectra_dir",
 ]
@@ -77,6 +86,15 @@ __all__ = [
 def spectra_dir(work_dir: Path) -> Path:
     """Return the ``spectra`` staging directory under ``work_dir``."""
     return work_dir / SPECTRA_SUBDIR
+
+
+def is_bucket_dataset_name(name: str) -> bool:
+    """Return whether ``name`` matches a staged charge dataset."""
+    return (
+        len(name) > len(BUCKET_PREFIX) + len(BUCKET_SUFFIX)
+        and name.startswith(BUCKET_PREFIX)
+        and name.endswith(BUCKET_SUFFIX)
+    )
 
 
 def bucket_key_to_str(bucket: ChargeBucket) -> str:
@@ -99,7 +117,7 @@ def bucket_key_to_str(bucket: ChargeBucket) -> str:
         return "other"
     if isinstance(bucket, tuple):
         return "_".join(str(part) for part in bucket)
-    raise TypeError(f"Unsupported bucket key type: {type(bucket)}")
+    raise TypeError(f"Unsupported bucket key type: {type(bucket).__name__}")
 
 
 def bucket_dataset_name(bucket: ChargeBucket) -> str:
@@ -120,9 +138,11 @@ def format_bucket_label(bucket: ChargeBucket) -> str:
     ``"1, 2"``, ``("unknown",)`` becomes ``"unknown"``, and ``"other"``
     becomes ``"other"``.
     """
-    if isinstance(bucket, str):
-        return bucket
-    return ", ".join(str(part) for part in bucket)
+    if bucket == "other":
+        return "other"
+    if isinstance(bucket, tuple):
+        return ", ".join(str(part) for part in bucket)
+    raise TypeError(f"Unsupported bucket key type: {type(bucket).__name__}")
 
 
 def bucket_label_from_uri(uri: str, fallback: str) -> str:
@@ -143,7 +163,7 @@ def bucket_label_from_uri(uri: str, fallback: str) -> str:
         Formatted charge label (e.g. ``"1, 2"`` or ``"unknown"``).
     """
     name = Path(uri.rstrip("/")).name
-    if name.startswith(BUCKET_PREFIX) and name.endswith(BUCKET_SUFFIX):
+    if is_bucket_dataset_name(name):
         key = name[len(BUCKET_PREFIX) : -len(BUCKET_SUFFIX)]
         return key.replace("_", ", ")
     return fallback
@@ -173,8 +193,20 @@ def read_canonical_metadata(
     -------
     pd.DataFrame
         Metadata table sorted by ``CANONICAL_SORT_COLUMNS``.
+
+    Raises
+    ------
+    ValueError
+        If any required column in ``CANONICAL_SORT_COLUMNS`` is omitted
+        from ``columns``.
     """
+    missing = [col for col in CANONICAL_SORT_COLUMNS if col not in columns]
+    if missing:
+        raise ValueError(
+            "columns must include CANONICAL_SORT_COLUMNS; missing: "
+            + ", ".join(missing)
+        )
     df = dataset.to_table(columns=list(columns)).to_pandas()
     if with_row_index:
         df = df.reset_index()
-    return df.sort_values(list(CANONICAL_SORT_COLUMNS))
+    return df.sort_values(list(CANONICAL_SORT_COLUMNS), kind="stable")

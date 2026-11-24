@@ -28,14 +28,14 @@ dependencies = [
     "joblib>=1.3.0",
     "lxml>=4.6.2",
     "natsort>=7.1.0",
-    "numba>=0.52.0",
-    "numpy>=1.19.4",
-    "pandas>=1.2.0",
-    "pyarrow>=2.0.0",
+    "numba>=0.57.0",
+    "numpy>=1.23.2",
+    "pandas>=1.5.0",
+    "pyarrow>=10.0.0",
     "pydantic>=2.10",
     "pylance>=14.0.3",
     "pyteomics[xml]>=4.4.0",
-    "scipy>=1.5.3",
+    "scipy>=1.9.2",
     "spectrum-utils==0.3.5",
 ]
 
@@ -49,6 +49,9 @@ falcon = "falcon.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["falcon*"]
+
+[tool.setuptools.package-data]
+falcon = ["py.typed"]
 
 [tool.setuptools_scm]
 
@@ -128,6 +131,7 @@ python-version = "3.11"
 error-on-warning = true
 
 [tool.pytest.ini_options]
+pythonpath = ["."]
 testpaths = ["tests"]
 addopts = ["-ra", "--strict-markers", "--strict-config"]
 markers = [

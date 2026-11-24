@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import glob
 import logging
+import math
+import os
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -16,6 +18,7 @@ __all__ = [
     "effective_n_workers",
     "expand_input_globs",
     "format_hms",
+    "paths_alias",
     "resolve_path",
 ]
 
@@ -26,7 +29,7 @@ def configure_logger() -> logging.Logger:
 
     Attaches a debug-level stderr handler if the root logger has no
     handlers yet, enables warning capture, and suppresses verbose debug
-    logs from ``numba`` and ``numexpr``.
+    logs from ``numba``.
 
     Returns
     -------
@@ -50,7 +53,6 @@ def configure_logger() -> logging.Logger:
         root.addHandler(handler)
     # Silence verbose third-party debug/info logs.
     logging.getLogger("numba").setLevel(logging.WARNING)
-    logging.getLogger("numexpr").setLevel(logging.WARNING)
     return logger
 
 
@@ -77,6 +79,54 @@ def resolve_path(path: Path) -> Path:
         return path.resolve(strict=False)
 
 
+def paths_alias(
+    target: Path,
+    candidate: Path,
+    *,
+    resolved_target: Path | None = None,
+    target_exists: bool | None = None,
+) -> bool:
+    """
+    Return whether ``target`` and ``candidate`` refer to the same file.
+
+    Checks both canonical resolved paths (covering non-existent paths
+    and symlinks) and ``os.path.samefile`` (covering hard links).
+
+    Parameters
+    ----------
+    target : Path
+        Destination or output path to test.
+    candidate : Path
+        Existing or literal input path to compare against.
+    resolved_target : Path | None, default=None
+        Optional pre-resolved canonical form of ``target``.
+    target_exists : bool | None, default=None
+        Optional precomputed ``target.exists()`` flag.
+
+    Returns
+    -------
+    bool
+        ``True`` if both paths alias the same filesystem location.
+    """
+    if resolved_target is None:
+        try:
+            resolved_target = resolve_path(target)
+        except (OSError, RuntimeError, ValueError):
+            return False
+    try:
+        if resolved_target == resolve_path(candidate):
+            return True
+    except (OSError, RuntimeError, ValueError):
+        return False
+    exists = target.exists() if target_exists is None else target_exists
+    if exists and candidate.exists():
+        try:
+            return os.path.samefile(target, candidate)
+        except (OSError, ValueError):
+            return False
+    return False
+
+
 def expand_input_globs(
     patterns: Sequence[str],
     *,
@@ -87,7 +137,9 @@ def expand_input_globs(
 
     Matches within each pattern are sorted lexicographically so results
     never depend on filesystem iteration order. Repeated matches across
-    patterns are preserved.
+    patterns are preserved. Existing literal paths containing glob
+    metacharacters (such as ``[1]``) are retained even when ``glob``
+    finds no wildcard expansion.
 
     Parameters
     ----------
@@ -108,8 +160,14 @@ def expand_input_globs(
         matches = sorted(glob.glob(pattern))
         if matches:
             resolved.extend(Path(match) for match in matches)
-        elif keep_unmatched_literals and not glob.has_magic(pattern):
-            resolved.append(Path(pattern))
+            continue
+        literal = Path(pattern)
+        if (
+            literal.exists()
+            or literal.is_symlink()
+            or (keep_unmatched_literals and not glob.has_magic(pattern))
+        ):
+            resolved.append(literal)
     return resolved
 
 
@@ -120,15 +178,17 @@ def format_hms(seconds: float) -> str:
     Parameters
     ----------
     seconds : float
-        Elapsed or estimated duration in seconds. Negative inputs are
-        clamped to ``0:00:00``.
+        Elapsed or estimated duration in seconds. Non-finite or
+        negative inputs are clamped to ``0:00:00``.
 
     Returns
     -------
     str
         Human-readable ``H:MM:SS`` string.
     """
-    total = max(0, int(seconds))
+    if not math.isfinite(seconds) or seconds <= 0:
+        return "0:00:00"
+    total = int(seconds)
     hours, rem = divmod(total, 3600)
     minutes, secs = divmod(rem, 60)
     return f"{hours:d}:{minutes:02d}:{secs:02d}"

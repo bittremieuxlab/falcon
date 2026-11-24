@@ -2,20 +2,24 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .. import __version__
-from ..types import AUTO_SENTINEL, NONE_SENTINEL
-from ..utils import expand_input_globs, resolve_path
+from ..types import INT8_MAX, INT8_MIN, NONE_SENTINEL
+from ..utils import expand_input_globs, paths_alias, resolve_path
 from .models import (
-    AverageConsensusConfig,
     ConfigError,
     FalconSettings,
+    PrecursorTolerance,
+    _AllowSentinelSchema,
+    validate_file_path,
 )
 
 if TYPE_CHECKING:
+    from pydantic import BaseModel
+    from pydantic.fields import FieldInfo
+
     from .models import FalconConfig
 
 __all__ = [
@@ -34,6 +38,11 @@ _TOML_ESCAPES: dict[str, str] = {
     "\f": "\\f",
     "\r": "\\r",
 }
+
+_IO_CUSTOM_FIELDS: frozenset[str] = frozenset(
+    {"input_filenames", "output_filename", "work_dir"}
+)
+_CLUSTERING_NESTED_FIELDS: frozenset[str] = frozenset({"precursor_tol"})
 
 
 def _toml_string(value: str) -> str:
@@ -70,7 +79,7 @@ def _toml_literal(value: Any) -> str:
         return _toml_string(str(value))
     if isinstance(value, (list, tuple)):
         return "[" + ", ".join(_toml_literal(v) for v in value) + "]"
-    raise TypeError(f"Unsupported TOML value type: {type(value)}")
+    raise TypeError(f"Unsupported TOML value type: {type(value).__name__}")
 
 
 def _format_optional_toml(
@@ -95,6 +104,77 @@ def _format_optional_toml(
         return f"{key} = {_toml_literal(value)}"
     prefix = "# " if comment_when_none else ""
     return f"{prefix}{key} = {_toml_literal(sentinel)}"
+
+
+def _sentinel_for_field(field_info: FieldInfo) -> str | None:
+    """Return the configured TOML sentinel for ``field_info``."""
+    for meta in field_info.metadata:
+        if isinstance(meta, _AllowSentinelSchema):
+            return meta.sentinel
+    return None
+
+
+def _format_model_toml_lines(
+    section: BaseModel,
+    *,
+    skip: frozenset[str] = frozenset(),
+) -> list[str]:
+    """Render scalar/list fields of a config section to TOML."""
+    lines: list[str] = []
+    for name, field_info in type(section).model_fields.items():
+        if name in skip:
+            continue
+        value = getattr(section, name)
+        sentinel = _sentinel_for_field(field_info)
+        if sentinel is not None:
+            lines.append(
+                _format_optional_toml(
+                    name,
+                    value,
+                    sentinel,
+                    comment_when_none=field_info.default is None,
+                )
+            )
+        else:
+            lines.append(f"{name} = {_toml_literal(value)}")
+    return lines
+
+
+def _format_metadata_value(value: Any) -> str:
+    """Format a metadata value as a single-line safe string."""
+    text = str(value)
+    if all(ord(ch) >= 0x20 and ord(ch) != 0x7F for ch in text):
+        return text
+    parts: list[str] = []
+    for ch in text:
+        if ch in _TOML_ESCAPES and ch not in ('"', "\\"):
+            parts.append(_TOML_ESCAPES[ch])
+        else:
+            code = ord(ch)
+            if code < 0x20 or code == 0x7F:
+                parts.append(f"\\x{code:02x}")
+            else:
+                parts.append(ch)
+    return "".join(parts)
+
+
+def _format_model_metadata_lines(
+    prefix: str,
+    section: BaseModel,
+    *,
+    skip: frozenset[str] = frozenset(),
+) -> list[str]:
+    """Render ``section.field = value`` lines from a Pydantic model."""
+    lines: list[str] = []
+    for name in type(section).model_fields:
+        if name in skip:
+            continue
+        value = getattr(section, name)
+        if isinstance(value, PrecursorTolerance):
+            lines.append(f"{prefix}.{name} = {value.mass} {value.mode}")
+        else:
+            lines.append(f"{prefix}.{name} = {value}")
+    return lines
 
 
 def format_toml(
@@ -145,75 +225,24 @@ def format_toml(
             "work_dir", work_dir_value, NONE_SENTINEL, comment_when_none=True
         )
     )
-    lines.append(f"overwrite = {_toml_literal(cfg.io.overwrite)}")
-    lines.append(
-        f"export_representatives = "
-        f"{_toml_literal(cfg.io.export_representatives)}"
+    lines.extend(_format_model_toml_lines(cfg.io, skip=_IO_CUSTOM_FIELDS))
+
+    lines.extend(["", "[preprocessing]"])
+    lines.extend(_format_model_toml_lines(cfg.preprocessing))
+
+    lines.extend(["", "[clustering]"])
+    lines.extend(
+        _format_model_toml_lines(
+            cfg.clustering, skip=_CLUSTERING_NESTED_FIELDS
+        )
     )
 
-    prep = cfg.preprocessing
-    lines.extend(
-        [
-            "",
-            "[preprocessing]",
-            f"min_peaks = {_toml_literal(prep.min_peaks)}",
-            f"min_mz_range = {_toml_literal(prep.min_mz_range)}",
-            f"min_mz = {_toml_literal(prep.min_mz)}",
-            f"max_mz = {_toml_literal(prep.max_mz)}",
-            _format_optional_toml(
-                "remove_precursor_tol",
-                prep.remove_precursor_tol,
-                NONE_SENTINEL,
-                comment_when_none=False,
-            ),
-            f"min_intensity = {_toml_literal(prep.min_intensity)}",
-            _format_optional_toml(
-                "max_peaks_used",
-                prep.max_peaks_used,
-                NONE_SENTINEL,
-                comment_when_none=False,
-            ),
-            f"scaling = {_toml_literal(prep.scaling)}",
-        ]
-    )
+    lines.extend(["", "[clustering.precursor_tol]"])
+    lines.extend(_format_model_toml_lines(cfg.clustering.precursor_tol))
 
-    clust = cfg.clustering
-    lines.extend(
-        [
-            "",
-            "[clustering]",
-            _format_optional_toml(
-                "rt_tol", clust.rt_tol, NONE_SENTINEL, comment_when_none=True
-            ),
-            f"fragment_tol = {_toml_literal(clust.fragment_tol)}",
-            f"linkage = {_toml_literal(clust.linkage)}",
-            f"distance_threshold = {_toml_literal(clust.distance_threshold)}",
-            f"min_matched_peaks = {_toml_literal(clust.min_matched_peaks)}",
-            f"batch_size = {_toml_literal(clust.batch_size)}",
-            _format_optional_toml(
-                "precursor_charge_buckets",
-                clust.precursor_charge_buckets,
-                AUTO_SENTINEL,
-                comment_when_none=True,
-            ),
-            "",
-            "[clustering.precursor_tol]",
-            f"mass = {_toml_literal(clust.precursor_tol.mass)}",
-            f"mode = {_toml_literal(clust.precursor_tol.mode)}",
-            "",
-            "[consensus]",
-            f"method = {_toml_literal(cfg.consensus.method)}",
-        ]
-    )
-    if isinstance(cfg.consensus, AverageConsensusConfig):
-        lines.append(
-            f"outlier_cutoff_lower = "
-            f"{_toml_literal(cfg.consensus.outlier_cutoff_lower)}"
-        )
-        lines.append(
-            f"outlier_cutoff_upper = "
-            f"{_toml_literal(cfg.consensus.outlier_cutoff_upper)}"
-        )
+    lines.extend(["", "[consensus]"])
+    lines.extend(_format_model_toml_lines(cfg.consensus))
+
     return "\n".join(lines) + "\n"
 
 
@@ -238,47 +267,52 @@ def format_metadata_lines(
         Version banner followed by ``section.key = value`` lines.
     """
     effective_work_dir = cfg.io.work_dir if work_dir is None else work_dir
-    prep = cfg.preprocessing
-    clust = cfg.clustering
-    lines = [
+    return [
         f"falcon version {__version__}",
-        f"io.work_dir = {effective_work_dir}",
-        f"io.overwrite = {cfg.io.overwrite}",
-        f"io.export_representatives = {cfg.io.export_representatives}",
-        f"preprocessing.min_peaks = {prep.min_peaks}",
-        f"preprocessing.min_mz_range = {prep.min_mz_range}",
-        f"preprocessing.min_mz = {prep.min_mz}",
-        f"preprocessing.max_mz = {prep.max_mz}",
-        f"preprocessing.remove_precursor_tol = {prep.remove_precursor_tol}",
-        f"preprocessing.min_intensity = {prep.min_intensity}",
-        f"preprocessing.max_peaks_used = {prep.max_peaks_used}",
-        f"preprocessing.scaling = {prep.scaling}",
-        (
-            f"clustering.precursor_tol = "
-            f"{clust.precursor_tol.mass} {clust.precursor_tol.mode}"
-        ),
-        f"clustering.rt_tol = {clust.rt_tol}",
-        f"clustering.fragment_tol = {clust.fragment_tol}",
-        f"clustering.linkage = {clust.linkage}",
-        f"clustering.distance_threshold = {clust.distance_threshold}",
-        f"clustering.min_matched_peaks = {clust.min_matched_peaks}",
-        f"clustering.batch_size = {clust.batch_size}",
-        (
-            f"clustering.precursor_charge_buckets = "
-            f"{clust.precursor_charge_buckets}"
-        ),
-        f"consensus.method = {cfg.consensus.method}",
+        f"io.work_dir = {_format_metadata_value(effective_work_dir)}",
+        *_format_model_metadata_lines("io", cfg.io, skip=_IO_CUSTOM_FIELDS),
+        *_format_model_metadata_lines("preprocessing", cfg.preprocessing),
+        *_format_model_metadata_lines("clustering", cfg.clustering),
+        *_format_model_metadata_lines("consensus", cfg.consensus),
     ]
-    if isinstance(cfg.consensus, AverageConsensusConfig):
-        lines.append(
-            f"consensus.outlier_cutoff_lower = "
-            f"{cfg.consensus.outlier_cutoff_lower}"
-        )
-        lines.append(
-            f"consensus.outlier_cutoff_upper = "
-            f"{cfg.consensus.outlier_cutoff_upper}"
-        )
-    return lines
+
+
+def _enrich_json_schema_constraints(schema: dict[str, Any]) -> None:
+    """Attach runtime validator constraints to the Pydantic schema."""
+    # Allow empty [consensus] tables (defaulting to medoid) by relaxing
+    # oneOf -> anyOf while preserving per-variant additionalProperties.
+    consensus_prop = schema.get("properties", {}).get("consensus")
+    if isinstance(consensus_prop, dict) and "oneOf" in consensus_prop:
+        consensus_prop["anyOf"] = consensus_prop.pop("oneOf")
+
+    defs = schema.get("$defs", {})
+    io_props = defs.get("PartialIOConfig", {}).get("properties", {})
+    if "input_filenames" in io_props:
+        for branch in io_props["input_filenames"].get("anyOf", ()):
+            if branch.get("type") == "array":
+                branch["minItems"] = 1
+                branch["items"] = {"type": "string", "minLength": 1}
+    for path_field in ("output_filename", "work_dir"):
+        if path_field in io_props:
+            for branch in io_props[path_field].get("anyOf", ()):
+                if branch.get("type") == "string" and "const" not in branch:
+                    branch["minLength"] = 1
+
+    clust_props = defs.get("ClusteringConfig", {}).get("properties", {})
+    buckets_schema = clust_props.get("precursor_charge_buckets", {})
+    for branch in buckets_schema.get("anyOf", ()):
+        if branch.get("type") != "array":
+            continue
+        branch["minItems"] = 1
+        for item_branch in branch.get("items", {}).get("anyOf", ()):
+            if item_branch.get("type") != "array":
+                continue
+            item_branch["minItems"] = 1
+            item_branch["uniqueItems"] = True
+            for elem in item_branch.get("items", {}).get("anyOf", ()):
+                if elem.get("type") == "integer":
+                    elem["minimum"] = INT8_MIN
+                    elem["maximum"] = INT8_MAX
 
 
 def build_json_schema() -> dict[str, Any]:
@@ -286,9 +320,9 @@ def build_json_schema() -> dict[str, Any]:
     Build a JSON Schema for sparse hierarchical TOML configs.
 
     Includes optional top-level ``extends`` (single path or list of
-    paths) alongside optional ``[io]`` paths and TOML string sentinels
-    (``"none"`` and ``"auto"``) so editor tooling validates partial
-    overlay files cleanly.
+    paths) alongside optional ``[io]`` paths, runtime validator bounds,
+    and TOML string sentinels (``"none"`` and ``"auto"``) so editor
+    tooling validates partial overlay files cleanly.
 
     Returns
     -------
@@ -296,8 +330,7 @@ def build_json_schema() -> dict[str, Any]:
         JSON-serializable schema dictionary.
     """
     schema = FalconSettings.model_json_schema()
-    properties = dict(schema.get("properties", {}))
-    properties = {
+    schema["properties"] = {
         "extends": {
             "title": "Extends",
             "description": (
@@ -313,61 +346,60 @@ def build_json_schema() -> dict[str, Any]:
                 },
             ],
         },
-        **properties,
+        **schema.get("properties", {}),
     }
-    schema["properties"] = properties
+    _enrich_json_schema_constraints(schema)
     return schema
 
 
-def _paths_alias(
-    destination: Path,
-    resolved_dest: Path,
-    dest_exists: bool,
-    candidate: Path,
-) -> bool:
-    """Return True if ``destination`` aliases ``candidate``."""
-    try:
-        if resolved_dest == resolve_path(candidate):
-            return True
-    except (OSError, RuntimeError):
-        return False
-    if dest_exists and candidate.exists():
-        try:
-            return os.path.samefile(destination, candidate)
-        except OSError:
-            return False
-    return False
-
-
 def _validate_save_destination(
-    config: FalconConfig, destination: Path
-) -> None:
-    """Ensure ``destination`` is a file path distinct from inputs."""
-    if destination.exists() and destination.is_dir():
-        raise ConfigError(
-            "Config output path is a directory, expected a file path: "
-            f"{destination}"
-        )
+    config: FalconConfig, destination: str | Path
+) -> Path:
+    """Ensure ``destination`` is a file path distinct from I/O files."""
     try:
-        resolved_dest = resolve_path(destination)
-    except (OSError, RuntimeError) as exc:
+        dest = validate_file_path(destination, label="Config output path")
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
+    try:
+        resolved_dest = resolve_path(dest)
+    except (OSError, RuntimeError, ValueError) as exc:
         raise ConfigError(
-            f"Failed to resolve config output path {destination}: {exc}"
+            f"Failed to resolve config output path {dest}: {exc}"
         ) from exc
+    if dest.is_dir():
+        raise ConfigError(
+            f"Config output path is a directory, expected a file path: {dest}"
+        )
 
-    dest_exists = destination.exists()
-    candidates = expand_input_globs(
+    dest_exists = dest.exists()
+    for candidate in expand_input_globs(
         config.io.input_filenames, keep_unmatched_literals=True
-    )
-    for candidate in candidates:
-        if _paths_alias(destination, resolved_dest, dest_exists, candidate):
+    ):
+        if paths_alias(
+            dest,
+            candidate,
+            resolved_target=resolved_dest,
+            target_exists=dest_exists,
+        ):
             raise ConfigError(
-                f"Config output path {destination} aliases input file "
+                f"Config output path {dest} aliases input file "
                 f"{candidate}; choose a distinct destination"
             )
+    for out_path in (config.io.csv_path, config.io.mgf_path):
+        if paths_alias(
+            dest,
+            out_path,
+            resolved_target=resolved_dest,
+            target_exists=dest_exists,
+        ):
+            raise ConfigError(
+                f"Config output path {dest} aliases output file "
+                f"{out_path}; choose a distinct destination"
+            )
+    return dest
 
 
-def write_saved_config(config: FalconConfig, destination: Path) -> None:
+def write_saved_config(config: FalconConfig, destination: str | Path) -> None:
     """
     Write a resolved ``FalconConfig`` as TOML to ``destination``.
 
@@ -375,20 +407,20 @@ def write_saved_config(config: FalconConfig, destination: Path) -> None:
     ----------
     config : FalconConfig
         Validated run configuration to serialize.
-    destination : Path
+    destination : str | Path
         Target TOML file path (must not be a directory or alias any
-        configured input peak file).
+        configured input or output file).
 
     Raises
     ------
     ConfigError
-        If ``destination`` is a directory, aliases an input file, or
-        cannot be written.
+        If ``destination`` is a directory, aliases an input or output
+        file, or cannot be written.
     """
-    _validate_save_destination(config, destination)
+    dest = _validate_save_destination(config, destination)
     try:
-        destination.write_text(format_toml(config), encoding="utf-8")
+        dest.write_text(format_toml(config), encoding="utf-8")
     except OSError as exc:
         raise ConfigError(
-            f"Failed to write configuration to {destination}: {exc}"
+            f"Failed to write configuration to {dest}: {exc}"
         ) from exc

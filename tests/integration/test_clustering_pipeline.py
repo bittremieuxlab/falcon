@@ -6,9 +6,14 @@ import tempfile
 import numpy as np
 import pytest
 
-from falcon.cluster import generate_clusters, generate_clusters_multi
+from falcon.cluster import (
+    engine,
+    generate_clusters,
+    generate_clusters_multi,
+    scheduling,
+)
 from falcon.config import AverageConsensusConfig, MedoidConsensusConfig
-from falcon.dataset import CANONICAL_SORT_COLUMNS
+from falcon.dataset import CANONICAL_SORT_COLUMNS, read_canonical_metadata
 from falcon.types import ClusterResult
 
 pytestmark = pytest.mark.integration
@@ -16,12 +21,8 @@ pytestmark = pytest.mark.integration
 
 def _attach_labels(dataset, labels):
     """Map spectrum identifier to label using canonical ordering."""
-    meta = dataset.to_table(columns=list(CANONICAL_SORT_COLUMNS)).to_pandas()
-    meta = meta.sort_values(list(CANONICAL_SORT_COLUMNS)).reset_index(
-        drop=True
-    )
-    meta["cluster"] = np.asarray(labels)
-    return dict(zip(meta["identifier"], meta["cluster"], strict=True))
+    meta = read_canonical_metadata(dataset, CANONICAL_SORT_COLUMNS)
+    return dict(zip(meta["identifier"], np.asarray(labels), strict=True))
 
 
 class TestClusteringPipelineIntegration:
@@ -133,11 +134,25 @@ class TestClusteringPipelineIntegration:
         temp_sub = tmp_path / "memmaps"
         temp_sub.mkdir()
         monkeypatch.setattr(tempfile, "tempdir", str(temp_sub))
+        # Lower pair-per-tile budget and pin worker count so n=6 always
+        # runs >= 2 parallel tiles even on 1-vCPU runners.
+        monkeypatch.setattr(scheduling, "MIN_PAIRS_PER_TILE", 4)
+        monkeypatch.setattr(engine, "effective_n_workers", lambda: 4)
+        assert len(scheduling.plan_tile_bounds(6, n_workers=4)) >= 2
 
-        for consensus_cfg in (
-            None,
-            MedoidConsensusConfig(),
-            AverageConsensusConfig(),
+        seen_giants: list[int] = []
+        real_alloc = engine.allocate_giant_tiles
+
+        def _spy_alloc(raw_giants, *args, **kwargs):
+            seen_giants.append(len(raw_giants))
+            return real_alloc(raw_giants, *args, **kwargs)
+
+        monkeypatch.setattr(engine, "allocate_giant_tiles", _spy_alloc)
+
+        for consensus_cfg, memmap_dir in (
+            (None, None),
+            (MedoidConsensusConfig(), temp_sub),
+            (AverageConsensusConfig(), None),
         ):
             res_giant = generate_clusters(
                 dataset,
@@ -145,7 +160,9 @@ class TestClusteringPipelineIntegration:
                 consensus_cfg,
                 min_mz=100.0,
                 max_mz=700.0,
+                temp_dir=memmap_dir,
             )
+            assert seen_giants[-1] >= 1
             res_normal = generate_clusters(
                 dataset,
                 da_clustering_factory(batch_size=100),
@@ -153,6 +170,7 @@ class TestClusteringPipelineIntegration:
                 min_mz=100.0,
                 max_mz=700.0,
             )
+            assert seen_giants[-1] == 0
             assert isinstance(res_giant, ClusterResult)
             assert isinstance(res_normal, ClusterResult)
             labels_giant, reps_giant = res_giant
@@ -232,3 +250,44 @@ class TestClusteringPipelineIntegration:
         assert isinstance(res, ClusterResult)
         assert len(res.labels) == 0
         assert res.representatives == []
+
+    def test_multiple_giants_parallel_pass2_and_forced_batch_split(
+        self, lance_dataset, spectrum_row, da_clustering_factory, monkeypatch
+    ):
+        peaks_a = [150.0, 250.0, 350.0, 450.0, 550.0]
+        peaks_b = [180.0, 280.0, 380.0, 480.0, 580.0]
+        inten = [1.0, 0.8, 0.6, 0.4, 0.2]
+        # 8 contiguous spectra split evenly by batch_size=4 into two
+        # 4-spectrum giants (effective threshold = 4 with
+        # MIN_PAIRS_PER_TILE=3 and 2+ workers), exercising both forced
+        # even splitting and multi-giant parallel Pass 2.
+        rows = [
+            spectrum_row(
+                f"s:{i}",
+                500.0 + 0.01 * i,
+                peaks_a if i % 2 == 0 else peaks_b,
+                inten,
+                2,
+                10.0 + i,
+            )
+            for i in range(8)
+        ]
+        ds = lance_dataset(rows)
+        monkeypatch.setattr(scheduling, "MIN_PAIRS_PER_TILE", 3)
+        monkeypatch.setattr(engine, "effective_n_workers", lambda: 2)
+        seen_giants: list[int] = []
+        real_alloc = engine.allocate_giant_tiles
+
+        def _spy_alloc(raw_giants, *args, **kwargs):
+            seen_giants.append(len(raw_giants))
+            return real_alloc(raw_giants, *args, **kwargs)
+
+        monkeypatch.setattr(engine, "allocate_giant_tiles", _spy_alloc)
+        res = generate_clusters(
+            ds, da_clustering_factory(batch_size=4), MedoidConsensusConfig()
+        )
+        assert seen_giants == [2]
+        assert len(res.labels) == 8
+        # Each 4-spectrum forced split produces 2 clusters (even vs odd).
+        assert len(np.unique(res.labels)) == 4
+        assert [int(r.cluster_id) for r in res.representatives] == [0, 1, 2, 3]

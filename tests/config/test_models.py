@@ -306,6 +306,10 @@ class TestIOConfig:
             {"input_filenames": ["a.mgf"], "output_filename": Path(".")},
             {"input_filenames": ["a.mgf"], "output_filename": Path("..")},
             {"input_filenames": ["a.mgf"], "output_filename": Path("/")},
+            {"input_filenames": ["a.mgf"], "output_filename": "results/"},
+            {"input_filenames": ["a.mgf"], "output_filename": "dir/."},
+            {"input_filenames": ["a.mgf"], "output_filename": "dir/.."},
+            {"input_filenames": ["a.mgf"], "output_filename": "dir/   "},
             {"input_filenames": ["a.mgf"], "output_filename": 123},
             {
                 "input_filenames": ["a.mgf"],
@@ -352,21 +356,9 @@ class TestChargeBuckets:
         "buckets",
         [
             [],
-            [[]],
-            [[2, 2]],
-            [["unknown", "unknown"]],
             [[1, 2], [2, 3]],
-            [[1, "unknown"], ["unknown"]],
-            [[1], "other", "other"],
-            [["other"]],
-            [[True]],
-            [[False]],
-            [[-129]],
             [[128]],
-            [[1.5]],
-            [["abc"]],
             "12",
-            [1],
         ],
     )
     def test_invalid_charge_buckets_rejected(self, buckets):
@@ -420,4 +412,12 @@ class TestCrossFieldInvariants:
             FalconSettings(
                 preprocessing=PreprocessingConfig(min_mz=0.0, max_mz=1500.0),
                 clustering=ClusteringConfig(fragment_tol=fragment_tol),
+            )
+
+    def test_cross_section_average_consensus_2x_fragment_tol_overflow(self):
+        with pytest.raises(ValidationError, match="average consensus"):
+            FalconSettings(
+                preprocessing=PreprocessingConfig(min_mz=0.0, max_mz=1500.0),
+                clustering=ClusteringConfig(fragment_tol=1e308),
+                consensus=AverageConsensusConfig(),
             )

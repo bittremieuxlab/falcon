@@ -224,6 +224,20 @@ class TestFormatTomlAndMetadata:
         assert "io.work_dir = None" in lines
         assert "consensus.method = medoid" in lines
 
+    def test_format_metadata_lines_sanitizes_control_chars_in_work_dir(self):
+        lines = format_metadata_lines(
+            FalconSettings(), work_dir=Path("wd\ninjected\r\x00dir")
+        )
+        work_dir_line = next(
+            line for line in lines if line.startswith("io.work_dir = ")
+        )
+        assert "\n" not in work_dir_line
+        assert "\r" not in work_dir_line
+        assert "\x00" not in work_dir_line
+        assert "\\n" in work_dir_line
+        assert "\\r" in work_dir_line
+        assert "\\x00" in work_dir_line
+
 
 class TestJsonSchema:
     def test_build_json_schema_is_json_serializable_with_extends_and_sentinels(
@@ -239,6 +253,35 @@ class TestJsonSchema:
         assert "consensus" in schema["properties"]
         assert '"const": "none"' in serialized
         assert '"const": "auto"' in serialized
+        # Empty [consensus] table requires anyOf rather than oneOf.
+        assert "anyOf" in schema["properties"]["consensus"]
+        assert "oneOf" not in schema["properties"]["consensus"]
+        io_defs = schema["$defs"]["PartialIOConfig"]["properties"]
+        in_array = next(
+            b
+            for b in io_defs["input_filenames"]["anyOf"]
+            if b.get("type") == "array"
+        )
+        assert in_array["minItems"] == 1
+        assert in_array["items"]["minLength"] == 1
+        buckets_def = schema["$defs"]["ClusteringConfig"]["properties"][
+            "precursor_charge_buckets"
+        ]
+        bucket_arr = next(
+            b for b in buckets_def["anyOf"] if b.get("type") == "array"
+        )
+        assert bucket_arr["minItems"] == 1
+        inner_arr = next(
+            b for b in bucket_arr["items"]["anyOf"] if b.get("type") == "array"
+        )
+        assert inner_arr["minItems"] == 1
+        assert inner_arr["uniqueItems"] is True
+        int_elem = next(
+            b
+            for b in inner_arr["items"]["anyOf"]
+            if b.get("type") == "integer"
+        )
+        assert (int_elem["minimum"], int_elem["maximum"]) == (-128, 127)
 
 
 class TestWriteSavedConfig:
@@ -259,6 +302,18 @@ class TestWriteSavedConfig:
             ConfigError, match="Config output path is a directory"
         ):
             write_saved_config(cfg, tmp_path)
+
+        for bad_dest, match in (
+            ("", "must not be empty"),
+            ("   ", "must not be empty"),
+            (Path("   "), "must not be empty"),
+            (f"{tmp_path}/   ", "non-empty file name"),
+            (f"{tmp_path}/no_such_dir/", "directory"),
+            (f"{tmp_path}/dir/.", "directory"),
+            (f"{tmp_path}/bad\x00.toml", "Failed to resolve"),
+        ):
+            with pytest.raises(ConfigError, match=match):
+                write_saved_config(cfg, bad_dest)
 
         missing_parent = tmp_path / "no_such_dir" / "saved.toml"
         with pytest.raises(ConfigError, match="Failed to write configuration"):
@@ -336,6 +391,18 @@ class TestWriteSavedConfig:
         with pytest.raises(ConfigError, match="aliases input file"):
             write_saved_config(cfg_sym_in, real_mgf)
         assert real_mgf.read_text(encoding="utf-8") == "REAL_MGF\n"
+
+    def test_rejects_output_csv_and_mgf_aliases(
+        self, tmp_path, config_factory
+    ):
+        cfg = config_factory(
+            input_filenames=(str(tmp_path / "in.mgf"),),
+            output_filename=tmp_path / "out",
+        )
+        for output_target in (cfg.io.csv_path, cfg.io.mgf_path):
+            with pytest.raises(ConfigError, match="aliases output file"):
+                write_saved_config(cfg, output_target)
+            assert not output_target.exists()
 
     def test_rejects_nonexistent_literal_dangling_symlink_and_symlink_loop(
         self, tmp_path, config_factory

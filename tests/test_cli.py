@@ -343,6 +343,9 @@ class TestCliUtilityActionsAndErrorFormatting:
                 ["in.mgf", "out", "--max-peaks-used", "abc"],
                 "expected an integer",
             ),
+            (["in.mgf", "out", "--save-config", ""], "must not be empty"),
+            (["in.mgf", "out", "--save-config", "dir/"], "directory"),
+            (["in.mgf", "out", "--save-config", "dir/."], "directory"),
             (
                 ["in.mgf", "out", "--precursor-tol", "abc", "ppm"],
                 "must be a number",
@@ -422,6 +425,25 @@ class TestCliUtilityActionsAndErrorFormatting:
         ):
             assert heading in help_text
 
+    def test_repeated_input_flags_extend_instead_of_overwriting(self):
+        action = parse_cli(
+            ["-i", "a.mgf", "-i", "b.mzml", "c.mzxml", "-o", "out"]
+        )
+        assert isinstance(action, RunAction)
+        assert action.config.io.input_filenames == (
+            "a.mgf",
+            "b.mzml",
+            "c.mzxml",
+        )
+
+    def test_newline_help_formatter_preserves_initial_indent(self):
+        from falcon.cli import NewlineTextHelpFormatter
+
+        fmt = NewlineTextHelpFormatter(prog="falcon")
+        filled = fmt._fill_text("hello world from falcon", 15, "  ")
+        for line in filled.splitlines():
+            assert line.startswith("  ")
+
 
 class TestCliMain:
     def test_main_dump_schema_and_print_config(
@@ -435,8 +457,34 @@ class TestCliMain:
         parsed = tomllib.loads(capsys.readouterr().out)
         assert parsed["consensus"]["method"] == "medoid"
 
+        rc_bad = falcon_main(["--print-config", "-i", "bad_\ud800.mgf"])
+        assert rc_bad == 2
+        assert "surrogate" in capsys.readouterr().err
+
+    def test_main_preserves_unrelated_logging_handlers(
+        self, monkeypatch, isolated_root_logger
+    ):
+        import logging
+
+        class _TrackingHandler(logging.NullHandler):
+            closed = False
+
+            def close(self) -> None:
+                self.closed = True
+                super().close()
+
+        root = logging.getLogger()
+        tracker = _TrackingHandler()
+        root.addHandler(tracker)
+        monkeypatch.setattr(pipeline, "run", lambda _cfg: 0)
+        try:
+            assert falcon_main(["in.mgf", "out"]) == 0
+            assert not tracker.closed
+        finally:
+            root.removeHandler(tracker)
+
     def test_main_runs_pipeline_with_and_without_save_config(
-        self, tmp_path, monkeypatch
+        self, tmp_path, monkeypatch, isolated_root_logger
     ):
         seen: list[FalconConfig] = []
 
@@ -464,6 +512,17 @@ class TestCliMain:
         rc_dir = falcon_main(["in.mgf", "out", "--save-config", str(tmp_path)])
         assert rc_dir == 2
         assert "directory" in capsys.readouterr().err.lower()
+
+        # Blank/whitespace --save-config and -c paths fail with exit code 2.
+        for bad_argv in (
+            ["in.mgf", "out", "--save-config", "   "],
+            ["in.mgf", "out", "--save-config", f"{tmp_path}/   "],
+            ["-c", "", "in.mgf", "out"],
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                falcon_main(bad_argv)
+            assert exc_info.value.code == 2
+            assert capsys.readouterr().err.strip()
 
         # Unwritable parent directory.
         unwritable = tmp_path / "no_such_dir" / "saved.toml"

@@ -8,8 +8,7 @@ import logging
 import sys
 import textwrap
 from dataclasses import dataclass
-from pathlib import Path
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar, get_args
 
 from pydantic import ValidationError
 
@@ -18,20 +17,28 @@ from .config import (
     AverageConsensusConfig,
     ClusteringConfig,
     ConfigError,
+    ConsensusMethod,
     IOConfig,
+    LinkageMethod,
     MedoidConsensusConfig,
+    PrecursorTolerance,
     PreprocessingConfig,
+    ScalingMethod,
     build_json_schema,
     format_toml,
     load_config,
     load_settings,
     write_saved_config,
 )
+from .config.models import validate_file_path
 from .types import AUTO_SENTINEL, NONE_SENTINEL
 from .utils import configure_logger
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
+    from pathlib import Path
+
+    from pydantic import BaseModel
 
     from .config import FalconConfig, FalconSettings
 
@@ -49,19 +56,17 @@ __all__ = [
 
 _T = TypeVar("_T")
 
+_SCALING_CHOICES: tuple[str, ...] = get_args(ScalingMethod)
+_LINKAGE_CHOICES: tuple[str, ...] = get_args(LinkageMethod)
+_CONSENSUS_CHOICES: tuple[str, ...] = get_args(ConsensusMethod)
+
 _CONSENSUS_UNION_TAGS = frozenset(
     {
-        "medoid",
-        "average",
+        *_CONSENSUS_CHOICES,
         MedoidConsensusConfig.__name__,
         AverageConsensusConfig.__name__,
     }
 )
-
-# Model defaults used to render accurate CLI help text without drift.
-_DEFAULT_PREP = PreprocessingConfig()
-_DEFAULT_CLUST = ClusteringConfig()
-_DEFAULT_AVG = AverageConsensusConfig()
 
 _IO_DIRECT_KEYS = tuple(IOConfig.model_fields)
 _PREP_KEYS = tuple(PreprocessingConfig.model_fields)
@@ -109,9 +114,30 @@ class NewlineTextHelpFormatter(argparse.HelpFormatter):
                 initial_indent=indent,
                 subsequent_indent=indent,
                 replace_whitespace=False,
-            ).strip()
-            for line in text.splitlines(keepends=True)
+            )
+            for line in text.splitlines()
         )
+
+
+def _add_field_arg(
+    group: argparse._ArgumentGroup,
+    model: type[BaseModel],
+    field: str,
+    help_text: str,
+    *,
+    flag: str | None = None,
+    none_label: str = NONE_SENTINEL,
+    **kwargs: Any,
+) -> None:
+    """Register one model-backed CLI flag with a synced default note."""
+    default = model.model_fields[field].default
+    default_str = none_label if default is None else str(default)
+    option = flag if flag is not None else f"--{field.replace('_', '-')}"
+    group.add_argument(
+        option,
+        help=f"{help_text} (default: {default_str}).",
+        **kwargs,
+    )
 
 
 def _cli_int(raw: str) -> int:
@@ -132,6 +158,14 @@ def _cli_float(raw: str) -> float:
         raise argparse.ArgumentTypeError(
             f"expected a number, got {raw!r}"
         ) from exc
+
+
+def _cli_save_path(raw: str) -> Path:
+    """Validate raw ``--save-config`` path strings before ``Path()``."""
+    try:
+        return validate_file_path(raw, label="config output path")
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def _cli_optional(
@@ -172,7 +206,7 @@ def _parse_cli_charge_buckets(
         has_close = inner.endswith("]")
         if has_open != has_close:
             raise ConfigError(f"Unbalanced brackets in charge bucket {raw!r}")
-        if has_open and has_close:
+        if has_open:
             inner = inner[1:-1]
         if not inner.strip():
             raise ConfigError(f"Empty charge bucket: {raw!r}")
@@ -220,7 +254,7 @@ def _add_config_args(parser: argparse.ArgumentParser) -> None:
     )
     mode_group.add_argument(
         "--save-config",
-        type=Path,
+        type=_cli_save_path,
         default=None,
         metavar="PATH",
         help="Write the resolved run configuration as TOML to PATH.",
@@ -244,6 +278,7 @@ def _add_io_args(parser: argparse.ArgumentParser) -> None:
     group.add_argument(
         "paths",
         nargs="*",
+        default=[],
         metavar="PATH",
         help=(
             "Input peak file(s) (.mzML, .mzXML, .MGF) followed by the "
@@ -253,219 +288,205 @@ def _add_io_args(parser: argparse.ArgumentParser) -> None:
     group.add_argument(
         "-i",
         "--input",
+        action="extend",
         nargs="+",
         dest="input_filenames",
-        default=argparse.SUPPRESS,
         metavar="FILE",
-        help="Input peak file(s) or globs (alternative to positional paths).",
+        help=(
+            "Input peak file(s) or globs (alternative to positional paths; "
+            "may be repeated)."
+        ),
     )
     group.add_argument(
         "-o",
         "--output",
         dest="output_filename",
-        default=argparse.SUPPRESS,
         metavar="PREFIX",
         help="Output file prefix (alternative to positional paths).",
     )
-    group.add_argument(
-        "--work-dir",
-        default=argparse.SUPPRESS,
+    _add_field_arg(
+        group,
+        IOConfig,
+        "work_dir",
+        f"Working directory for Lance staging cache, or '{NONE_SENTINEL}' "
+        "for a temporary directory",
         metavar=f"DIR|{NONE_SENTINEL}",
-        help=(
-            "Working directory for Lance staging cache, or "
-            f"'{NONE_SENTINEL}' for a temporary directory."
-        ),
     )
-    group.add_argument(
-        "--overwrite",
+    _add_field_arg(
+        group,
+        IOConfig,
+        "overwrite",
+        "Overwrite existing results and cached staging files",
         action=argparse.BooleanOptionalAction,
-        default=argparse.SUPPRESS,
-        help="Overwrite existing results and cached staging files.",
     )
-    group.add_argument(
-        "--export-representatives",
+    _add_field_arg(
+        group,
+        IOConfig,
+        "export_representatives",
+        "Export cluster representative spectra to an MGF file",
         action=argparse.BooleanOptionalAction,
-        default=argparse.SUPPRESS,
-        help="Export cluster representative spectra to an MGF file.",
     )
 
 
 def _add_preprocessing_args(parser: argparse.ArgumentParser) -> None:
     """Register spectrum preprocessing flags."""
-    p = _DEFAULT_PREP
     group = parser.add_argument_group("Preprocessing")
-    group.add_argument(
-        "--min-peaks",
+    _add_field_arg(
+        group,
+        PreprocessingConfig,
+        "min_peaks",
+        "Minimum number of peaks per spectrum",
         type=_cli_int,
-        default=argparse.SUPPRESS,
-        help=f"Minimum number of peaks per spectrum (default: {p.min_peaks}).",
     )
-    group.add_argument(
-        "--min-mz-range",
+    _add_field_arg(
+        group,
+        PreprocessingConfig,
+        "min_mz_range",
+        "Minimum fragment m/z span per spectrum",
         type=_cli_float,
-        default=argparse.SUPPRESS,
-        help=(
-            f"Minimum fragment m/z span per spectrum "
-            f"(default: {p.min_mz_range})."
-        ),
     )
-    group.add_argument(
-        "--min-mz",
+    _add_field_arg(
+        group,
+        PreprocessingConfig,
+        "min_mz",
+        "Minimum peak m/z inclusive",
         type=_cli_float,
-        default=argparse.SUPPRESS,
-        help=f"Minimum peak m/z inclusive (default: {p.min_mz}).",
     )
-    group.add_argument(
-        "--max-mz",
+    _add_field_arg(
+        group,
+        PreprocessingConfig,
+        "max_mz",
+        "Maximum peak m/z inclusive",
         type=_cli_float,
-        default=argparse.SUPPRESS,
-        help=f"Maximum peak m/z inclusive (default: {p.max_mz}).",
     )
-    group.add_argument(
-        "--remove-precursor-tol",
+    _add_field_arg(
+        group,
+        PreprocessingConfig,
+        "remove_precursor_tol",
+        f"Window (Da) around precursor m/z to remove peaks, or "
+        f"'{NONE_SENTINEL}' to disable",
         type=_cli_optional_float,
-        default=argparse.SUPPRESS,
         metavar=f"DA|{NONE_SENTINEL}",
-        help=(
-            f"Window (Da) around precursor m/z to remove peaks, or "
-            f"'{NONE_SENTINEL}' to disable "
-            f"(default: {p.remove_precursor_tol})."
-        ),
     )
-    group.add_argument(
-        "--min-intensity",
+    _add_field_arg(
+        group,
+        PreprocessingConfig,
+        "min_intensity",
+        "Minimum peak intensity relative to base peak in [0, 1)",
         type=_cli_float,
-        default=argparse.SUPPRESS,
-        help=(
-            "Minimum peak intensity relative to base peak in [0, 1) "
-            f"(default: {p.min_intensity})."
-        ),
     )
-    group.add_argument(
-        "--max-peaks-used",
+    _add_field_arg(
+        group,
+        PreprocessingConfig,
+        "max_peaks_used",
+        f"Maximum most-intense peaks to retain, or '{NONE_SENTINEL}' for all",
         type=_cli_optional_int,
-        default=argparse.SUPPRESS,
         metavar=f"N|{NONE_SENTINEL}",
-        help=(
-            f"Maximum most-intense peaks to retain, or '{NONE_SENTINEL}' "
-            f"for all (default: {p.max_peaks_used})."
-        ),
     )
-    group.add_argument(
-        "--scaling",
-        choices=("off", "root", "log", "rank"),
-        default=argparse.SUPPRESS,
-        help=f"Peak intensity scaling method (default: {p.scaling}).",
+    _add_field_arg(
+        group,
+        PreprocessingConfig,
+        "scaling",
+        "Peak intensity scaling method",
+        choices=_SCALING_CHOICES,
     )
 
 
 def _add_clustering_args(parser: argparse.ArgumentParser) -> None:
     """Register spectrum comparison and clustering flags."""
-    c = _DEFAULT_CLUST
+    tol_mass = PrecursorTolerance.model_fields["mass"].default
+    tol_mode = PrecursorTolerance.model_fields["mode"].default
     group = parser.add_argument_group("Clustering")
     group.add_argument(
         "--precursor-tol",
         nargs=2,
         metavar=("MASS", "MODE"),
-        default=argparse.SUPPRESS,
         help=(
             'Precursor mass tolerance and unit ("ppm" or "Da", '
-            f"default: {c.precursor_tol.mass:g} {c.precursor_tol.mode})."
+            f"default: {tol_mass:g} {tol_mode})."
         ),
     )
-    group.add_argument(
-        "--rt-tol",
+    _add_field_arg(
+        group,
+        ClusteringConfig,
+        "rt_tol",
+        f"Retention time tolerance, or '{NONE_SENTINEL}' to disable",
         type=_cli_optional_float,
-        default=argparse.SUPPRESS,
         metavar=f"TOL|{NONE_SENTINEL}",
-        help=(
-            f"Retention time tolerance, or '{NONE_SENTINEL}' to disable "
-            f"(default: {NONE_SENTINEL})."
-        ),
     )
-    group.add_argument(
-        "--fragment-tol",
+    _add_field_arg(
+        group,
+        ClusteringConfig,
+        "fragment_tol",
+        "Fragment mass tolerance in m/z",
         type=_cli_float,
-        default=argparse.SUPPRESS,
-        help=f"Fragment mass tolerance in m/z (default: {c.fragment_tol}).",
     )
-    group.add_argument(
-        "--linkage",
-        choices=("single", "complete", "average"),
-        default=argparse.SUPPRESS,
-        help=(
-            f"Hierarchical clustering linkage criterion "
-            f"(default: {c.linkage})."
-        ),
+    _add_field_arg(
+        group,
+        ClusteringConfig,
+        "linkage",
+        "Hierarchical clustering linkage criterion",
+        choices=_LINKAGE_CHOICES,
     )
-    group.add_argument(
-        "--distance-threshold",
+    _add_field_arg(
+        group,
+        ClusteringConfig,
+        "distance_threshold",
+        "Cosine distance threshold in (0, 1)",
         type=_cli_float,
-        default=argparse.SUPPRESS,
-        help=(
-            f"Cosine distance threshold in (0, 1) "
-            f"(default: {c.distance_threshold})."
-        ),
     )
-    group.add_argument(
-        "--min-matched-peaks",
+    _add_field_arg(
+        group,
+        ClusteringConfig,
+        "min_matched_peaks",
+        "Minimum matched fragment peaks",
         type=_cli_int,
-        default=argparse.SUPPRESS,
-        help=(
-            f"Minimum matched fragment peaks (default: {c.min_matched_peaks})."
-        ),
     )
-    group.add_argument(
-        "--batch-size",
+    _add_field_arg(
+        group,
+        ClusteringConfig,
+        "batch_size",
+        "Maximum spectra per precursor m/z batch",
         type=_cli_int,
-        default=argparse.SUPPRESS,
-        help=(
-            f"Maximum spectra per precursor m/z batch "
-            f"(default: {c.batch_size})."
-        ),
     )
-    group.add_argument(
-        "--precursor-charge-buckets",
+    _add_field_arg(
+        group,
+        ClusteringConfig,
+        "precursor_charge_buckets",
+        "Charge buckets such as '[1]' '[2, 3]' unknown other, or "
+        f"'{AUTO_SENTINEL}' to cluster each observed charge separately",
+        none_label=AUTO_SENTINEL,
         nargs="+",
         metavar="BUCKET",
-        default=argparse.SUPPRESS,
-        help=(
-            "Charge buckets such as '[1]' '[2, 3]' unknown other, or "
-            f"'{AUTO_SENTINEL}' to cluster each observed charge separately."
-        ),
     )
 
 
 def _add_consensus_args(parser: argparse.ArgumentParser) -> None:
     """Register representative spectrum / consensus flags."""
-    a = _DEFAULT_AVG
     group = parser.add_argument_group("Consensus")
-    group.add_argument(
-        "--consensus-method",
-        dest="consensus_method",
-        choices=("medoid", "average"),
-        default=argparse.SUPPRESS,
-        help="Representative spectrum method (default: medoid).",
+    _add_field_arg(
+        group,
+        MedoidConsensusConfig,
+        "method",
+        "Representative spectrum method",
+        flag="--consensus-method",
+        choices=_CONSENSUS_CHOICES,
     )
-    group.add_argument(
-        "--outlier-cutoff-lower",
+    _add_field_arg(
+        group,
+        AverageConsensusConfig,
+        "outlier_cutoff_lower",
+        "Lower sigma cutoff for consensus averaging (only valid when "
+        "consensus.method = 'average')",
         type=_cli_float,
-        default=argparse.SUPPRESS,
-        help=(
-            "Lower sigma cutoff for consensus averaging (only valid when "
-            f"consensus.method = 'average'; default: "
-            f"{a.outlier_cutoff_lower})."
-        ),
     )
-    group.add_argument(
-        "--outlier-cutoff-upper",
+    _add_field_arg(
+        group,
+        AverageConsensusConfig,
+        "outlier_cutoff_upper",
+        "Upper sigma cutoff for consensus averaging (only valid when "
+        "consensus.method = 'average')",
         type=_cli_float,
-        default=argparse.SUPPRESS,
-        help=(
-            "Upper sigma cutoff for consensus averaging (only valid when "
-            f"consensus.method = 'average'; default: "
-            f"{a.outlier_cutoff_upper})."
-        ),
     )
 
 
@@ -473,8 +494,8 @@ def build_parser() -> argparse.ArgumentParser:
     """
     Build the Falcon CLI ``ArgumentParser``.
 
-    All configurable options default to ``argparse.SUPPRESS`` so omitted
-    CLI flags never overwrite values loaded from TOML config layers.
+    Uses ``argument_default=argparse.SUPPRESS`` so omitted CLI flags
+    never overwrite values loaded from TOML config layers.
 
     Returns
     -------
@@ -483,6 +504,7 @@ def build_parser() -> argparse.ArgumentParser:
     """
     parser = argparse.ArgumentParser(
         prog="falcon",
+        argument_default=argparse.SUPPRESS,
         description=(
             "falcon: Large-scale tandem mass spectrum clustering\n"
             "===================================================\n\n"
@@ -647,14 +669,20 @@ def main(args: Sequence[str] | None = None) -> int:
     -------
     int
         Process exit status (``0`` on success, ``1`` on existing-output
-        abort, ``2`` on configuration error).
+        abort, ``2`` on post-parse configuration/serialization error;
+        argument parsing errors exit with status ``2`` via
+        ``SystemExit``).
     """
     action = parse_cli(args)
     if isinstance(action, DumpSchemaAction):
         print(json.dumps(build_json_schema(), indent=2))
         return 0
     if isinstance(action, PrintConfigAction):
-        print(format_toml(action.settings), end="")
+        try:
+            print(format_toml(action.settings), end="")
+        except ConfigError as exc:
+            print(f"falcon: error: {exc}", file=sys.stderr)
+            return 2
         return 0
 
     if action.save_config is not None:
@@ -671,4 +699,5 @@ def main(args: Sequence[str] | None = None) -> int:
     try:
         return run(action.config)
     finally:
-        logging.shutdown()
+        for handler in logging.getLogger().handlers:
+            handler.flush()

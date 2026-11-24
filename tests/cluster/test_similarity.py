@@ -128,3 +128,51 @@ class TestCosineFastArrays:
         )
         assert matched_lo == 1
         assert score_lo == 0.0
+
+    def test_lower_boundary_rounding_never_drops_exact_match(self):
+        rng = np.random.default_rng(123)
+        tol = 0.05
+        ones = np.array([1.0], dtype=np.float64)
+        two_ones = np.array([0.0, 1.0], dtype=np.float64)
+        for peak in rng.uniform(100.0, 1500.0, size=200):
+            mz1 = np.array([peak], dtype=np.float64)
+            mz2 = np.array([peak - tol, peak], dtype=np.float64)
+            score, matched = similarity.cosine_fast_arrays(
+                mz1, ones, mz2, two_ones, tol
+            )
+            assert matched == 1
+            assert score == pytest.approx(1.0)
+
+    def test_matches_independent_brute_force_reference(self, spec_factory):
+        rng = np.random.default_rng(99)
+        tol = 0.15
+        for _ in range(25):
+            mz1 = np.sort(rng.uniform(100.0, 105.0, 10)).astype(np.float32)
+            mz2 = np.sort(rng.uniform(100.0, 105.0, 12)).astype(np.float32)
+            i1 = rng.uniform(0.1, 1.0, 10).astype(np.float32)
+            i2 = rng.uniform(0.1, 1.0, 12).astype(np.float32)
+            s1 = spec_factory(mz1, i1)
+            s2 = spec_factory(mz2, i2)
+
+            pairs = [
+                (-(float(s1.intensity[i]) * float(s2.intensity[j])), i, j)
+                for i in range(len(s1.mz))
+                for j in range(len(s2.mz))
+                if abs(float(s1.mz[i]) - float(s2.mz[j])) <= tol
+            ]
+            pairs.sort()
+            used1, used2 = set(), set()
+            ref_score, ref_matches = 0.0, 0
+            for neg_prod, i, j in pairs:
+                if i not in used1 and j not in used2:
+                    used1.add(i)
+                    used2.add(j)
+                    ref_score -= neg_prod
+                    ref_matches += 1
+            ref_score = max(0.0, min(ref_score, 1.0))
+
+            score, matched = similarity.cosine_fast_arrays(
+                s1.mz, s1.intensity, s2.mz, s2.intensity, tol
+            )
+            assert matched == ref_matches
+            assert score == pytest.approx(ref_score, abs=1e-6)

@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import functools
 import logging
+import re
 from typing import IO, TYPE_CHECKING, Any
 
+import numpy as np
 import pyteomics.mzml
+import pyteomics.xml
 
 from . import reader_utils
 
@@ -17,7 +21,41 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_PSI_MS_OBO_URI = "http://purl.obolibrary.org/obo/ms/psi-ms.obo"
+_SCAN_NR_RE = re.compile(r"(?:^|\s)scan=(\S+)")
+
 __all__ = ["get_spectra"]
+
+
+@functools.lru_cache(maxsize=1)
+def _load_offline_psims_cv() -> Any:
+    """Load and cache the vendored PSI-MS CV without network access."""
+    try:
+        from psims.controlled_vocabulary.controlled_vocabulary import OBOCache
+
+        return OBOCache(enabled=False, use_remote=False).load(_PSI_MS_OBO_URI)
+    except Exception as exc:
+        logger.debug("Could not preload offline PSI-MS CV: %s", exc)
+        return None
+
+
+def _open_mzml(xml_source: IO[Any] | str) -> Any:
+    """Open an mzML source with non-indexed float32 offline settings."""
+    kwargs: dict[str, Any] = {"use_index": False, "dtype": np.float32}
+    if hasattr(pyteomics.xml, "CVParamParser"):
+        cv = _load_offline_psims_cv()
+        if cv is not None:
+            kwargs["cv"] = cv
+    return pyteomics.mzml.MzML(xml_source, **kwargs)
+
+
+def _extract_scan_nr(spectrum_dict: dict[str, Any]) -> str | None:
+    """Extract the ``scan=`` token from an mzML spectrum dictionary."""
+    raw_id = spectrum_dict.get("id")
+    if not isinstance(raw_id, str):
+        return None
+    match = _SCAN_NR_RE.search(raw_id)
+    return match.group(1) if match is not None else None
 
 
 def get_spectra(
@@ -31,34 +69,49 @@ def get_spectra(
     source : IO[Any] | str | os.PathLike[str]
         Path or open file object for the mzML source.
 
-    Yields
-    ------
-    MsmsSpectrum
+    Returns
+    -------
+    Iterator[MsmsSpectrum]
         Parsed MS/MS spectra with ``<stem>:scan:<number>`` identifiers;
         spectra lacking ``scan=`` or failing to parse are skipped.
     """
+    warned_missing_scan = False
 
-    def _extract_scan_nr(spectrum_dict: dict[str, Any]) -> str | None:
-        raw_id = spectrum_dict["id"]
-        scan_idx = raw_id.find("scan=")
-        if scan_idx == -1:
-            logger.warning(
+    def _extract_scan_nr_logged(spectrum_dict: dict[str, Any]) -> str | None:
+        nonlocal warned_missing_scan
+        scan_nr = _extract_scan_nr(spectrum_dict)
+        if scan_nr is None:
+            log_fn = logger.debug if warned_missing_scan else logger.warning
+            warned_missing_scan = True
+            log_fn(
                 "Skipping spectrum with unrecognized id "
                 "(no 'scan=' field) in %s: %s",
                 source,
-                raw_id,
+                spectrum_dict.get("id"),
             )
-            return None
-        return raw_id[scan_idx + 5 :]
+        return scan_nr
 
-    yield from reader_utils.iter_xml_spectra(
+    return reader_utils.iter_xml_spectra(
         source,
-        pyteomics.mzml.MzML,
+        _open_mzml,
         "ms level",
-        _extract_scan_nr,
+        _extract_scan_nr_logged,
         _parse_spectrum,
         logger,
     )
+
+
+def _parse_charge_value(raw_charge: Any) -> int | None:
+    """Extract the first integer charge from a scalar or sequence."""
+    if isinstance(raw_charge, (list, tuple)):
+        if not raw_charge:
+            return None
+        raw_charge = raw_charge[0]
+    if raw_charge is None or (
+        isinstance(raw_charge, str) and not raw_charge.strip()
+    ):
+        return None
+    return int(raw_charge)
 
 
 def _parse_spectrum(
@@ -69,6 +122,8 @@ def _parse_spectrum(
 
     Uses the first precursor and selected ion, falling back from
     ``charge state`` to ``possible charge state`` before ``None``.
+    Multi-valued charge sequences use the first entry, matching MGF
+    behavior, and negative-mode scans negate the charge magnitude.
 
     Parameters
     ----------
@@ -80,23 +135,30 @@ def _parse_spectrum(
     Returns
     -------
     MsmsSpectrum
-        Parsed spectrum; missing RT is stored as ``NaN``.
+        Parsed spectrum; missing or blank RT is stored as ``NaN``.
     """
     mz_array = spectrum_dict["m/z array"]
     intensity_array = spectrum_dict["intensity array"]
-    retention_time = spectrum_dict["scanList"]["scan"][0].get(
-        "scan start time", float("nan")
+    scans = (spectrum_dict.get("scanList") or {}).get("scan")
+    raw_rt = scans[0].get("scan start time") if scans else None
+    retention_time = (
+        float("nan")
+        if raw_rt is None or (isinstance(raw_rt, str) and not raw_rt.strip())
+        else raw_rt
     )
 
     precursor = spectrum_dict["precursorList"]["precursor"][0]
     precursor_ion = precursor["selectedIonList"]["selectedIon"][0]
     precursor_mz = precursor_ion["selected ion m/z"]
+    precursor_charge: int | None = None
     if "charge state" in precursor_ion:
-        precursor_charge: int | None = int(precursor_ion["charge state"])
-    elif "possible charge state" in precursor_ion:
-        precursor_charge = int(precursor_ion["possible charge state"])
-    else:
-        precursor_charge = None
+        precursor_charge = _parse_charge_value(precursor_ion["charge state"])
+    if precursor_charge is None and "possible charge state" in precursor_ion:
+        precursor_charge = _parse_charge_value(
+            precursor_ion["possible charge state"]
+        )
+    if precursor_charge is not None and "negative scan" in spectrum_dict:
+        precursor_charge = -abs(precursor_charge)
 
     return reader_utils.build_msms_spectrum(
         identifier,

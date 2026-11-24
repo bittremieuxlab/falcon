@@ -31,19 +31,32 @@ __all__ = [
 ]
 
 
-def __getattr__(name: str) -> Any:
-    """Lazily expose configuration and pipeline APIs at module level."""
-    if name in {
+_CONFIG_EXPORTS = frozenset(
+    {
         "FalconConfig",
         "FalconSettings",
         "load_config",
         "load_settings",
-    }:
+    }
+)
+
+
+def __getattr__(name: str) -> Any:
+    """Lazily expose configuration and pipeline APIs at module level."""
+    if name in _CONFIG_EXPORTS:
         from . import config
 
-        return getattr(config, name)
+        value = getattr(config, name)
+        globals()[name] = value
+        return value
     if name == "run":
         from .pipeline import run
 
+        globals()[name] = run
         return run
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    """Include lazily exposed public API names in ``dir(falcon)``."""
+    return sorted({*globals(), *__all__})

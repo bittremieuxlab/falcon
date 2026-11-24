@@ -9,6 +9,7 @@ from falcon.dataset import (
     CANONICAL_SORT_COLUMNS,
     INTERVAL_COLUMNS,
     METADATA_COLUMNS,
+    SORTED_INTERVAL_COLUMNS,
     SPECTRA_SUBDIR,
     SPECTRUM_SCHEMA,
     bucket_dataset_name,
@@ -16,6 +17,7 @@ from falcon.dataset import (
     bucket_key_to_str,
     bucket_label_from_uri,
     format_bucket_label,
+    is_bucket_dataset_name,
     read_canonical_metadata,
     spectra_dir,
 )
@@ -113,6 +115,22 @@ class TestBucketNamingHelpers:
     def test_format_bucket_label(self, bucket, expected):
         assert format_bucket_label(bucket) == expected
 
+    @pytest.mark.parametrize("bad_bucket", [[1, 2], "unknown", 2])
+    def test_format_bucket_label_rejects_invalid_types(self, bad_bucket):
+        with pytest.raises(TypeError, match="Unsupported bucket key type"):
+            format_bucket_label(bad_bucket)
+
+    def test_is_bucket_dataset_name_and_sorted_interval_columns(self):
+        assert is_bucket_dataset_name("spectra_charge_2.lance")
+        assert is_bucket_dataset_name("spectra_charge_other.lance")
+        assert not is_bucket_dataset_name("spectra_charge_.lance")
+        assert not is_bucket_dataset_name("custom.lance")
+        assert not is_bucket_dataset_name("spectra_charge_2.parquet")
+        assert "identifier" not in SORTED_INTERVAL_COLUMNS
+        assert set(SORTED_INTERVAL_COLUMNS) == set(INTERVAL_COLUMNS) - {
+            "identifier"
+        }
+
     @pytest.mark.parametrize(
         ("uri", "fallback", "expected"),
         [
@@ -128,6 +146,7 @@ class TestBucketNamingHelpers:
                 "3, unknown",
             ),
             ("/data/work/spectra/spectra_charge_other.lance", "fb", "other"),
+            ("/data/work/spectra/spectra_charge_.lance", "fb", "fb"),
             (
                 "/data/work/custom_table.lance",
                 "fallback_label",
@@ -183,3 +202,8 @@ class TestReadCanonicalMetadata:
             df_idx["index"].tolist(), columns=["identifier"]
         ).to_pydict()["identifier"]
         assert taken == expected_order
+
+    def test_rejects_missing_canonical_sort_columns(self, lance_dataset):
+        ds = lance_dataset([])
+        with pytest.raises(ValueError, match="CANONICAL_SORT_COLUMNS"):
+            read_canonical_metadata(ds, ["identifier", "precursor_mz"])

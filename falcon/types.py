@@ -59,7 +59,7 @@ class ProcessedSpectrum(TypedDict):
 class SpectrumTuple(NamedTuple):
     """Compact spectrum record for similarity and clustering code."""
 
-    precursor_mz: float
+    precursor_mz: float | np.floating[Any]
     precursor_charge: Any
     mz: np.ndarray
     intensity: np.ndarray
@@ -79,7 +79,7 @@ class ConsensusTuple(NamedTuple):
     def from_spectrum(
         cls,
         spec: SpectrumTuple,
-        retention_time: float,
+        retention_time: float | np.floating[Any],
         cluster_id: int,
     ) -> ConsensusTuple:
         """
@@ -118,21 +118,21 @@ class ClusterResult(NamedTuple):
 
 
 def make_consensus_tuple(
-    precursor_mz: float,
+    precursor_mz: float | np.floating[Any],
     precursor_charge: Any,
     mz: np.ndarray,
     intensity: np.ndarray,
-    retention_time: float,
+    retention_time: float | np.floating[Any],
     cluster_id: int,
 ) -> ConsensusTuple:
     """
     Construct a ``ConsensusTuple`` with canonical float32/int32 dtypes.
 
-    Missing or NaN precursor charges are normalized to ``np.nan``.
+    Missing or non-finite precursor charges normalize to ``np.nan``.
 
     Parameters
     ----------
-    precursor_mz : float
+    precursor_mz : float | np.floating
         Representative precursor m/z value.
     precursor_charge : Any
         Precursor charge state, or ``None``/``NaN`` when unknown.
@@ -140,7 +140,7 @@ def make_consensus_tuple(
         Fragment peak m/z array.
     intensity : np.ndarray
         Fragment peak intensity array.
-    retention_time : float
+    retention_time : float | np.floating
         Representative retention time (or ``NaN`` when missing).
     cluster_id : int
         Cluster label assigned to this representative.
@@ -152,7 +152,7 @@ def make_consensus_tuple(
     """
     import numpy as np
 
-    if precursor_charge is None or math.isnan(float(precursor_charge)):
+    if precursor_charge is None or not math.isfinite(float(precursor_charge)):
         norm_charge: np.int32 | float = np.nan
     else:
         norm_charge = np.int32(precursor_charge)
@@ -302,11 +302,10 @@ def parse_charge_bucket_list(value: Any) -> tuple[ChargeBucket, ...]:
     """
     if not isinstance(value, (list, tuple)):
         raise ValueError(
-            "precursor_charge_buckets must be 'auto' or a non-empty list "
-            "of buckets"
+            "Charge buckets must be a non-empty list or tuple of buckets"
         )
     if len(value) == 0:
-        raise ValueError("precursor_charge_buckets must not be empty")
+        raise ValueError("Charge buckets must not be empty")
 
     buckets: list[ChargeBucket] = []
     seen_values: set[ChargeValue] = set()
@@ -368,9 +367,9 @@ def mz_bin_bounds(
     Returns
     -------
     tuple[int, float, float]
-        ``(n_bins, start_dim, end_dim)`` where ``start_dim`` is the
-        largest grid multiple at or below ``min_mz`` and ``end_dim`` is
-        the smallest grid multiple strictly above ``max_mz``.
+        ``(n_bins, start_dim, end_dim)`` on the ``bin_size`` grid with
+        outward-safe float64 bounds ``start_dim <= min_mz`` and
+        ``end_dim > max_mz``.
 
     Raises
     ------

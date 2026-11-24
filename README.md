@@ -1,7 +1,7 @@
 _falcon_
 ========
 
-![falcon](falcon_logo.png)
+![falcon](https://raw.githubusercontent.com/bittremieuxlab/falcon/main/falcon_logo.png)
 
 For more information:
 
@@ -36,7 +36,7 @@ pip install falcon-ms
 ```
 
 For development setup, testing, and contribution guidelines, see
-[CONTRIBUTING.md](CONTRIBUTING.md).
+[CONTRIBUTING.md](https://github.com/bittremieuxlab/falcon/blob/main/CONTRIBUTING.md).
 
 Running _falcon_
 ----------------
@@ -63,7 +63,7 @@ Instead of hardcoding named profiles, _falcon_ layers sparse TOML override files
    Any TOML file may also inherit from one or more parent files using a top-level `extends = "base.toml"` or `extends = ["base.toml", "instrument.toml"]` key (paths resolve relative to the declaring file).
 3. **CLI flags** (highest precedence; omitted flags never overwrite values from TOML files, and boolean flags support `--flag`/`--no-flag`).
 
-For example, [configs/metabolomics.toml](configs/metabolomics.toml) overrides only the fields that differ for untargeted metabolomics:
+For example, [configs/metabolomics.toml](https://github.com/bittremieuxlab/falcon/blob/main/configs/metabolomics.toml) overrides only the fields that differ for untargeted metabolomics:
 
 ```toml
 [preprocessing]
@@ -121,6 +121,7 @@ For detailed information on all available CLI options, run `falcon -h` or `falco
 - `precursor_tol` (`--precursor-tol MASS MODE`): The precursor mass tolerance (`mass >= 0`) and unit (`"ppm"` or `"Da"`).
   Default is `20 ppm`.
 - `rt_tol` (`--rt-tol`): Optional retention time tolerance (`>= 0`, or `"none"` to disable) to restrict clustering to spectra with similar retention times.
+  Note that retention-time units are not unified across input formats (MGF uses seconds via `RTINSECONDS`, mzXML values are converted to minutes by Pyteomics, and mzML preserves file-native units), so match `rt_tol` to your input files' units and avoid mixing incompatible units across formats.
   Default is disabled (`none`).
 - `fragment_tol` (`--fragment-tol`): The fragment mass tolerance in _m_/_z_ (`> 0`) used during spectrum comparison.
   Default is `0.05`.
@@ -149,7 +150,7 @@ For detailed information on all available CLI options, run `falcon -h` or `falco
 **Spectrum preprocessing (`[preprocessing]`)**
 
 The default preprocessing settings target bottom-up proteomics.
-For untargeted metabolomics or top-down data, layer a sparse TOML override file such as [configs/metabolomics.toml](configs/metabolomics.toml).
+For untargeted metabolomics or top-down data, layer a sparse TOML override file such as [configs/metabolomics.toml](https://github.com/bittremieuxlab/falcon/blob/main/configs/metabolomics.toml).
 
 - `min_peaks` (`--min-peaks`) and `min_mz_range` (`--min-mz-range`): Discard spectra with fewer than `min_peaks` peaks (`>= 1`) or a smaller _m_/_z_ span than `min_mz_range` (`>= 0`, `<= max_mz - min_mz`).
   Defaults are `5` peaks and `250.0` _m_/_z_.
@@ -165,22 +166,13 @@ For untargeted metabolomics or top-down data, layer a sparse TOML override file 
 How does it work?
 -----------------
 
-![falcon spectrum clustering](falcon_how_v2.png)
+![falcon spectrum clustering](https://raw.githubusercontent.com/bittremieuxlab/falcon/main/falcon_how_v2.png)
 
-1. Input peak files (mzML, mzXML, or MGF) are read in parallel and preprocessed
-spectra are written to per-charge Lance columnar datasets stored in the working
-directory.
-2. Within each charge bucket, spectra are sorted by precursor _m_/_z_ and split into disjoint batches of at most
-`batch_size` spectra.
-3. For each batch a full pairwise cosine distance matrix is computed using a
-Numba-parallelized routine. Peak pairs with fewer than `min_matched_peaks`
-matched fragments are treated as maximally distant (distance = 1.0).
-4. Hierarchical clustering is performed on the pairwise distance matrix using
-the `fastcluster` library. The dendrogram is cut at `distance_threshold` using
-the chosen `linkage` criterion to produce flat clusters.
-5. One representative (consensus) spectrum is selected or computed for each
-cluster and, if requested, exported to an MGF file.
-6. Cluster assignments are exported to a csv file, while consensus spectra are written to an mgf file.
+1. Input peak files (mzML, mzXML, or MGF) are read in parallel, quality-filtered, and normalized, then staged into per-charge Lance columnar datasets in the working directory.
+2. Within each charge bucket, spectra are sorted canonically by precursor _m_/_z_, retention time, and identifier, partitioned at precursor _m_/_z_ gaps exceeding `precursor_tol`, and evenly subdivided into disjoint batches of at most `batch_size` spectra.
+3. For each batch, a full pairwise cosine distance matrix is computed using Numba-accelerated kernels (large batches are tiled across worker processes). Spectrum pairs with fewer than `min_matched_peaks` matched fragments are treated as maximally distant (distance = 1.0).
+4. Hierarchical clustering is performed on the pairwise distance matrix using `fastcluster`, cut at `distance_threshold` under the chosen `linkage` criterion, and refined so every cluster satisfies the full `precursor_tol` span (and optional `rt_tol` span).
+5. Cluster assignments are exported to a CSV file. When `--export-representatives` is enabled, one representative (medoid or intensity-averaged consensus) spectrum per cluster is computed and exported to an MGF file.
 
 Contact
 -------

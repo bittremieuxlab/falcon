@@ -31,21 +31,34 @@ if TYPE_CHECKING:
 
 DEFAULT_MIN_MZ: float = 101.0
 DEFAULT_MAX_MZ: float = 1500.0
+DEFAULT_OUTLIER_CUTOFF_LOWER: float = 1.5
+DEFAULT_OUTLIER_CUTOFF_UPPER: float = 1.5
+
+PrecursorTolMode = Literal["ppm", "Da"]
+ScalingMethod = Literal["off", "root", "log", "rank"]
+LinkageMethod = Literal["single", "complete", "average"]
+ConsensusMethod = Literal["medoid", "average"]
 
 __all__ = [
     "DEFAULT_MAX_MZ",
     "DEFAULT_MIN_MZ",
+    "DEFAULT_OUTLIER_CUTOFF_LOWER",
+    "DEFAULT_OUTLIER_CUTOFF_UPPER",
     "AverageConsensusConfig",
     "ClusteringConfig",
     "ConfigError",
     "ConsensusConfig",
+    "ConsensusMethod",
     "FalconConfig",
     "FalconSettings",
     "IOConfig",
+    "LinkageMethod",
     "MedoidConsensusConfig",
     "PartialIOConfig",
+    "PrecursorTolMode",
     "PrecursorTolerance",
     "PreprocessingConfig",
+    "ScalingMethod",
 ]
 
 _T = TypeVar("_T")
@@ -70,7 +83,7 @@ class _AllowSentinelSchema:
         if "anyOf" in json_schema:
             json_schema["anyOf"] = [
                 *json_schema["anyOf"],
-                {"const": self.sentinel},
+                {"type": "string", "const": self.sentinel},
             ]
         return json_schema
 
@@ -95,28 +108,43 @@ def _optional(
     return _parse
 
 
+_DIR_LIKE_SUFFIXES: tuple[str, ...] = ("/", "\\", "/.", "\\.", "/..", "\\..")
+
+
 def _parse_path(value: Any) -> Path:
     """Validate and convert a non-empty string or Path to ``Path``."""
     if isinstance(value, Path):
         if not str(value).strip():
-            raise ValueError("Path must not be empty")
+            raise ValueError("Path must not be empty or whitespace")
         return value
     if isinstance(value, str):
         if not value.strip():
             raise ValueError("Path must not be empty or whitespace")
         return Path(value)
-    raise ValueError(f"Expected a path string or Path, got {type(value)}")
+    raise ValueError(
+        f"Expected a path string or Path, got {type(value).__name__}"
+    )
+
+
+def validate_file_path(value: Any, *, label: str) -> Path:
+    """Validate a file or prefix path (rejecting directory paths)."""
+    if isinstance(value, str) and not value.strip():
+        raise ValueError(f"{label} must not be empty or whitespace")
+    if isinstance(value, str) and value.endswith(_DIR_LIKE_SUFFIXES):
+        raise ValueError(
+            f"{label} is a directory path, expected a file path: {value!r}"
+        )
+    path = _parse_path(value)
+    if not path.name.strip() or path.name in (".", ".."):
+        raise ValueError(
+            f"{label} must include a non-empty file name, got {str(path)!r}"
+        )
+    return path
 
 
 def _parse_output_prefix(value: Any) -> Path:
     """Validate an output file prefix path (non-empty file name)."""
-    path = _parse_path(value)
-    if path.name in ("", ".", ".."):
-        raise ValueError(
-            "output_filename must include a file prefix name, "
-            f"got {str(path)!r}"
-        )
-    return path
+    return validate_file_path(value, label="output_filename")
 
 
 def _parse_input_filenames(value: Any) -> tuple[str, ...]:
@@ -173,7 +201,7 @@ class PrecursorTolerance(BaseModel):
     model_config = _STRICT_MODEL_CONFIG
 
     mass: _NonNegFloat = 20.0
-    mode: Literal["ppm", "Da"] = "ppm"
+    mode: PrecursorTolMode = "ppm"
 
 
 class PreprocessingConfig(BaseModel):
@@ -190,7 +218,7 @@ class PreprocessingConfig(BaseModel):
         float, Field(ge=0.0, lt=1.0, allow_inf_nan=False)
     ] = 0.01
     max_peaks_used: _OptionalPosInt = 50
-    scaling: Literal["off", "root", "log", "rank"] = "off"
+    scaling: ScalingMethod = "off"
 
     @model_validator(mode="after")
     def _validate_invariants(self) -> Self:
@@ -225,7 +253,7 @@ class ClusteringConfig(BaseModel):
     )
     rt_tol: _OptionalNonNegFloat = None
     fragment_tol: _PosFloat = 0.05
-    linkage: Literal["single", "complete", "average"] = "complete"
+    linkage: LinkageMethod = "complete"
     distance_threshold: Annotated[
         float, Field(gt=0.0, lt=1.0, allow_inf_nan=False)
     ] = 0.1
@@ -248,8 +276,8 @@ class AverageConsensusConfig(BaseModel):
     model_config = _STRICT_MODEL_CONFIG
 
     method: Literal["average"] = "average"
-    outlier_cutoff_lower: _PosFloat = 1.5
-    outlier_cutoff_upper: _PosFloat = 1.5
+    outlier_cutoff_lower: _PosFloat = DEFAULT_OUTLIER_CUTOFF_LOWER
+    outlier_cutoff_upper: _PosFloat = DEFAULT_OUTLIER_CUTOFF_UPPER
 
 
 ConsensusConfig = Annotated[
@@ -342,6 +370,14 @@ class _BaseFalconConfig(BaseModel):
                 f"m/z bin count ({n_bins}) for [{min_mz}, {max_mz}] at "
                 f"fragment_tol={frag_tol} exceeds int32 maximum ({INT32_MAX})"
             )
+        if isinstance(self.consensus, AverageConsensusConfig):
+            try:
+                mz_bin_bounds(min_mz, max_mz, 2.0 * frag_tol)
+            except ValueError as exc:
+                raise ValueError(
+                    f"clustering.fragment_tol ({frag_tol}) for average "
+                    f"consensus: {exc}"
+                ) from exc
         return self
 
 

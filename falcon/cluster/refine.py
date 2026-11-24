@@ -2,11 +2,26 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import numba as nb
 import numpy as np
 import scipy.cluster.hierarchy as sch
 
-__all__ = ["cut_linkage", "linkage_1d", "postprocess_cluster"]
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+    from ..config.models import ClusteringConfig
+
+_VALID_TOL_MODES = frozenset({None, "Da", "ppm"})
+
+__all__ = [
+    "cut_linkage",
+    "iter_cluster_groups",
+    "linkage_1d",
+    "postprocess_cluster",
+    "refine_clusters",
+]
 
 
 def cut_linkage(linkage_matrix: np.ndarray, threshold: float) -> np.ndarray:
@@ -30,6 +45,36 @@ def cut_linkage(linkage_matrix: np.ndarray, threshold: float) -> np.ndarray:
     )
 
 
+@nb.njit(cache=True)
+def iter_cluster_groups(clusters: np.ndarray) -> Iterator[tuple[int, int]]:
+    """
+    Yield ``(start, stop)`` index slices for contiguous cluster labels.
+
+    Assumes ``clusters`` is grouped by label; each ``-1`` noise entry
+    is yielded as its own length-1 slice regardless of position.
+
+    Parameters
+    ----------
+    clusters : np.ndarray
+        1D cluster label array (``-1`` denotes noise points).
+
+    Yields
+    ------
+    tuple[int, int]
+        Half-open ``(start_i, stop_i)`` slice bounds for each group.
+    """
+    n = clusters.shape[0]
+    pos = 0
+    while pos < n:
+        label = clusters[pos]
+        start_i = pos
+        pos += 1
+        if label != -1:
+            while pos < n and clusters[pos] == label:
+                pos += 1
+        yield start_i, pos
+
+
 def _assign_singletons(cluster_labels: np.ndarray, start_label: int) -> int:
     """Fill ``cluster_labels`` with contiguous singleton IDs."""
     n_points = cluster_labels.shape[0]
@@ -39,7 +84,40 @@ def _assign_singletons(cluster_labels: np.ndarray, start_label: int) -> int:
     return n_points
 
 
-@nb.njit(cache=True, fastmath=True)
+@nb.njit(cache=True)
+def _linkage_1d_nb(values: np.ndarray, use_ppm: bool) -> np.ndarray:
+    """Compute 1D complete-linkage tree without fastmath."""
+    n = values.shape[0]
+    linkage = np.zeros((n - 1, 4), np.double)
+    # Track (min_val, max_val, cluster_id, size) in ascending order.
+    clusters = [(values[i], values[i], i, 1) for i in np.argsort(values)]
+    for it in range(n - 1):
+        min_i = 0
+        min_dist = clusters[1][1] - clusters[0][0]
+        if use_ppm:
+            min_dist = min_dist / clusters[0][0] * 1e6
+        for i in range(1, len(clusters) - 1):
+            dist = clusters[i + 1][1] - clusters[i][0]
+            if use_ppm:
+                dist = dist / clusters[i][0] * 1e6
+            if dist < min_dist or (np.isnan(min_dist) and not np.isnan(dist)):
+                min_dist = dist
+                min_i = i
+        n_points = clusters[min_i][3] + clusters[min_i + 1][3]
+        linkage[it, 0] = clusters[min_i][2]
+        linkage[it, 1] = clusters[min_i + 1][2]
+        linkage[it, 2] = min_dist
+        linkage[it, 3] = n_points
+        clusters[min_i] = (
+            clusters[min_i][0],
+            clusters[min_i + 1][1],
+            n + it,
+            n_points,
+        )
+        del clusters[min_i + 1]
+    return linkage
+
+
 def linkage_1d(values: np.ndarray, tol_mode: str | None = None) -> np.ndarray:
     """
     Compute 1D complete-linkage hierarchical clustering over values.
@@ -51,43 +129,43 @@ def linkage_1d(values: np.ndarray, tol_mode: str | None = None) -> np.ndarray:
     Parameters
     ----------
     values : np.ndarray
-        1D array of precursor m/z values or retention times.
+        1D array of at least 2 precursor m/z values or retention times.
     tol_mode : {"Da", "ppm"} | None, default=None
         Distance mode: ``"ppm"`` normalizes span by the lower cluster
-        minimum; ``"Da"`` or ``None`` uses absolute differences.
+        minimum (requires strictly positive values); ``"Da"`` or
+        ``None`` uses absolute differences.
 
     Returns
     -------
     np.ndarray
         Float64 ``(n - 1, 4)`` SciPy-compatible linkage matrix.
+
+    Raises
+    ------
+    ValueError
+        If ``values`` is not 1D, has fewer than 2 entries, ``tol_mode``
+        is unrecognized, or ``tol_mode == "ppm"`` with non-finite or
+        non-positive values.
     """
-    n = values.shape[0]
-    linkage = np.zeros((n - 1, 4), np.double)
-    # Track (min_val, max_val, cluster_id, size) in ascending order.
-    clusters = [(values[i], values[i], i, 1) for i in np.argsort(values)]
-    for it in range(n - 1):
-        min_dist, min_i = np.inf, -1
-        for i in range(len(clusters) - 1):
-            dist = clusters[i + 1][1] - clusters[i][0]
-            if tol_mode == "ppm":
-                dist = dist / clusters[i][0] * 1e6
-            if dist < min_dist:
-                min_dist, min_i = dist, i
-        n_points = clusters[min_i][3] + clusters[min_i + 1][3]
-        linkage[it, :] = [
-            clusters[min_i][2],
-            clusters[min_i + 1][2],
-            min_dist,
-            n_points,
-        ]
-        clusters[min_i] = (
-            clusters[min_i][0],
-            clusters[min_i + 1][1],
-            n + it,
-            n_points,
+    values_f64 = np.asarray(values, dtype=np.float64)
+    if values_f64.ndim != 1:
+        raise ValueError(f"values must be 1D, got shape {values_f64.shape}")
+    if values_f64.shape[0] < 2:
+        raise ValueError(
+            f"linkage_1d requires at least 2 values, got {values_f64.shape[0]}"
         )
-        del clusters[min_i + 1]
-    return linkage
+    if tol_mode not in _VALID_TOL_MODES:
+        raise ValueError(
+            f"tol_mode must be None, 'Da', or 'ppm', got {tol_mode!r}"
+        )
+    use_ppm = tol_mode == "ppm"
+    if use_ppm and not bool(
+        np.all(np.isfinite(values_f64) & (values_f64 > 0.0))
+    ):
+        raise ValueError(
+            "tol_mode='ppm' requires finite strictly positive values"
+        )
+    return _linkage_1d_nb(values_f64, use_ppm)
 
 
 def postprocess_cluster(
@@ -114,8 +192,8 @@ def postprocess_cluster(
     cluster_mzs : np.ndarray
         Precursor m/z values of spectra in the initial cluster.
     cluster_rts : np.ndarray
-        Retention times aligned with ``cluster_mzs``. NaN entries skip
-        RT linkage and stay separate from known-RT spectra.
+        Retention times aligned with ``cluster_mzs``. Non-finite entries
+        skip RT linkage and stay separate from finite-RT spectra.
     precursor_tol_mass : float
         Maximum precursor m/z span within a refined cluster.
     precursor_tol_mode : {"Da", "ppm"}
@@ -134,20 +212,21 @@ def postprocess_cluster(
         Total number of output clusters (including singletons).
     """
     n_points = cluster_labels.shape[0]
-    if n_points < min_samples:
+    if n_points <= 1 or n_points < min_samples:
         return _assign_singletons(cluster_labels, start_label)
 
     # Split on full precursor m/z span via 1D complete linkage.
     mz_linkage = linkage_1d(cluster_mzs, precursor_tol_mode)
     assignments = cut_linkage(mz_linkage, precursor_tol_mass)
 
-    # Optionally intersect with an RT partition. Known-RT spectra
-    # undergo 1D RT linkage; NaN-RT spectra receive a dedicated RT code
-    # so they stay grouped by m/z without merging into known-RT groups.
+    # Optionally intersect with an RT partition. Finite-RT spectra
+    # undergo 1D RT linkage; non-finite-RT spectra receive a dedicated
+    # RT code so they stay grouped by m/z without merging into
+    # finite-RT groups.
     if rt_tol is not None:
-        nan_mask = np.isnan(cluster_rts)
-        if not nan_mask.all():
-            valid_mask = ~nan_mask
+        non_finite_mask = ~np.isfinite(cluster_rts)
+        if not non_finite_mask.all():
+            valid_mask = ~non_finite_mask
             valid_rts = cluster_rts[valid_mask]
             rt_labels = np.zeros(n_points, dtype=np.int32)
             if len(valid_rts) >= 2:
@@ -156,7 +235,7 @@ def postprocess_cluster(
                 n_rt = int(valid_rt_labels.max()) + 1
             else:
                 n_rt = 1
-            rt_labels[nan_mask] = n_rt
+            rt_labels[non_finite_mask] = n_rt
             # Injective mixed-radix encoding of (m/z, RT) pairs.
             assignments = np.unique(
                 assignments.astype(np.int64) * (n_rt + 1) + rt_labels,
@@ -172,12 +251,12 @@ def postprocess_cluster(
     if n_groups == n_points:
         return _assign_singletons(cluster_labels, start_label)
 
+    keep_mask = counts >= min_samples
+    n_clusters = int(np.count_nonzero(keep_mask))
     remap = np.full(n_groups, -1, dtype=np.int32)
-    n_clusters = 0
-    for group_id, count in enumerate(counts):
-        if count >= min_samples:
-            remap[group_id] = start_label + n_clusters
-            n_clusters += 1
+    remap[keep_mask] = np.arange(
+        start_label, start_label + n_clusters, dtype=np.int32
+    )
 
     cluster_labels[:] = remap[assignments]
     singleton_mask = cluster_labels == -1
@@ -190,3 +269,60 @@ def postprocess_cluster(
         )
         n_clusters += n_singletons
     return n_clusters
+
+
+def refine_clusters(
+    labels: np.ndarray,
+    precursor_mzs: np.ndarray,
+    rts: np.ndarray,
+    clustering: ClusteringConfig,
+    min_samples: int,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """
+    Refine all initial clusters in an interval by precursor m/z and RT.
+
+    Groups initial cluster labels using a stable sort so canonical
+    within-cluster input order is preserved, then applies
+    :func:`postprocess_cluster` to each initial cluster in turn.
+
+    Parameters
+    ----------
+    labels : np.ndarray
+        Initial 1D cluster labels aligned to canonical input order.
+    precursor_mzs : np.ndarray
+        Precursor m/z values aligned with ``labels``.
+    rts : np.ndarray
+        Retention times aligned with ``labels``.
+    clustering : ClusteringConfig
+        Validated clustering configuration providing precursor and RT
+        tolerances.
+    min_samples : int
+        Minimum spectra required to form a multi-spectrum cluster.
+
+    Returns
+    -------
+    tuple[np.ndarray, np.ndarray, int]
+        ``(refined_labels, label_order, n_clusters)`` where
+        ``refined_labels[k]`` is the refined int32 label for canonical
+        input index ``label_order[k]``, and ``n_clusters`` is the total
+        number of refined clusters (including singletons).
+    """
+    label_order = np.argsort(labels, kind="stable")
+    refined_labels = np.array(labels[label_order], dtype=np.int32, copy=True)
+    mzs_ord = precursor_mzs[label_order]
+    rts_ord = rts[label_order]
+
+    current_label = 0
+    for start_i, stop_i in iter_cluster_groups(refined_labels):
+        n_clusters = postprocess_cluster(
+            refined_labels[start_i:stop_i],
+            mzs_ord[start_i:stop_i],
+            rts_ord[start_i:stop_i],
+            clustering.precursor_tol.mass,
+            clustering.precursor_tol.mode,
+            clustering.rt_tol,
+            min_samples,
+            current_label,
+        )
+        current_label += n_clusters
+    return refined_labels, label_order, current_label

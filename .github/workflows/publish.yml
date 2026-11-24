@@ -27,6 +27,15 @@ jobs:
       - name: Build sdist and wheel
         run: uv build
 
+      - name: Smoke-test built wheel CLI and imports
+        run: |
+          set -- dist/*.whl
+          [ "$#" -eq 1 ]
+          wheel="$1"
+          uv run --isolated --no-project --with "$wheel" falcon --version
+          uv run --isolated --no-project --with "$wheel" python -P -c \
+            "from pathlib import Path; import falcon, falcon.pipeline, falcon.cluster, falcon.ms_io, falcon.staging; pkg = Path(falcon.__file__).resolve().parent; assert not pkg.is_relative_to(Path.cwd().resolve()), pkg; assert (pkg / 'py.typed').is_file(); assert falcon.__version__ != '0.0.0.dev0'"
+
       - name: Upload distribution archives
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

@@ -76,6 +76,58 @@ class TestLinkage1D:
         assert z_neg[0, 2] == pytest.approx(0.5)
         assert z_neg[1, 2] == pytest.approx(15.0)
 
+    def test_validates_inputs_and_handles_non_finite_without_corruption(self):
+        with pytest.raises(ValueError, match="1D"):
+            refine.linkage_1d(np.zeros((2, 2)), "Da")
+        for short in (np.array([]), np.array([100.0])):
+            with pytest.raises(ValueError, match="at least 2"):
+                refine.linkage_1d(short, "Da")
+        with pytest.raises(ValueError, match="tol_mode"):
+            refine.linkage_1d(np.array([100.0, 101.0]), "PPM")
+        with pytest.raises(ValueError, match="strictly positive"):
+            refine.linkage_1d(np.array([0.0, 100.0]), "ppm")
+        for bad_ppm in (
+            np.array([100.0, np.nan]),
+            np.array([100.0, np.inf]),
+            np.array([-np.inf, 100.0]),
+        ):
+            with pytest.raises(ValueError, match="finite strictly positive"):
+                refine.linkage_1d(bad_ppm, "ppm")
+
+        # NaN/inf inputs must never trigger negative-index wrap-around.
+        z_nan = refine.linkage_1d(np.array([100.0, np.nan, 200.0]), "Da")
+        assert z_nan.shape == (2, 4)
+        assert z_nan[0, 2] == pytest.approx(100.0)
+        assert set(z_nan[0, :2].tolist()) == {0.0, 2.0}
+
+        z_inf = refine.linkage_1d(np.array([100.0, np.inf]), "Da")
+        assert z_inf.shape == (1, 4)
+        assert np.isinf(z_inf[0, 2])
+
+
+class TestIterClusterGroups:
+    def test_noise_singletons_and_contiguous_clusters(self):
+        clusters = np.array([-1, -1, 0, 0, -1, 1, 1, 1], dtype=np.int32)
+        assert list(refine.iter_cluster_groups(clusters)) == [
+            (0, 1),
+            (1, 2),
+            (2, 4),
+            (4, 5),
+            (5, 8),
+        ]
+
+    def test_non_contiguous_labels_empty_and_single_element(self):
+        clusters = np.array([0, 0, 5, 10, 10], dtype=np.int32)
+        assert list(refine.iter_cluster_groups(clusters)) == [
+            (0, 2),
+            (2, 3),
+            (3, 5),
+        ]
+        assert list(refine.iter_cluster_groups(np.array([], np.int32))) == []
+        assert list(refine.iter_cluster_groups(np.array([0], np.int32))) == [
+            (0, 1)
+        ]
+
 
 class TestPostprocessCluster:
     def test_homogeneous_cluster_keeps_single_label(self):
@@ -217,3 +269,95 @@ class TestPostprocessCluster:
         assert labels_all_nan[0] == labels_all_nan[1]
         assert labels_all_nan[2] == labels_all_nan[3]
         assert labels_all_nan[0] != labels_all_nan[2]
+
+    def test_min_samples_one_single_point_and_zero_tolerances(self):
+        one = np.array([0], dtype=np.int32)
+        assert (
+            refine.postprocess_cluster(
+                one,
+                np.array([100.0]),
+                np.array([10.0]),
+                0.0,
+                "Da",
+                0.0,
+                min_samples=1,
+                start_label=9,
+            )
+            == 1
+        )
+        assert one[0] == 9
+
+        # Exact zero m/z and RT tolerances keep identical values together.
+        labels = np.zeros(3, dtype=np.int32)
+        n = refine.postprocess_cluster(
+            labels,
+            np.array([100.0, 100.0, 100.001]),
+            np.array([5.0, 5.0, 5.0]),
+            0.0,
+            "Da",
+            0.0,
+            min_samples=2,
+            start_label=0,
+        )
+        assert n == 2
+        assert labels[0] == labels[1]
+        assert labels[0] != labels[2]
+
+    def test_rt_with_infinite_values_separates_from_finite_without_polluting(
+        self,
+    ):
+        labels = np.zeros(5, dtype=np.int32)
+        mzs = np.array([100.0, 100.02, 100.04, 100.06, 100.08])
+        rts = np.array([10.0, 10.1, np.inf, -np.inf, np.nan])
+        n = refine.postprocess_cluster(
+            labels, mzs, rts, 0.5, "Da", 1.0, min_samples=2, start_label=0
+        )
+        assert n == 2
+        assert labels[0] == labels[1]
+        assert labels[2] == labels[3] == labels[4]
+        assert labels[0] != labels[2]
+
+        labels_all_inf = np.zeros(4, dtype=np.int32)
+        n_inf = refine.postprocess_cluster(
+            labels_all_inf,
+            np.array([100.0, 100.1, 200.0, 200.1]),
+            np.array([np.inf, -np.inf, np.inf, np.nan]),
+            0.5,
+            "Da",
+            1.0,
+            min_samples=2,
+            start_label=0,
+        )
+        assert n_inf == 2
+        assert labels_all_inf[0] == labels_all_inf[1]
+        assert labels_all_inf[2] == labels_all_inf[3]
+        assert labels_all_inf[0] != labels_all_inf[2]
+
+
+class TestRefineClusters:
+    def test_refines_multiple_unsorted_groups_preserving_canonical_order(
+        self, da_clustering_factory
+    ):
+        # Two initial clusters interleaved in canonical index order:
+        # group 0 (indices 0, 2, 4, 5) splits into two pairs by m/z;
+        # group 1 (indices 1, 3) splits into two singletons by RT.
+        initial = np.array([0, 1, 0, 1, 0, 0], dtype=np.int32)
+        mzs = np.array([100.0, 150.0, 100.1, 150.1, 200.0, 200.1])
+        rts = np.array([10.0, 10.0, 10.2, 50.0, 10.0, 10.2])
+
+        refined_labels, label_order, n_clusters = refine.refine_clusters(
+            initial,
+            mzs,
+            rts,
+            da_clustering_factory(rt_tol=5.0),
+            min_samples=2,
+        )
+        assert n_clusters == 4
+        # Stable sort keeps canonical order within each initial group.
+        np.testing.assert_array_equal(label_order, [0, 2, 4, 5, 1, 3])
+        restored = np.empty_like(initial)
+        restored[label_order] = refined_labels
+        assert restored[0] == restored[2]
+        assert restored[4] == restored[5]
+        assert len({restored[0], restored[4], restored[1], restored[3]}) == 4
+        assert set(restored.tolist()) == {0, 1, 2, 3}

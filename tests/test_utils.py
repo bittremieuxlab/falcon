@@ -1,33 +1,13 @@
 """Unit tests for falcon.utils logging, path, glob, and worker code."""
 
 import logging
+import os
 import sys
 
 import joblib
 import pytest
 
 from falcon import utils
-
-
-@pytest.fixture
-def isolated_root_logger():
-    """Preserve and restore root and third-party logging state."""
-    root = logging.getLogger()
-    numba_logger = logging.getLogger("numba")
-    numexpr_logger = logging.getLogger("numexpr")
-    prev_handlers = list(root.handlers)
-    prev_root_level = root.level
-    prev_numba_level = numba_logger.level
-    prev_numexpr_level = numexpr_logger.level
-    yield root
-    for handler in list(root.handlers):
-        root.removeHandler(handler)
-    for handler in prev_handlers:
-        root.addHandler(handler)
-    root.setLevel(prev_root_level)
-    numba_logger.setLevel(prev_numba_level)
-    numexpr_logger.setLevel(prev_numexpr_level)
-    logging.captureWarnings(False)
 
 
 class TestConfigureLogger:
@@ -48,7 +28,6 @@ class TestConfigureLogger:
         assert handler.stream is sys.stderr
         assert handler.level == logging.DEBUG
         assert logging.getLogger("numba").level == logging.WARNING
-        assert logging.getLogger("numexpr").level == logging.WARNING
 
     def test_does_not_duplicate_existing_handlers(self, isolated_root_logger):
         root = isolated_root_logger
@@ -110,11 +89,50 @@ class TestPathGlobAndTimeHelpers:
             keep_unmatched_literals=True,
         ) == [missing_literal]
 
+    def test_expand_input_globs_retains_existing_literal_with_brackets(
+        self, tmp_path
+    ):
+        bracketed = tmp_path / "sample_[1].mgf"
+        bracketed.write_text("", encoding="utf-8")
+
+        assert utils.expand_input_globs([str(bracketed)]) == [bracketed]
+
+    def test_paths_alias_covers_symlinks_hardlinks_and_loops(
+        self, tmp_path, monkeypatch
+    ):
+        target = tmp_path / "real.mgf"
+        target.write_text("MGF\n", encoding="utf-8")
+        sym = tmp_path / "sym.mgf"
+        sym.symlink_to(target)
+        hard = tmp_path / "hard.mgf"
+        os.link(target, hard)
+        other = tmp_path / "other.mgf"
+        other.write_text("OTHER\n", encoding="utf-8")
+        loop = tmp_path / "loop.mgf"
+        loop.symlink_to(loop)
+
+        assert utils.paths_alias(target, sym)
+        assert utils.paths_alias(target, hard)
+        assert not utils.paths_alias(target, other)
+        assert not utils.paths_alias(loop, target)
+        assert not utils.paths_alias(target, loop)
+        assert not utils.paths_alias(tmp_path / "bad\x00a", target)
+        assert not utils.paths_alias(target, tmp_path / "bad\x00b")
+
+        def _fail_samefile(_a, _b):
+            raise OSError("vanished")
+
+        monkeypatch.setattr(os.path, "samefile", _fail_samefile)
+        assert not utils.paths_alias(target, other)
+
     @pytest.mark.parametrize(
         ("seconds", "expected"),
         [
             (-10.5, "0:00:00"),
             (-0.1, "0:00:00"),
+            (float("nan"), "0:00:00"),
+            (float("inf"), "0:00:00"),
+            (float("-inf"), "0:00:00"),
             (0, "0:00:00"),
             (59.9, "0:00:59"),
             (3661, "1:01:01"),

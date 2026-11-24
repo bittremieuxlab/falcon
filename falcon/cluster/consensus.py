@@ -2,17 +2,24 @@
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 import numba as nb
 import numpy as np
 
-from ..config.models import AverageConsensusConfig, MedoidConsensusConfig
+from ..config.models import (
+    DEFAULT_OUTLIER_CUTOFF_LOWER,
+    DEFAULT_OUTLIER_CUTOFF_UPPER,
+    AverageConsensusConfig,
+    MedoidConsensusConfig,
+)
 from ..types import ConsensusTuple, make_consensus_tuple, mz_bin_bounds
 from .distance import condensed_index, pack_spectra_csr
+from .refine import iter_cluster_groups
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Sequence
+    from collections.abc import Sequence
 
     from ..config.models import ConsensusConfig
     from ..types import SpectrumTuple
@@ -29,41 +36,8 @@ __all__ = [
     "get_cluster_averages",
     "get_cluster_medoids",
     "get_representative_spectra",
-    "iter_cluster_groups",
     "sigma_clip",
 ]
-
-
-@nb.njit(cache=True)
-def iter_cluster_groups(clusters: np.ndarray) -> Iterator[tuple[int, int]]:
-    """
-    Yield ``(start, stop)`` index slices for contiguous cluster labels.
-
-    Assumes ``clusters`` is sorted by label with any ``-1`` noise labels
-    first; each ``-1`` entry is yielded as a length-1 slice.
-
-    Parameters
-    ----------
-    clusters : np.ndarray
-        Sorted 1D cluster label array (``-1`` denotes noise points).
-
-    Yields
-    ------
-    tuple[int, int]
-        Half-open ``(start_i, stop_i)`` slice bounds for each group.
-    """
-    n = clusters.shape[0]
-    start_i = 0
-    while start_i < n and clusters[start_i] == -1:
-        yield start_i, start_i + 1
-        start_i += 1
-    stop_i = start_i
-    while stop_i < n:
-        label = clusters[stop_i]
-        start_i = stop_i
-        while stop_i < n and clusters[stop_i] == label:
-            stop_i += 1
-        yield start_i, stop_i
 
 
 def get_representative_spectra(
@@ -73,10 +47,10 @@ def get_representative_spectra(
     order_map: np.ndarray,
     consensus: ConsensusConfig,
     *,
-    pdist: np.ndarray,
-    min_mz: float,
-    max_mz: float,
-    fragment_tol: float,
+    pdist: np.ndarray | None = None,
+    min_mz: float | None = None,
+    max_mz: float | None = None,
+    fragment_tol: float | None = None,
 ) -> list[ConsensusTuple]:
     """
     Compute one representative spectrum per cluster in an interval.
@@ -97,23 +71,36 @@ def get_representative_spectra(
         and ``pdist``.
     consensus : ConsensusConfig
         Validated consensus configuration (medoid or average).
-    pdist : np.ndarray
-        Condensed pairwise distance matrix (used for medoid).
-    min_mz, max_mz : float
-        Configured lower and upper fragment m/z bounds (used for
+    pdist : np.ndarray | None, default=None
+        Condensed pairwise distance matrix (required for medoid).
+    min_mz, max_mz : float | None, default=None
+        Configured lower and upper fragment m/z bounds (required for
         average).
-    fragment_tol : float
-        Fragment tolerance in Da (used for average; bin width is
+    fragment_tol : float | None, default=None
+        Fragment tolerance in Da (required for average; bin width is
         ``2 * fragment_tol``).
 
     Returns
     -------
     list[ConsensusTuple]
         Representative spectra ordered by cluster label.
+
+    Raises
+    ------
+    ValueError
+        If ``consensus`` is unsupported or required mode-specific
+        arguments are omitted.
     """
     if isinstance(consensus, MedoidConsensusConfig):
+        if pdist is None:
+            raise ValueError("pdist is required for medoid consensus")
         return get_cluster_medoids(spectra, labels, rts, order_map, pdist)
     if isinstance(consensus, AverageConsensusConfig):
+        if min_mz is None or max_mz is None or fragment_tol is None:
+            raise ValueError(
+                "min_mz, max_mz, and fragment_tol are required for "
+                "average consensus"
+            )
         return get_cluster_averages(
             spectra,
             labels,
@@ -128,7 +115,7 @@ def get_representative_spectra(
     raise ValueError(f"Unsupported consensus config: {consensus!r}")
 
 
-@nb.njit(cache=True, fastmath=True, boundscheck=False)
+@nb.njit(cache=True, boundscheck=False)
 def _select_medoid_positions(
     labels: np.ndarray,
     order_map: np.ndarray,
@@ -139,13 +126,15 @@ def _select_medoid_positions(
     Return the position in ``labels`` of each cluster's medoid.
 
     Clusters with at least ``_MIN_MEDOID_CLUSTER_SIZE`` members choose
-    the member minimizing summed float32 within-cluster distance;
+    the member minimizing summed float64 within-cluster distance;
     smaller clusters choose their first member.
     """
     n = labels.shape[0]
     positions = np.empty(n, dtype=np.int64)
     group_idx = 0
     pos = 0
+    # Keep group scanning inline: calling a cached @njit generator from
+    # another cached @njit kernel triggers Numba cache KeyError bugs.
     while pos < n:
         label = labels[pos]
         start_i = pos
@@ -156,18 +145,56 @@ def _select_medoid_positions(
         size = pos - start_i
         medoid_offset = 0
         if size >= _MIN_MEDOID_CLUSTER_SIZE:
-            row_sum = np.zeros(size, np.float32)
+            row_sum = np.zeros(size, np.float64)
             for row in range(size):
                 i_spec = order_map[start_i + row]
                 for col in range(row + 1, size):
                     j_spec = order_map[start_i + col]
-                    dist = pdist[condensed_index(i_spec, j_spec, n_spectra)]
+                    if i_spec == j_spec:
+                        continue
+                    dist = float(
+                        pdist[condensed_index(i_spec, j_spec, n_spectra)]
+                    )
                     row_sum[row] += dist
                     row_sum[col] += dist
             medoid_offset = int(np.argmin(row_sum))
         positions[group_idx] = start_i + medoid_offset
         group_idx += 1
     return positions[:group_idx]
+
+
+def _validate_consensus_inputs(
+    spectra: Sequence[SpectrumTuple],
+    labels: np.ndarray,
+    rts: np.ndarray,
+    order_map: np.ndarray,
+    *,
+    pdist: np.ndarray | None = None,
+) -> int:
+    """Validate 1D consensus inputs and return ``len(labels)``."""
+    if (
+        labels.ndim != 1
+        or order_map.ndim != 1
+        or rts.ndim != 1
+        or (pdist is not None and pdist.ndim != 1)
+    ):
+        raise ValueError("Consensus input arrays must all be 1D arrays")
+    if not np.issubdtype(order_map.dtype, np.integer):
+        raise ValueError(
+            f"order_map must have integer dtype, got {order_map.dtype}"
+        )
+    n_labels = labels.shape[0]
+    if order_map.shape[0] != n_labels or rts.shape[0] != n_labels:
+        raise ValueError(
+            "labels, order_map, and rts must have matching lengths, "
+            f"got {n_labels}, {order_map.shape[0]}, and {rts.shape[0]}"
+        )
+    n_spectra = len(spectra)
+    if n_labels > 0 and (
+        int(order_map.min()) < 0 or int(order_map.max()) >= n_spectra
+    ):
+        raise ValueError(f"order_map indices must lie in [0, {n_spectra})")
+    return n_labels
 
 
 def get_cluster_medoids(
@@ -198,10 +225,30 @@ def get_cluster_medoids(
     -------
     list[ConsensusTuple]
         Medoid representative spectra ordered by cluster label.
+
+    Raises
+    ------
+    ValueError
+        If input arrays are not 1D, lengths disagree, ``order_map``
+        contains out-of-bounds indices, or ``pdist`` is undersized when
+        a cluster has at least ``_MIN_MEDOID_CLUSTER_SIZE`` members.
     """
-    positions = _select_medoid_positions(
-        labels, order_map, pdist, len(spectra)
+    n_labels = _validate_consensus_inputs(
+        spectra, labels, rts, order_map, pdist=pdist
     )
+    if n_labels == 0:
+        return []
+    n_spectra = len(spectra)
+    required = n_spectra * (n_spectra - 1) // 2
+    if pdist.shape[0] < required and any(
+        stop_i - start_i >= _MIN_MEDOID_CLUSTER_SIZE
+        for start_i, stop_i in iter_cluster_groups(labels)
+    ):
+        raise ValueError(
+            f"pdist length ({pdist.shape[0]}) must be at least "
+            f"{required} for {n_spectra} spectra"
+        )
+    positions = _select_medoid_positions(labels, order_map, pdist, n_spectra)
     return [
         ConsensusTuple.from_spectrum(
             spectra[int(order_map[pos])],
@@ -274,29 +321,36 @@ def bin_cluster_peaks(
     sorted_spec_ids = spec_ids[order]
 
     change = np.flatnonzero(sorted_bins[1:] != sorted_bins[:-1]) + 1
-    starts = np.concatenate(([0], change))
-    stops = np.concatenate((change, [len(sorted_bins)]))
-
-    min_spectra = _MIN_BIN_OCCUPANCY_FRACTION * n_spectra
-    keep_starts: list[int] = []
-    keep_stops: list[int] = []
-    for lo, hi in zip(starts, stops, strict=True):
-        s_slice = sorted_spec_ids[lo:hi]
-        distinct_spectra = 1 + int(
-            np.count_nonzero(s_slice[1:] != s_slice[:-1])
-        )
-        if distinct_spectra >= min_spectra:
-            keep_starts.append(int(lo))
-            keep_stops.append(int(hi))
-
-    if not keep_starts:
-        return empty_f32, empty_f32, empty_i64, empty_i64
-    return (
-        sorted_mz,
-        sorted_int,
-        np.asarray(keep_starts, dtype=np.int64),
-        np.asarray(keep_stops, dtype=np.int64),
+    starts = np.concatenate((np.array([0], dtype=np.int64), change))
+    stops = np.concatenate(
+        (change, np.array([len(sorted_bins)], dtype=np.int64))
     )
+
+    is_new_spec = np.empty(len(sorted_bins), dtype=np.int64)
+    is_new_spec[0] = 1
+    is_new_spec[1:] = (sorted_bins[1:] != sorted_bins[:-1]) | (
+        sorted_spec_ids[1:] != sorted_spec_ids[:-1]
+    )
+    distinct_spectra = np.add.reduceat(is_new_spec, starts)
+    keep = distinct_spectra >= _MIN_BIN_OCCUPANCY_FRACTION * n_spectra
+    if not np.any(keep):
+        return empty_f32, empty_f32, empty_i64, empty_i64
+    return sorted_mz, sorted_int, starts[keep], stops[keep]
+
+
+@nb.njit(cache=True)
+def _std_float64(values: np.ndarray) -> float:
+    """Compute population standard deviation in float64 via Welford."""
+    n = len(values)
+    mean = 0.0
+    m2 = 0.0
+    for i in range(n):
+        x = float(values[i])
+        delta = x - mean
+        mean += delta / (i + 1)
+        delta2 = x - mean
+        m2 += delta * delta2
+    return math.sqrt(max(0.0, m2 / n))
 
 
 @nb.njit(cache=True)
@@ -309,8 +363,11 @@ def sigma_clip(
     """
     Remove intensity outliers iteratively from a single m/z bin.
 
-    Stops once at most two observations remain, the standard deviation
-    reaches zero, or an iteration removes no values.
+    Computes median and population standard deviation in float64 to
+    prevent float32 accumulation drift on large clusters while keeping
+    the returned arrays in their input dtypes. Stops once at most two
+    observations remain, the standard deviation reaches zero, or an
+    iteration removes no values.
 
     Parameters
     ----------
@@ -329,8 +386,8 @@ def sigma_clip(
         Retained intensities and their corresponding m/z values.
     """
     while len(intensities) > 2:
-        med = np.median(intensities)
-        std = np.std(intensities)
+        med = float(np.median(intensities.astype(np.float64)))
+        std = _std_float64(intensities)
         if std == 0.0:
             break
         lower_bound = med - outlier_cutoff_lower * std
@@ -372,8 +429,14 @@ def _clip_and_average_bins(
             )
             if len(intensities) == 0:
                 continue
-        out_mz[written] = np.mean(mzs)
-        out_int[written] = np.mean(intensities)
+        count = len(intensities)
+        mz_sum = 0.0
+        int_sum = 0.0
+        for idx in range(count):
+            mz_sum += float(mzs[idx])
+            int_sum += float(intensities[idx])
+        out_mz[written] = np.float32(mz_sum / count)
+        out_int[written] = np.float32(int_sum / count)
         written += 1
 
     return out_mz[:written], out_int[:written]
@@ -388,8 +451,8 @@ def get_cluster_averages(
     min_mz: float,
     max_mz: float,
     fragment_tol: float,
-    outlier_cutoff_lower: float = 1.5,
-    outlier_cutoff_upper: float = 1.5,
+    outlier_cutoff_lower: float = DEFAULT_OUTLIER_CUTOFF_LOWER,
+    outlier_cutoff_upper: float = DEFAULT_OUTLIER_CUTOFF_UPPER,
 ) -> list[ConsensusTuple]:
     """
     Compute intensity-averaged consensus spectra for each cluster.
@@ -420,9 +483,18 @@ def get_cluster_averages(
     -------
     list[ConsensusTuple]
         Averaged consensus spectra ordered by cluster label.
+
+    Raises
+    ------
+    ValueError
+        If input arrays are not 1D, lengths disagree, or ``order_map``
+        contains out-of-bounds indices.
     """
+    n_labels = _validate_consensus_inputs(spectra, labels, rts, order_map)
     bin_size = 2.0 * fragment_tol
     n_bins, start_dim, _ = mz_bin_bounds(min_mz, max_mz, bin_size)
+    if n_labels == 0:
+        return []
     reps: list[ConsensusTuple] = []
 
     for start_i, stop_i in iter_cluster_groups(labels):
@@ -431,10 +503,12 @@ def get_cluster_averages(
                 spectra[int(order_map[i])] for i in range(start_i, stop_i)
             ]
             avg_precursor_mz = float(
-                np.mean([spec.precursor_mz for spec in members])
+                np.mean(
+                    [spec.precursor_mz for spec in members], dtype=np.float64
+                )
             )
             charge = members[0].precursor_charge
-            avg_rt = float(np.mean(rts[start_i:stop_i]))
+            avg_rt = float(np.mean(rts[start_i:stop_i], dtype=np.float64))
 
             sorted_mz, sorted_int, bin_starts, bin_stops = bin_cluster_peaks(
                 members, start_dim, n_bins, bin_size

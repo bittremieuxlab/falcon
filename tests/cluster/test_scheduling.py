@@ -2,20 +2,17 @@
 
 import itertools
 
-import numba as nb
-import numba.typed
 import numpy as np
 import pytest
 
-from falcon.cluster import scheduling
+from falcon.cluster import refine, scheduling
 
 
 def _make_spec(task_id: int, n: int) -> scheduling.IntervalSpec:
     """Create a synthetic IntervalSpec with ``n`` spectra."""
     return scheduling.IntervalSpec(
         task_id=task_id,
-        row_ids=list(range(n)),
-        precursor_mzs=np.full(n, 500.0 + task_id, dtype=np.float32),
+        row_ids=np.arange(n, dtype=np.int64),
     )
 
 
@@ -29,75 +26,149 @@ class TestTileThreshold:
     ):
         assert scheduling.tile_threshold(batch_size) == expected
 
+    @pytest.mark.parametrize("bad_batch_size", [0, -1])
+    def test_rejects_non_positive_batch_size(self, bad_batch_size):
+        with pytest.raises(ValueError, match="batch_size must be at least 1"):
+            scheduling.tile_threshold(bad_batch_size)
+
 
 class TestPrecursorMzSplits:
     def test_da_single_and_multiple_splits_with_exact_boundary(self):
         mzs = np.array([100.0, 100.5, 101.0, 101.5])
-        assert scheduling.precursor_mz_splits(
-            mzs, 0.5, "Da", batch_size=100
-        ) == nb.typed.List([0, 4])
+        splits = scheduling.precursor_mz_splits(mzs, 0.5, "Da", batch_size=100)
+        assert isinstance(splits, np.ndarray)
+        assert splits.dtype == np.int64
+        np.testing.assert_array_equal(splits, [0, 4])
 
         mzs_split = np.array([100.0, 100.5, 101.5, 102.0])
-        assert scheduling.precursor_mz_splits(
-            mzs_split, 0.5, "Da", batch_size=100
-        ) == nb.typed.List([0, 2, 4])
+        np.testing.assert_array_equal(
+            scheduling.precursor_mz_splits(
+                mzs_split, 0.5, "Da", batch_size=100
+            ),
+            [0, 2, 4],
+        )
 
     def test_ppm_single_and_multiple_splits(self):
         mzs_one = np.array([100.0, 100.002, 100.003, 100.005])
-        assert scheduling.precursor_mz_splits(
-            mzs_one, 50, "ppm", batch_size=100
-        ) == nb.typed.List([0, 4])
+        np.testing.assert_array_equal(
+            scheduling.precursor_mz_splits(mzs_one, 50, "ppm", batch_size=100),
+            [0, 4],
+        )
 
         mzs_two = np.array([100.0, 100.004, 101.0, 101.004])
-        assert scheduling.precursor_mz_splits(
-            mzs_two, 50, "ppm", batch_size=100
-        ) == nb.typed.List([0, 2, 4])
+        np.testing.assert_array_equal(
+            scheduling.precursor_mz_splits(mzs_two, 50, "ppm", batch_size=100),
+            [0, 2, 4],
+        )
 
     def test_true_even_chunking_for_internal_and_trailing_oversized_blocks(
         self,
     ):
         # Continuous block of 4 with batch_size=2 -> [0, 2, 4].
         mzs = np.array([100.0, 100.2, 100.4, 100.5])
-        assert scheduling.precursor_mz_splits(
-            mzs, 0.5, "Da", batch_size=2
-        ) == nb.typed.List([0, 2, 4])
+        np.testing.assert_array_equal(
+            scheduling.precursor_mz_splits(mzs, 0.5, "Da", batch_size=2),
+            [0, 2, 4],
+        )
 
         # Internal contiguous block of 4 exceeds batch_size=3 -> evenly
         # split into (2, 2) rather than greedy (3, 1).
         mzs2 = np.array([100.0, 101.0, 102.0, 103.0, 106.0, 107.0])
-        assert scheduling.precursor_mz_splits(
-            mzs2, 1.0, "Da", batch_size=3
-        ) == nb.typed.List([0, 2, 4, 6])
+        np.testing.assert_array_equal(
+            scheduling.precursor_mz_splits(mzs2, 1.0, "Da", batch_size=3),
+            [0, 2, 4, 6],
+        )
 
         # Trailing contiguous block of 7 exceeds batch_size=5 -> evenly
         # split into (4, 3) rather than greedy (5, 2).
         mzs_tail = np.array([100.0, 100.1, 100.2, 100.3, 100.4, 100.5, 100.6])
-        assert scheduling.precursor_mz_splits(
-            mzs_tail, 0.5, "Da", batch_size=5
-        ) == nb.typed.List([0, 4, 7])
+        np.testing.assert_array_equal(
+            scheduling.precursor_mz_splits(mzs_tail, 0.5, "Da", batch_size=5),
+            [0, 4, 7],
+        )
 
         # Gap coincides with block_size == batch_size (3).
         mzs3 = np.array([100.0, 100.1, 100.2, 200.0, 200.1])
-        assert scheduling.precursor_mz_splits(
-            mzs3, 0.5, "Da", batch_size=3
-        ) == nb.typed.List([0, 3, 5])
+        np.testing.assert_array_equal(
+            scheduling.precursor_mz_splits(mzs3, 0.5, "Da", batch_size=3),
+            [0, 3, 5],
+        )
 
         # batch_size=1 splits every element into a singleton interval.
-        assert scheduling.precursor_mz_splits(
-            np.array([100.0, 100.0, 100.0]), 0.5, "Da", batch_size=1
-        ) == nb.typed.List([0, 1, 2, 3])
+        np.testing.assert_array_equal(
+            scheduling.precursor_mz_splits(
+                np.array([100.0, 100.0, 100.0]), 0.5, "Da", batch_size=1
+            ),
+            [0, 1, 2, 3],
+        )
 
-    def test_empty_and_single_value(self):
-        assert scheduling.precursor_mz_splits(
-            np.array([]), 0.5, "Da", batch_size=100
-        ) == nb.typed.List([0])
-        assert scheduling.precursor_mz_splits(
-            np.array([100.0]), 0.5, "Da", batch_size=100
-        ) == nb.typed.List([0, 1])
+    def test_empty_single_value_and_invalid_arguments(self):
+        np.testing.assert_array_equal(
+            scheduling.precursor_mz_splits(
+                np.array([]), 0.5, "Da", batch_size=100
+            ),
+            [0],
+        )
+        np.testing.assert_array_equal(
+            scheduling.precursor_mz_splits(
+                np.array([100.0]), 0.5, "Da", batch_size=100
+            ),
+            [0, 1],
+        )
+        with pytest.raises(ValueError, match="batch_size"):
+            scheduling.precursor_mz_splits(
+                np.array([100.0]), 0.5, "Da", batch_size=0
+            )
+        with pytest.raises(ValueError, match="precursor_tol_mode"):
+            scheduling.precursor_mz_splits(
+                np.array([100.0, 101.0]), 0.5, "da", batch_size=10
+            )
+        with pytest.raises(ValueError, match="precursor_mzs must be 1D"):
+            scheduling.precursor_mz_splits(
+                np.zeros((2, 2)), 0.5, "Da", batch_size=10
+            )
+        with pytest.raises(ValueError, match="strictly positive"):
+            scheduling.precursor_mz_splits(
+                np.array([0.0, 100.0]), 20.0, "ppm", batch_size=10
+            )
+        for bad_ppm in (
+            np.array([100.0, np.nan]),
+            np.array([100.0, np.inf]),
+        ):
+            with pytest.raises(ValueError, match="finite strictly positive"):
+                scheduling.precursor_mz_splits(
+                    bad_ppm, 20.0, "ppm", batch_size=10
+                )
+
+    def test_ppm_float32_input_matches_float64_linkage_1d_boundary(self):
+        # Float32 gives 19.7346992 ppm while float64 gives 19.7347005;
+        # a midpoint tolerance verifies float64 precision matches
+        # refine.linkage_1d.
+        mzs_f32 = np.array([300.0, 300.00592], dtype=np.float32)
+        ppm_f32 = float(
+            np.float32((mzs_f32[1] - mzs_f32[0]) / mzs_f32[0])
+            * np.float32(1e6)
+        )
+        ppm_f64 = float(refine.linkage_1d(mzs_f32, "ppm")[0, 2])
+        assert ppm_f32 < ppm_f64
+        tol = 0.5 * (ppm_f32 + ppm_f64)
+
+        splits = scheduling.precursor_mz_splits(
+            mzs_f32, tol, "ppm", batch_size=10
+        )
+        np.testing.assert_array_equal(splits, [0, 1, 2])
+        assert (
+            len(
+                np.unique(
+                    refine.cut_linkage(refine.linkage_1d(mzs_f32, "ppm"), tol)
+                )
+            )
+            == 2
+        )
 
 
-class TestIntervalRowBounds:
-    @pytest.mark.parametrize("n", [2, 3, 10, 100])
+class TestIntervalRowBoundsAndTilePlanning:
+    @pytest.mark.parametrize("n", [2, 3, 4, 10, 100])
     @pytest.mark.parametrize("n_tiles", [1, 2, 4, 20])
     def test_exact_partition_of_rows(self, n, n_tiles):
         bounds = scheduling.interval_row_bounds(n, n_tiles)
@@ -109,6 +180,10 @@ class TestIntervalRowBounds:
         for prev, curr in itertools.pairwise(bounds):
             assert prev[1] == curr[0]
 
+    def test_small_interval_splits_without_off_by_one_collapse(self):
+        assert scheduling.interval_row_bounds(4, 2) == [(0, 1), (1, 4)]
+        assert scheduling.interval_row_bounds(6, 2) == [(0, 2), (2, 6)]
+
     def test_balances_pair_work_across_tiles(self):
         n = 400
         bounds = scheduling.interval_row_bounds(n, 4)
@@ -119,6 +194,23 @@ class TestIntervalRowBounds:
         assert sum(pair_counts) == n * (n - 1) // 2
         ideal = n * (n - 1) // 8
         assert all(abs(p - ideal) / ideal < 0.15 for p in pair_counts)
+
+    def test_validates_bounds_and_plan_tile_bounds_conserves_cost(
+        self, monkeypatch
+    ):
+        with pytest.raises(ValueError, match="n must be at least 2"):
+            scheduling.interval_row_bounds(1, 1)
+        with pytest.raises(ValueError, match="n_tiles must be at least 1"):
+            scheduling.interval_row_bounds(4, 0)
+        with pytest.raises(ValueError, match="n must be at least 2"):
+            scheduling.plan_tile_bounds(1, 2)
+        with pytest.raises(ValueError, match="n_workers must be at least 1"):
+            scheduling.plan_tile_bounds(4, 0)
+
+        monkeypatch.setattr(scheduling, "MIN_PAIRS_PER_TILE", 3)
+        planned = scheduling.plan_tile_bounds(6, n_workers=4)
+        assert len(planned) >= 2
+        assert sum(cost for _, _, cost in planned) == pytest.approx(36.0)
 
 
 class TestCostBasedChunking:
@@ -178,26 +270,29 @@ class TestPrepareBucketChunks:
             spectrum_row("s:g1", 700.01, peaks, inten, 2, 11.0),
         ]
         ds = lance_dataset(rows)
-        n, splits, normal_chunks, giant_specs = (
-            scheduling.prepare_bucket_chunks(
-                ds,
-                "2",
-                da_clustering_factory(batch_size=10),
-                num_chunks=4,
-                threshold=3,
-            )
+        plan = scheduling.prepare_bucket_chunks(
+            ds,
+            "2",
+            da_clustering_factory(batch_size=10),
+            num_chunks=4,
+            threshold=3,
         )
-        assert n == 5
-        assert list(splits) == [0, 2, 5]
-        assert len(normal_chunks) == 1
-        assert len(normal_chunks[0]) == 1
-        assert normal_chunks[0][0].n_spectra == 2
-        assert len(giant_specs) == 1
-        assert giant_specs[0].n_spectra == 3
+        assert isinstance(plan, scheduling.BucketPlan)
+        assert plan.n_spectra == 5
+        assert list(plan.splits) == [0, 2, 5]
+        assert len(plan.normal_chunks) == 1
+        assert len(plan.normal_chunks[0]) == 1
+        assert plan.normal_chunks[0][0].n_spectra == 2
+        assert len(plan.giant_specs) == 1
+        assert plan.giant_specs[0].n_spectra == 3
+        assert isinstance(plan.giant_specs[0].row_ids, np.ndarray)
 
         # Taking by row_ids must yield rows in canonical order.
         giant_ids = (
-            ds.take(indices=giant_specs[0].row_ids, columns=["identifier"])
+            ds.take(
+                indices=plan.giant_specs[0].row_ids.tolist(),
+                columns=["identifier"],
+            )
             .to_pandas()["identifier"]
             .tolist()
         )
@@ -231,40 +326,35 @@ class TestPrepareBucketChunks:
                 )
         ds = lance_dataset(rows)
 
-        n, splits, normal_chunks, giant_specs = (
-            scheduling.prepare_bucket_chunks(
-                ds,
-                "2",
-                da_clustering_factory(batch_size=20),
-                num_chunks=2,
-                threshold=8,
-            )
+        plan = scheduling.prepare_bucket_chunks(
+            ds,
+            "2",
+            da_clustering_factory(batch_size=20),
+            num_chunks=2,
+            threshold=8,
         )
-        assert n == 26
-        assert list(splits) == [0, 10, 14, 18, 22, 26]
-        assert len(giant_specs) == 1
-        assert giant_specs[0].n_spectra == 10
-        assert len(normal_chunks) == 2
-        assert [len(chunk) for chunk in normal_chunks] == [2, 2]
-        assert [sum(s.cost for s in chunk) for chunk in normal_chunks] == [
-            32,
-            32,
-        ]
+        assert plan.n_spectra == 26
+        assert list(plan.splits) == [0, 10, 14, 18, 22, 26]
+        assert len(plan.giant_specs) == 1
+        assert plan.giant_specs[0].n_spectra == 10
+        assert len(plan.normal_chunks) == 2
+        assert [len(chunk) for chunk in plan.normal_chunks] == [2, 2]
+        assert [
+            sum(s.cost for s in chunk) for chunk in plan.normal_chunks
+        ] == [32, 32]
 
     def test_empty_and_all_giant_buckets(
         self, lance_dataset, spectrum_row, da_clustering_factory
     ):
         clust = da_clustering_factory(batch_size=10)
         ds_empty = lance_dataset([], name="empty.lance")
-        n_empty, splits_empty, chunks_empty, giants_empty = (
-            scheduling.prepare_bucket_chunks(
-                ds_empty, "2", clust, num_chunks=2, threshold=4
-            )
+        plan_empty = scheduling.prepare_bucket_chunks(
+            ds_empty, "2", clust, num_chunks=2, threshold=4
         )
-        assert n_empty == 0
-        assert list(splits_empty) == [0]
-        assert chunks_empty == []
-        assert giants_empty == []
+        assert plan_empty.n_spectra == 0
+        assert list(plan_empty.splits) == [0]
+        assert plan_empty.normal_chunks == []
+        assert plan_empty.giant_specs == []
 
         peaks = [100.0, 200.0, 300.0]
         inten = [1.0, 0.8, 0.6]
@@ -275,11 +365,11 @@ class TestPrepareBucketChunks:
             ],
             name="giant.lance",
         )
-        n_g, splits_g, chunks_g, giants_g = scheduling.prepare_bucket_chunks(
+        plan_g = scheduling.prepare_bucket_chunks(
             ds_giant, "2", clust, num_chunks=2, threshold=4
         )
-        assert n_g == 4
-        assert list(splits_g) == [0, 4]
-        assert chunks_g == []
-        assert len(giants_g) == 1
-        assert giants_g[0].n_spectra == 4
+        assert plan_g.n_spectra == 4
+        assert list(plan_g.splits) == [0, 4]
+        assert plan_g.normal_chunks == []
+        assert len(plan_g.giant_specs) == 1
+        assert plan_g.giant_specs[0].n_spectra == 4

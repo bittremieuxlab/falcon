@@ -9,11 +9,27 @@ from falcon import ms_io
 
 class TestLazySubmoduleImports:
     @pytest.mark.parametrize("name", ["mgf_io", "mzml_io", "mzxml_io"])
-    def test_lazy_getattr_loads_format_submodules(self, monkeypatch, name):
+    def test_lazy_getattr_loads_and_caches_format_submodules(
+        self, monkeypatch, name
+    ):
         monkeypatch.delattr(ms_io, name, raising=False)
+        assert name not in ms_io.__dict__
         mod = getattr(ms_io, name)
         assert mod.__name__ == f"falcon.ms_io.{name}"
         assert callable(mod.get_spectra)
+        assert ms_io.__dict__[name] is mod
+        assert getattr(ms_io, name) is mod
+
+    def test_dir_lists_lazy_submodules_without_eager_loading(
+        self, monkeypatch
+    ):
+        for name in ("mgf_io", "mzml_io", "mzxml_io"):
+            monkeypatch.delattr(ms_io, name, raising=False)
+        names = dir(ms_io)
+        for exported in ms_io.__all__:
+            assert exported in names
+        for name in ("mgf_io", "mzml_io", "mzxml_io"):
+            assert name not in ms_io.__dict__
 
     def test_unknown_attribute_raises_attribute_error(self):
         with pytest.raises(AttributeError, match="has no attribute 'unknown'"):
@@ -26,8 +42,8 @@ class TestGetSpectraDispatch:
         with pytest.raises(FileNotFoundError, match="Non-existing peak file"):
             list(ms_io.get_spectra(missing))
 
-    def test_directory_path_raises_file_not_found(self, tmp_path):
-        with pytest.raises(FileNotFoundError, match="Non-existing peak file"):
+    def test_directory_path_raises_is_a_directory_error(self, tmp_path):
+        with pytest.raises(IsADirectoryError, match="is a directory"):
             list(ms_io.get_spectra(tmp_path))
 
     def test_unknown_extension_raises_value_error(self, tmp_path):

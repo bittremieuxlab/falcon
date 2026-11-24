@@ -10,7 +10,7 @@ if TYPE_CHECKING:
     import os
     from collections.abc import Iterable, Iterator
 
-    from spectrum_utils.spectrum import MsmsSpectrum
+    import spectrum_utils.spectrum as sus
 
     from ..types import ConsensusTuple
     from . import mgf_io, mzml_io, mzxml_io
@@ -21,13 +21,22 @@ __all__ = ["get_spectra", "mgf_io", "mzml_io", "mzxml_io", "write_spectra"]
 
 
 def __getattr__(name: str) -> Any:
-    """Lazily load format-specific reader/writer submodules."""
+    """Lazily load and cache format-specific submodules."""
     if name in _LAZY_SUBMODULES:
-        return importlib.import_module(f".{name}", __name__)
+        module = importlib.import_module(f".{name}", __name__)
+        globals()[name] = module
+        return module
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-def get_spectra(filename: str | os.PathLike[str]) -> Iterator[MsmsSpectrum]:
+def __dir__() -> list[str]:
+    """Include lazily exposed submodules in ``dir(ms_io)``."""
+    return sorted({*globals(), *__all__})
+
+
+def get_spectra(
+    filename: str | os.PathLike[str],
+) -> Iterator[sus.MsmsSpectrum]:
     """
     Read MS/MS spectra from a peak file based on its extension.
 
@@ -46,12 +55,18 @@ def get_spectra(filename: str | os.PathLike[str]) -> Iterator[MsmsSpectrum]:
 
     Raises
     ------
+    IsADirectoryError
+        If ``filename`` refers to a directory.
     FileNotFoundError
         If ``filename`` does not exist or is not a regular file.
     ValueError
         If ``filename`` has an unsupported extension.
     """
     path = Path(filename)
+    if path.is_dir():
+        raise IsADirectoryError(
+            f"Peak file path is a directory, not a file: {filename}"
+        )
     if not path.is_file():
         raise FileNotFoundError(f"Non-existing peak file {filename}")
 

@@ -1,7 +1,9 @@
 """Unit tests for falcon.ms_io.mzxml_io."""
 
+import base64
 import logging
 import math
+import struct
 
 import numpy as np
 import pyteomics.mzxml
@@ -58,6 +60,25 @@ class TestMzxmlParseSpectrum:
         assert spec.precursor_mz == pytest.approx(400.0)
         assert spec.precursor_charge == 2
 
+    @pytest.mark.parametrize(
+        ("polarity", "raw_charge", "expected"),
+        [
+            ("-", 2, -2),
+            ("-", -2, -2),
+            ("-", None, None),
+            ("+", 2, 2),
+        ],
+    )
+    def test_negative_polarity_negates_charge_magnitude(
+        self, polarity, raw_charge, expected
+    ):
+        extra = (
+            {"precursorCharge": raw_charge} if raw_charge is not None else None
+        )
+        raw = {**_mzxml_dict(extra_precursor=extra), "polarity": polarity}
+        spec = mzxml_io._parse_spectrum(raw, "run:scan:7")
+        assert spec.precursor_charge == expected
+
 
 class TestMzxmlGetSpectra:
     def test_sample_fixture_filters_ms1_and_extracts_metadata(self, data_dir):
@@ -70,27 +91,27 @@ class TestMzxmlGetSpectra:
         # Pyteomics converts ISO duration PT6S to 0.1 minutes; the
         # sample.mzxml binary block encodes (m/z=160.0, int=10.0).
         assert s.retention_time == pytest.approx(0.1)
+        assert s.mz.dtype == np.float32
+        assert s.intensity.dtype == np.float32
         np.testing.assert_allclose(s.mz, [160.0])
         np.testing.assert_allclose(s.intensity, [10.0])
 
-    def test_get_spectra_does_not_mutate_spectrum_dict_id(self, monkeypatch):
+    def test_get_spectra_does_not_mutate_spectrum_dict_id_and_passes_options(
+        self, monkeypatch, fake_reader_factory
+    ):
         raw = _mzxml_dict(extra_precursor={"precursorCharge": 2})
         orig_id = raw["id"]
+        received_kwargs = []
 
-        class _FakeMzXML:
-            def __init__(self, _source):
-                pass
-
-            def __enter__(self):
-                return iter([raw])
-
-            def __exit__(self, *_args):
-                return False
-
-        monkeypatch.setattr(pyteomics.mzxml, "MzXML", _FakeMzXML)
+        monkeypatch.setattr(
+            pyteomics.mzxml,
+            "MzXML",
+            fake_reader_factory([raw], kwargs_log=received_kwargs),
+        )
         spectra = list(mzxml_io.get_spectra("run.mzxml"))
         assert [s.identifier for s in spectra] == ["run:scan:7"]
         assert raw["id"] == orig_id
+        assert received_kwargs == [{"use_index": False, "dtype": np.float32}]
 
     def test_reads_from_open_file_object(self, data_dir):
         with (data_dir / "sample.mzxml").open("rb") as fh:
@@ -149,21 +170,160 @@ class TestMzxmlGetSpectra:
         spectra = list(mzxml_io.get_spectra(path))
         assert [s.identifier for s in spectra] == ["bad:scan:3"]
 
-    def test_malformed_xml_logs_warning_instead_of_crashing(
+    def test_malformed_and_zero_byte_xml_log_warning_instead_of_crashing(
         self, tmp_path, caplog
     ):
-        corrupt = tmp_path / "corrupt.mzxml"
-        corrupt.write_text("<mzXML><msRun><scan num='1'")
+        for name, content in [
+            ("corrupt.mzxml", "<mzXML><msRun><scan num='1'"),
+            ("empty.mzxml", ""),
+        ]:
+            path = tmp_path / name
+            path.write_text(content, encoding="utf-8")
+            caplog.clear()
+            with caplog.at_level(logging.WARNING, logger="falcon"):
+                spectra = list(mzxml_io.get_spectra(path))
+            assert spectra == []
+            assert any(
+                "Failed to read file" in r.message for r in caplog.records
+            )
+
+    def test_corrupt_base64_and_zlib_log_warning_instead_of_crashing(
+        self, tmp_path, caplog
+    ):
+        template = (
+            '<?xml version="1.0" encoding="ISO-8859-1"?>\n'
+            '<mzXML xmlns="http://sashimi.sourceforge.net/'
+            'schema_revision/mzXML_3.2">\n'
+            ' <msRun scanCount="1">\n'
+            '  <scan num="1" msLevel="2" peaksCount="1">\n'
+            "   <precursorMz>400.0</precursorMz>\n"
+            '   <peaks compressionType="{comp}" precision="32" '
+            'byteOrder="network" contentType="m/z-int">'
+            "{payload}</peaks>\n"
+            "  </scan>\n"
+            " </msRun>\n"
+            "</mzXML>\n"
+        )
+        odd_peaks_b64 = base64.b64encode(
+            struct.pack(">3f", 100.0, 50.0, 200.0)
+        ).decode("ascii")
+        for filename, comp, payload in [
+            ("bad_b64.mzxml", "none", "!!!not-base64!!!"),
+            ("bad_zlib.mzxml", "zlib", "AAAAAAAAWUA="),
+            ("odd_peaks.mzxml", "none", odd_peaks_b64),
+        ]:
+            path = tmp_path / filename
+            path.write_text(
+                template.format(comp=comp, payload=payload), encoding="utf-8"
+            )
+            caplog.clear()
+            with caplog.at_level(logging.WARNING, logger="falcon"):
+                spectra = list(mzxml_io.get_spectra(path))
+            assert spectra == []
+            assert any(
+                "Failed to read file" in r.message for r in caplog.records
+            )
+
+    def test_skips_non_numeric_rt_and_non_finite_precursor_mz(
+        self, tmp_path, monkeypatch, fake_reader_factory
+    ):
+        raws = [
+            _mzxml_dict(rt="not_a_number"),
+            {
+                **_mzxml_dict(),
+                "id": "8",
+                "precursorMz": [{"precursorMz": float("inf")}],
+            },
+            {**_mzxml_dict(rt=1.5), "id": "9"},
+        ]
+
+        monkeypatch.setattr(
+            pyteomics.mzxml, "MzXML", fake_reader_factory(raws)
+        )
+        spectra = list(mzxml_io.get_spectra(tmp_path / "mixed.mzxml"))
+        assert [s.identifier for s in spectra] == ["mixed:scan:9"]
+
+    def test_parses_negative_polarity_end2end(self, tmp_path):
+        peaks_b64 = base64.b64encode(struct.pack(">2f", 150.0, 25.0)).decode(
+            "ascii"
+        )
+        path = tmp_path / "neg.mzxml"
+        path.write_text(
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<mzXML xmlns="http://sashimi.sourceforge.net/'
+            'schema_revision/mzXML_3.2">\n'
+            ' <msRun scanCount="1">\n'
+            '  <scan num="3" msLevel="2" polarity="-" peaksCount="1">\n'
+            '   <precursorMz precursorCharge="2">420.0</precursorMz>\n'
+            '   <peaks compressionType="none" precision="32" '
+            f'byteOrder="network" contentType="m/z-int">{peaks_b64}</peaks>\n'
+            "  </scan>\n"
+            " </msRun>\n"
+            "</mzXML>\n",
+            encoding="utf-8",
+        )
+        spectra = list(mzxml_io.get_spectra(path))
+        assert [s.identifier for s in spectra] == ["neg:scan:3"]
+        assert spectra[0].precursor_mz == pytest.approx(420.0)
+        assert spectra[0].precursor_charge == -2
+
+    @pytest.mark.parametrize(
+        ("filename", "scan_attrs"),
+        [
+            ("bad_num.mzxml", 'num="abc" msLevel="2"'),
+            ("missing_mslevel.mzxml", 'num="2"'),
+        ],
+    )
+    def test_non_integer_num_and_missing_mslevel_warn_without_crashing(
+        self, tmp_path, caplog, filename, scan_attrs
+    ):
+        peaks_b64 = base64.b64encode(struct.pack(">2f", 150.0, 25.0)).decode(
+            "ascii"
+        )
+        path = tmp_path / filename
+        path.write_text(
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<mzXML xmlns="http://sashimi.sourceforge.net/'
+            'schema_revision/mzXML_3.2">\n'
+            ' <msRun scanCount="1">\n'
+            f'  <scan {scan_attrs} peaksCount="1">\n'
+            '   <precursorMz precursorCharge="2">400.0</precursorMz>\n'
+            '   <peaks compressionType="none" precision="32" '
+            f'byteOrder="network" contentType="m/z-int">{peaks_b64}</peaks>\n'
+            "  </scan>\n"
+            " </msRun>\n"
+            "</mzXML>\n",
+            encoding="utf-8",
+        )
         with caplog.at_level(logging.WARNING, logger="falcon"):
-            spectra = list(mzxml_io.get_spectra(corrupt))
-        assert spectra == []
+            assert list(mzxml_io.get_spectra(path)) == []
         assert any("Failed to read file" in r.message for r in caplog.records)
 
-    def test_skips_empty_precursor_charge_type_error(
+    def test_skips_non_integer_id_and_missing_mslevel_per_spectrum(
+        self, monkeypatch, fake_reader_factory
+    ):
+        no_level = _mzxml_dict()
+        del no_level["msLevel"]
+        raws = [
+            {**_mzxml_dict(), "id": "abc"},
+            no_level,
+            {**_mzxml_dict(), "id": "4"},
+        ]
+        monkeypatch.setattr(
+            pyteomics.mzxml, "MzXML", fake_reader_factory(raws)
+        )
+        spectra = list(mzxml_io.get_spectra("mixed_ids.mzxml"))
+        assert [s.identifier for s in spectra] == ["mixed_ids:scan:4"]
+
+    def test_missing_file_propagates_os_error(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            list(mzxml_io.get_spectra(tmp_path / "missing.mzxml"))
+
+    def test_empty_precursor_charge_and_attributeless_precursor_retained(
         self, tmp_path, mzxml_writer
     ):
-        # Empty precursorCharge="" yields None in Pyteomics -> TypeError
-        # on int(None); reader must skip it instead of aborting.
+        # Empty precursorCharge="" yields None in Pyteomics; retain with
+        # precursor_charge=None (matching mzml_io).
         path = mzxml_writer(
             tmp_path / "empty_charge.mzxml",
             [
@@ -186,4 +346,71 @@ class TestMzxmlGetSpectra:
             ],
         )
         spectra = list(mzxml_io.get_spectra(path))
-        assert [s.identifier for s in spectra] == ["empty_charge:scan:5"]
+        assert [s.identifier for s in spectra] == [
+            "empty_charge:scan:1",
+            "empty_charge:scan:5",
+        ]
+        assert spectra[0].precursor_charge is None
+        assert spectra[1].precursor_charge == 2
+
+        # Minimal <precursorMz> without XML attributes collapses to a
+        # bare string in Pyteomics; retain with precursor_charge=None.
+        peaks_b64 = base64.b64encode(struct.pack(">2f", 150.0, 25.0)).decode(
+            "ascii"
+        )
+        bare_path = tmp_path / "bare_prec.mzxml"
+        bare_path.write_text(
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<mzXML xmlns="http://sashimi.sourceforge.net/'
+            'schema_revision/mzXML_3.2">\n'
+            ' <msRun scanCount="1">\n'
+            '  <scan num="7" msLevel="2" peaksCount="1">\n'
+            "   <precursorMz>450.25</precursorMz>\n"
+            '   <peaks compressionType="none" precision="32" '
+            f'byteOrder="network" contentType="m/z-int">{peaks_b64}</peaks>\n'
+            "  </scan>\n"
+            " </msRun>\n"
+            "</mzXML>\n",
+            encoding="utf-8",
+        )
+        bare_spectra = list(mzxml_io.get_spectra(bare_path))
+        assert [s.identifier for s in bare_spectra] == ["bare_prec:scan:7"]
+        assert bare_spectra[0].precursor_mz == pytest.approx(450.25)
+        assert bare_spectra[0].precursor_charge is None
+
+    def test_skips_none_precursor_mz_type_error(
+        self, monkeypatch, fake_reader_factory
+    ):
+        raws = [
+            {
+                **_mzxml_dict(),
+                "id": "1",
+                "precursorMz": [{"precursorMz": None}],
+            },
+            {**_mzxml_dict(), "id": "2"},
+        ]
+        monkeypatch.setattr(
+            pyteomics.mzxml, "MzXML", fake_reader_factory(raws)
+        )
+        spectra = list(mzxml_io.get_spectra("bad_prec.mzxml"))
+        assert [s.identifier for s in spectra] == ["bad_prec:scan:2"]
+
+    def test_blank_retention_time_yields_nan_rt(
+        self, monkeypatch, fake_reader_factory
+    ):
+        raws = [
+            {**_mzxml_dict(rt=""), "id": "10"},
+            {**_mzxml_dict(rt="   "), "id": "11"},
+        ]
+        monkeypatch.setattr(
+            pyteomics.mzxml, "MzXML", fake_reader_factory(raws)
+        )
+        spectra = list(mzxml_io.get_spectra("blank_rt.mzxml"))
+        assert [s.identifier for s in spectra] == [
+            "blank_rt:scan:10",
+            "blank_rt:scan:11",
+        ]
+        assert all(
+            s.retention_time is not None and math.isnan(s.retention_time)
+            for s in spectra
+        )

@@ -2,12 +2,27 @@
 
 import importlib
 import importlib.metadata
+import subprocess
+import sys
 
 import pytest
 
 import falcon
 import falcon.__main__
 from falcon import cli, config, pipeline
+
+_HEAVY_MODULES = (
+    "numpy",
+    "numba",
+    "scipy",
+    "lance",
+    "pyarrow",
+    "pandas",
+    "fastcluster",
+    "joblib",
+    "spectrum_utils",
+    "pyteomics",
+)
 
 
 class TestPackageMetadataAndExports:
@@ -44,6 +59,30 @@ class TestPackageMetadataAndExports:
     def test_unknown_attribute_raises_attribute_error(self):
         with pytest.raises(AttributeError, match="nonexistent_attr"):
             _ = falcon.nonexistent_attr
+
+    def test_dir_lists_lazy_public_exports(self):
+        names = dir(falcon)
+        for attr in falcon.__all__:
+            assert attr in names
+
+    def test_lightweight_imports_and_cli_inspection_defer_heavy_deps(self):
+        script = (
+            "import sys\n"
+            "import falcon, falcon.types, falcon.utils, "
+            "falcon.config, falcon.cli\n"
+            "assert falcon.cli.main(['--print-config']) == 0\n"
+            "assert falcon.cli.main(['--dump-schema']) == 0\n"
+            f"heavy = {_HEAVY_MODULES!r}\n"
+            "loaded = [m for m in heavy if m in sys.modules]\n"
+            "assert not loaded, f'Heavy modules loaded eagerly: {loaded}'\n"
+        )
+        proc = subprocess.run(  # noqa: S603
+            [sys.executable, "-c", script],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert proc.returncode == 0, proc.stderr
 
 
 class TestMainModule:

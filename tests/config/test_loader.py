@@ -296,8 +296,137 @@ class TestLoadSettingsAndConfig:
         assert settings.preprocessing.min_peaks == 5
 
     def test_load_config_requires_io_paths(self):
-        with pytest.raises(ValidationError):
+        with pytest.raises(ValidationError) as exc_info:
             load_config()
+        locs = {err["loc"] for err in exc_info.value.errors()}
+        assert ("io", "input_filenames") in locs
+        assert ("io", "output_filename") in locs
+
+    def test_rejects_bare_string_or_path_for_config_files(self, tmp_path):
+        from typing import Any
+
+        toml_path = tmp_path / "single.toml"
+        toml_path.write_text("[clustering]\nmin_matched_peaks = 3\n")
+        for raw in (str(toml_path), toml_path, b"single.toml"):
+            bad_files: Any = raw
+            with pytest.raises(ConfigError, match="sequence of paths"):
+                load_settings(config_files=bad_files)
+
+    def test_partial_consensus_layers_symmetric_between_extends_and_files(
+        self, tmp_path
+    ):
+        cutoffs = tmp_path / "cutoffs.toml"
+        cutoffs.write_text(
+            "[consensus]\noutlier_cutoff_lower = 2.5\n", encoding="utf-8"
+        )
+        method = tmp_path / "method.toml"
+        method.write_text(
+            '[consensus]\nmethod = "average"\n', encoding="utf-8"
+        )
+        child = tmp_path / "child.toml"
+        child.write_text(
+            'extends = ["cutoffs.toml", "method.toml"]\n', encoding="utf-8"
+        )
+
+        via_extends = load_settings(config_files=[child])
+        via_files = load_settings(config_files=[cutoffs, method])
+        assert via_extends == via_files
+        assert via_files.consensus.method == "average"
+        assert via_files.consensus.outlier_cutoff_lower == 2.5
+
+        # Switching a partial [consensus] layer to medoid drops stale
+        # average-only cutoffs cleanly while still rejecting unknown keys.
+        reset_medoid = load_settings(
+            config_files=[cutoffs],
+            overrides={"consensus": {"method": "medoid"}},
+        )
+        assert reset_medoid.consensus == MedoidConsensusConfig()
+
+        typo = tmp_path / "typo.toml"
+        typo.write_text("[consensus]\nunknown_key = 1\n", encoding="utf-8")
+        with pytest.raises(ValidationError, match="unknown_key"):
+            load_settings(
+                config_files=[typo],
+                overrides={"consensus": {"method": "medoid"}},
+            )
+
+        # Switching average -> medoid or medoid -> average still surfaces
+        # unknown typo keys from the base layer, and medoid -> medoid does
+        # not silently strip invalid average-only keys.
+        avg_typo = tmp_path / "avg_typo.toml"
+        avg_typo.write_text(
+            '[consensus]\nmethod = "average"\n'
+            "outlier_cutoff_lower = 2.0\nunknown_avg_key = 1\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ValidationError, match="unknown_avg_key"):
+            load_settings(
+                config_files=[avg_typo],
+                overrides={"consensus": {"method": "medoid"}},
+            )
+
+        med_typo = tmp_path / "med_typo.toml"
+        med_typo.write_text(
+            '[consensus]\nmethod = "medoid"\nunknown_med_key = 1\n',
+            encoding="utf-8",
+        )
+        with pytest.raises(ValidationError, match="unknown_med_key"):
+            load_settings(
+                config_files=[med_typo],
+                overrides={"consensus": {"method": "average"}},
+            )
+
+        med_invalid = tmp_path / "med_invalid.toml"
+        med_invalid.write_text(
+            '[consensus]\nmethod = "medoid"\noutlier_cutoff_lower = 2.0\n',
+            encoding="utf-8",
+        )
+        with pytest.raises(ValidationError, match="outlier_cutoff_lower"):
+            load_settings(
+                config_files=[med_invalid],
+                overrides={"consensus": {"method": "medoid"}},
+            )
+
+    def test_load_toml_file_rejects_blank_and_nul_byte_paths(self):
+        for bad_path in ("", "   ", Path("   ")):
+            with pytest.raises(ConfigError, match="empty or whitespace"):
+                load_toml_file(bad_path)
+
+        with pytest.raises(ConfigError, match="Failed to resolve"):
+            load_toml_file("bad\x00.toml")
+
+    def test_symlinked_config_resolves_relative_extends_against_target_dir(
+        self, tmp_path
+    ):
+        preset_dir = tmp_path / "presets"
+        preset_dir.mkdir()
+        (preset_dir / "base.toml").write_text(
+            "[clustering]\nmin_matched_peaks = 7\n", encoding="utf-8"
+        )
+        child = preset_dir / "child.toml"
+        child.write_text('extends = "base.toml"\n', encoding="utf-8")
+
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        link = run_dir / "active.toml"
+        link.symlink_to(child)
+
+        settings = load_settings(config_files=[link])
+        assert settings.clustering.min_matched_peaks == 7
+
+    def test_merge_config_dicts_supports_mapping_proxy(self):
+        from types import MappingProxyType
+
+        base = MappingProxyType(
+            {"clustering": MappingProxyType({"fragment_tol": 0.05})}
+        )
+        override = MappingProxyType(
+            {"clustering": MappingProxyType({"linkage": "single"})}
+        )
+        merged = merge_config_dicts(base, override)
+        assert merged == {
+            "clustering": {"fragment_tol": 0.05, "linkage": "single"}
+        }
 
     def test_metabolomics_example_config_loads_cleanly(self):
         src_root = Path(__file__).resolve().parents[2]

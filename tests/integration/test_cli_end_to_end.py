@@ -11,8 +11,12 @@ import pytest
 import falcon
 from falcon import ms_io, staging
 from falcon.cli import main as falcon_main
+from tests.helpers import LOW_QUALITY_PEAKS
 
-pytestmark = pytest.mark.integration
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.usefixtures("isolated_root_logger"),
+]
 
 PEAKS_A = [
     (150.0, 100.0),
@@ -30,7 +34,6 @@ PEAKS_B = [
     (580.0, 250.0),
     (680.0, 120.0),
 ]
-LOW_QUALITY_PEAKS = [(150.0, 100.0), (160.0, 200.0)]
 
 
 class TestCliEndToEnd:
@@ -255,11 +258,10 @@ class TestCliEndToEnd:
                 ]
             )
 
-        # Run 4 without --overwrite aborts with exit code 1 AND cleans up
-        # its automatic temporary work_dir.
+        # Run 4 without --overwrite aborts with exit code 1 before
+        # creating an automatic temporary work_dir.
         assert falcon_main([str(mgf), str(out1)]) == 1
-        assert len(track_mkdtemp) == 1
-        assert not track_mkdtemp[0].exists()
+        assert track_mkdtemp == []
 
         # Run 5 with --overwrite refreshes cache and succeeds.
         assert (
@@ -410,7 +412,8 @@ class TestCliEndToEnd:
             falcon_main(
                 [str(tmp_path / "missing_*.mgf"), str(tmp_path / "out")]
             )
-        assert not track_mkdtemp[-1].exists()
+        assert len(track_mkdtemp) == 1
+        assert not track_mkdtemp[0].exists()
 
         mgf = mgf_writer(
             tmp_path / "ok.mgf",
@@ -418,4 +421,37 @@ class TestCliEndToEnd:
         )
         with pytest.raises(FileNotFoundError):
             falcon_main([str(mgf), str(tmp_path / "no_such_dir" / "out")])
-        assert not track_mkdtemp[-1].exists()
+        # Unwritable output directory fails in prepare_outputs before
+        # allocating any additional temporary work_dir.
+        assert len(track_mkdtemp) == 1
+
+    def test_negative_charge_end_to_end_removes_precursor_and_exports_mgf(
+        self, tmp_path, mgf_block, mgf_writer
+    ):
+        # Include an intense peak at the precursor m/z (500.0) that must be
+        # removed in negative-ion mode before clustering and export.
+        peaks_with_prec = [*PEAKS_A, (500.0, 10_000.0)]
+        mgf = mgf_writer(
+            tmp_path / "neg.mgf",
+            [
+                mgf_block(peaks_with_prec, 500.0, charge=-2, scan=1, rt=10.0),
+                mgf_block(
+                    peaks_with_prec, 500.002, charge=-2, scan=2, rt=12.0
+                ),
+            ],
+        )
+        out_prefix = tmp_path / "neg_out"
+        rc = falcon_main(
+            [str(mgf), str(out_prefix), "--export-representatives"]
+        )
+        assert rc == 0
+        df = pd.read_csv(f"{out_prefix}.csv", comment="#")
+        assert list(df["precursor_charge"]) == [-2, -2]
+        assert df["cluster"].nunique() == 1
+
+        mgf_text = (tmp_path / "neg_out.mgf").read_text(encoding="utf-8")
+        assert "CHARGE=2-" in mgf_text
+        reps = list(ms_io.get_spectra(str(tmp_path / "neg_out.mgf")))
+        assert len(reps) == 1
+        assert reps[0].precursor_charge == -2
+        assert all(abs(float(mz) - 500.0) > 1.5 for mz in reps[0].mz)

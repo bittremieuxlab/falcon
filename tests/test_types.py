@@ -22,7 +22,9 @@ from falcon.types import (
 
 
 class TestSpectrumAndConsensusRecords:
-    @pytest.mark.parametrize("charge", [2, np.int8(3), None, float("nan")])
+    @pytest.mark.parametrize(
+        "charge", [2, np.int8(3), None, float("nan"), float("inf")]
+    )
     def test_make_consensus_tuple_normalizes_dtypes_and_missing_charge(
         self, charge
     ):
@@ -40,7 +42,7 @@ class TestSpectrumAndConsensusRecords:
         assert rep.intensity.dtype == np.float32
         assert rep.retention_time.dtype == np.float32
         assert rep.cluster_id == np.int32(7)
-        if charge is None or math.isnan(float(charge)):
+        if charge is None or not math.isfinite(float(charge)):
             assert math.isnan(rep.precursor_charge)
         else:
             assert rep.precursor_charge == np.int32(charge)
