@@ -7,19 +7,17 @@ import pytest
 from scipy.spatial.distance import squareform
 
 from falcon.cluster import consensus
-from falcon.config import AverageConsensusConfig, MedoidConsensusConfig
-from falcon.types import mz_bin_bounds
+from falcon.config import ConsensusConfig, mz_bin_bounds
+from tests.helpers import make_spectrum_tuple
 
 
 class TestClusterMedoids:
-    def test_randomized_medoids_match_dense_squareform_reference(
-        self, spec_factory
-    ):
+    def test_randomized_medoids_match_dense_squareform_reference(self):
         rng = np.random.default_rng(77)
         for _ in range(10):
             n = int(rng.integers(5, 25))
             specs = [
-                spec_factory(
+                make_spectrum_tuple(
                     [100.0 + i], [1.0], precursor_mz=300.0 + i, charge=2
                 )
                 for i in range(n)
@@ -56,11 +54,11 @@ class TestClusterMedoids:
                     float(rts[expected_pos])
                 )
 
-    def test_empty_singletons_and_noise_medoids(self, spec_factory):
+    def test_empty_and_noise_medoids(self):
         specs = [
-            spec_factory([100.0], [1.0], precursor_mz=500.0),
-            spec_factory([200.0], [1.0], precursor_mz=501.0),
-            spec_factory([300.0], [1.0], precursor_mz=502.0),
+            make_spectrum_tuple([100.0], [1.0], precursor_mz=500.0),
+            make_spectrum_tuple([200.0], [1.0], precursor_mz=501.0),
+            make_spectrum_tuple([300.0], [1.0], precursor_mz=502.0),
         ]
         reps = consensus.get_cluster_medoids(
             specs,
@@ -83,10 +81,9 @@ class TestClusterMedoids:
 
 
 class TestBinningSigmaClipAndAverages:
-    def test_bin_cluster_peaks_70_percent_occupancy(self, spec_factory):
-        # 10 spectra: bin @ 100 in 7 (kept), bin @ 200 in 6 (dropped).
+    def test_bin_cluster_peaks_70_percent_occupancy(self):
         specs = [
-            spec_factory(
+            make_spectrum_tuple(
                 [100.0, 200.0] if i < 6 else ([100.0] if i == 6 else [300.0]),
                 [1.0, 1.0] if i < 6 else [1.0],
                 normalize=False,
@@ -112,24 +109,22 @@ class TestBinningSigmaClipAndAverages:
         )
         np.testing.assert_allclose(kept_i, [1.0, 1.0, 1.0, 1.0])
 
-        # Asymmetric bounds clip only the tighter side.
         sym = np.array([1.0, 10.0, 10.0, 10.0, 19.0], dtype=np.float32)
         low_i, _ = consensus.sigma_clip(sym, mzs, 1.0, 3.0)
         high_i, _ = consensus.sigma_clip(sym, mzs, 3.0, 1.0)
         np.testing.assert_allclose(low_i, [10.0, 10.0, 10.0, 19.0])
         np.testing.assert_allclose(high_i, [1.0, 10.0, 10.0, 10.0])
 
-        # Pair and zero-std arrays stop immediately.
         pair = np.array([1.0, 100.0], dtype=np.float32)
         out_pair, _ = consensus.sigma_clip(pair, mzs[:2], 0.1, 0.1)
         np.testing.assert_array_equal(out_pair, pair)
 
-    def test_large_cluster_avoids_float32_summation_drift(self, spec_factory):
+    def test_large_cluster_avoids_float32_summation_drift(self):
         n = 2000
         peak_mz = np.float32(1000.01)
         peak_int = np.float32(0.75)
         spectra = [
-            spec_factory(
+            make_spectrum_tuple(
                 [float(peak_mz)],
                 [float(peak_int)],
                 precursor_mz=float(peak_mz),
@@ -151,17 +146,15 @@ class TestBinningSigmaClipAndAverages:
         assert abs(float(reps[0].intensity[0]) - float(peak_int)) < 1e-5
         assert abs(float(reps[0].retention_time) - 500.01) < 1e-4
 
-    def test_average_multi_cluster_nan_rt_none_charge_and_dispatch(
-        self, spec_factory
-    ):
+    def test_average_multi_cluster_nan_rt_none_charge_and_dispatch(self):
         specs = [
-            spec_factory(
+            make_spectrum_tuple(
                 [100.0, 200.0], [0.4, 0.6], precursor_mz=500.0, normalize=False
             ),
-            spec_factory(
+            make_spectrum_tuple(
                 [100.2, 200.2], [0.6, 0.8], precursor_mz=500.4, normalize=False
             ),
-            spec_factory(
+            make_spectrum_tuple(
                 [300.0],
                 [1.0],
                 precursor_mz=600.0,
@@ -178,7 +171,7 @@ class TestBinningSigmaClipAndAverages:
             labels,
             rts,
             order,
-            AverageConsensusConfig(),
+            ConsensusConfig(method="average"),
             min_mz=50.0,
             max_mz=400.0,
             fragment_tol=0.5,
@@ -197,7 +190,7 @@ class TestBinningSigmaClipAndAverages:
             labels,
             rts,
             order,
-            MedoidConsensusConfig(),
+            ConsensusConfig(method="medoid"),
             pdist=np.array([0.1, 0.9, 0.9], dtype=np.float32),
         )
         assert [int(r.cluster_id) for r in med_reps] == [0, 1]

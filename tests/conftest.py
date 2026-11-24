@@ -1,9 +1,4 @@
-"""Shared pytest fixtures for the Falcon test suite.
-
-Keeps heavy scientific dependencies (``lance``, ``numpy``, ``pyarrow``)
-out of module-level imports so pure-stdlib unit tests start quickly
-without polluting ``sys.modules``.
-"""
+"""Shared stateful pytest fixtures for the Falcon test suite."""
 
 from __future__ import annotations
 
@@ -13,18 +8,6 @@ import warnings
 from pathlib import Path
 
 import pytest
-
-from tests.helpers import (
-    format_mgf_spectrum,
-    make_consensus_record,
-    make_da_clustering,
-    make_falcon_config,
-    make_spectrum_row,
-    make_spectrum_tuple,
-    write_mgf,
-    write_toy_mzml,
-    write_toy_mzxml,
-)
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
 
@@ -52,60 +35,6 @@ def isolated_root_logger():
 def data_dir():
     """Return path to checked-in peak-file fixtures."""
     return DATA_DIR
-
-
-@pytest.fixture(scope="session")
-def spec_factory():
-    """Expose ``make_spectrum_tuple`` as a session fixture."""
-    return make_spectrum_tuple
-
-
-@pytest.fixture(scope="session")
-def consensus_factory():
-    """Expose ``make_consensus_record`` as a session fixture."""
-    return make_consensus_record
-
-
-@pytest.fixture(scope="session")
-def config_factory():
-    """Expose ``make_falcon_config`` as a session fixture."""
-    return make_falcon_config
-
-
-@pytest.fixture(scope="session")
-def da_clustering_factory():
-    """Expose ``make_da_clustering`` as a session fixture."""
-    return make_da_clustering
-
-
-@pytest.fixture(scope="session")
-def spectrum_row():
-    """Expose ``make_spectrum_row`` as a session fixture."""
-    return make_spectrum_row
-
-
-@pytest.fixture(scope="session")
-def mgf_block():
-    """Expose ``format_mgf_spectrum`` as a session fixture."""
-    return format_mgf_spectrum
-
-
-@pytest.fixture(scope="session")
-def mgf_writer():
-    """Expose ``write_mgf`` as a session fixture."""
-    return write_mgf
-
-
-@pytest.fixture(scope="session")
-def mzml_writer():
-    """Expose ``write_toy_mzml`` as a session fixture."""
-    return write_toy_mzml
-
-
-@pytest.fixture(scope="session")
-def mzxml_writer():
-    """Expose ``write_toy_mzxml`` as a session fixture."""
-    return write_toy_mzxml
 
 
 @pytest.fixture

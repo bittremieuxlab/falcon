@@ -6,21 +6,26 @@ import argparse
 import json
 import logging
 import sys
-import textwrap
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, TypeVar, get_args
 
 from pydantic import ValidationError
 
 from . import __version__
 from .config import (
-    AverageConsensusConfig,
+    AUTO_SENTINEL,
+    NONE_SENTINEL,
+    OTHER_BUCKET,
+    UNKNOWN_CHARGE,
     ClusteringConfig,
     ConfigError,
+    ConsensusConfig,
+    ConsensusMethod,
     IOConfig,
-    MedoidConsensusConfig,
+    LinkageMethod,
     PrecursorTolerance,
+    PrecursorTolMode,
     PreprocessingConfig,
+    ScalingMethod,
     build_json_schema,
     format_toml,
     load_config,
@@ -29,17 +34,6 @@ from .config import (
     validate_file_path,
     write_saved_config,
 )
-from .types import (
-    AUTO_SENTINEL,
-    NONE_SENTINEL,
-    OTHER_BUCKET,
-    UNKNOWN_CHARGE,
-    ConsensusMethod,
-    LinkageMethod,
-    PrecursorTolMode,
-    ScalingMethod,
-)
-from .utils import configure_logger
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -47,19 +41,6 @@ if TYPE_CHECKING:
 
     from pydantic import BaseModel
 
-    from .config import FalconConfig, FalconSettings
-
-__all__ = [
-    "CliAction",
-    "DumpSchemaAction",
-    "NewlineTextHelpFormatter",
-    "PrintConfigAction",
-    "RunAction",
-    "build_parser",
-    "format_validation_error",
-    "main",
-    "parse_cli",
-]
 
 _T = TypeVar("_T")
 
@@ -67,52 +48,35 @@ _PRECURSOR_TOL_MODES: tuple[str, ...] = get_args(PrecursorTolMode)
 _SCALING_CHOICES: tuple[str, ...] = get_args(ScalingMethod)
 _LINKAGE_CHOICES: tuple[str, ...] = get_args(LinkageMethod)
 _CONSENSUS_CHOICES: tuple[str, ...] = get_args(ConsensusMethod)
-_CONSENSUS_UNION_TAGS = frozenset(
-    {
-        *_CONSENSUS_CHOICES,
-        MedoidConsensusConfig.__name__,
-        AverageConsensusConfig.__name__,
-    }
+
+_DIRECT_SECTIONS: tuple[tuple[str, type[BaseModel], frozenset[str]], ...] = (
+    ("io", IOConfig, frozenset()),
+    ("preprocessing", PreprocessingConfig, frozenset()),
+    (
+        "clustering",
+        ClusteringConfig,
+        frozenset({"precursor_tol", "precursor_charge_buckets"}),
+    ),
+    ("consensus", ConsensusConfig, frozenset({"method"})),
 )
 
 
-@dataclass(frozen=True, slots=True)
-class DumpSchemaAction:
-    """CLI action requesting JSON Schema output."""
-
-
-@dataclass(frozen=True, slots=True)
-class PrintConfigAction:
-    """CLI action requesting resolved TOML output."""
-
-    settings: FalconSettings
-
-
-@dataclass(frozen=True, slots=True)
-class RunAction:
-    """CLI action executing a validated clustering run."""
-
-    config: FalconConfig
-    save_config: Path | None = None
-
-
-CliAction = DumpSchemaAction | PrintConfigAction | RunAction
-
-
-class NewlineTextHelpFormatter(argparse.HelpFormatter):
-    """Help formatter that preserves explicit newlines in text."""
-
-    def _fill_text(self, text: str, width: int, indent: str) -> str:
-        return "\n".join(
-            textwrap.fill(
-                line,
-                width,
-                initial_indent=indent,
-                subsequent_indent=indent,
-                replace_whitespace=False,
+def _configure_logger() -> None:
+    logging.captureWarnings(True)
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)
+    if not root.handlers:
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setLevel(logging.DEBUG)
+        handler.setFormatter(
+            logging.Formatter(
+                "{asctime} {levelname} [{name}/{processName}] "
+                "{module}.{funcName} : {message}",
+                style="{",
             )
-            for line in text.splitlines()
         )
+        root.addHandler(handler)
+    logging.getLogger("numba").setLevel(logging.WARNING)
 
 
 def _add_field_arg(
@@ -159,34 +123,6 @@ def _cli_optional(converter: Callable[[str], _T]) -> Callable[[str], _T | str]:
     return _parse
 
 
-def _parse_cli_charge_bucket(raw: str) -> list[int | str] | str:
-    if raw == OTHER_BUCKET:
-        return OTHER_BUCKET
-    has_open, has_close = raw.startswith("["), raw.endswith("]")
-    if has_open != has_close:
-        raise ConfigError(f"Unbalanced brackets in charge bucket {raw!r}")
-    inner = raw[1:-1] if has_open else raw
-    if not inner.strip():
-        raise ConfigError(f"Empty charge bucket: {raw!r}")
-
-    bucket: list[int | str] = []
-    for part in inner.split(","):
-        token = part.strip()
-        if not token:
-            raise ConfigError(f"Empty charge entry in bucket {raw!r}")
-        if token == UNKNOWN_CHARGE:
-            bucket.append(UNKNOWN_CHARGE)
-            continue
-        try:
-            bucket.append(int(token))
-        except ValueError as exc:
-            raise ConfigError(
-                f"Invalid charge value {token!r} in bucket {raw!r} "
-                f"(expected integer or '{UNKNOWN_CHARGE}')"
-            ) from exc
-    return bucket
-
-
 def _parse_cli_charge_buckets(
     tokens: Sequence[str],
 ) -> str | list[list[int | str] | str]:
@@ -198,7 +134,34 @@ def _parse_cli_charge_buckets(
             f"Cannot combine '{AUTO_SENTINEL}' with explicit "
             "--precursor-charge-buckets"
         )
-    return [_parse_cli_charge_bucket(raw) for raw in stripped]
+    buckets: list[list[int | str] | str] = []
+    for raw in stripped:
+        if raw == OTHER_BUCKET:
+            buckets.append(OTHER_BUCKET)
+            continue
+        has_open, has_close = raw.startswith("["), raw.endswith("]")
+        if has_open != has_close:
+            raise ConfigError(f"Unbalanced brackets in charge bucket {raw!r}")
+        inner = raw[1:-1] if has_open else raw
+        if not inner.strip():
+            raise ConfigError(f"Empty charge bucket: {raw!r}")
+        bucket: list[int | str] = []
+        for part in inner.split(","):
+            token = part.strip()
+            if not token:
+                raise ConfigError(f"Empty charge entry in bucket {raw!r}")
+            if token == UNKNOWN_CHARGE:
+                bucket.append(UNKNOWN_CHARGE)
+                continue
+            try:
+                bucket.append(int(token))
+            except ValueError as exc:
+                raise ConfigError(
+                    f"Invalid charge value {token!r} in bucket {raw!r} "
+                    f"(expected integer or '{UNKNOWN_CHARGE}')"
+                ) from exc
+        buckets.append(bucket)
+    return buckets
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -218,10 +181,10 @@ def build_parser() -> argparse.ArgumentParser:
             "Official code website: "
             "https://github.com/bittremieuxlab/falcon\n\n"
             "Configuration layers apply in order: built-in defaults <- "
-            "TOML config file(s) via -c/--config (with optional 'extends') "
+            "TOML config\nfile(s) via -c/--config (with optional 'extends') "
             "<- CLI flags."
         ),
-        formatter_class=NewlineTextHelpFormatter,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
     cfg = parser.add_argument_group("Configuration")
@@ -368,17 +331,13 @@ def build_parser() -> argparse.ArgumentParser:
     cons = parser.add_argument_group("Consensus")
     _add_field_arg(
         cons,
-        MedoidConsensusConfig,
+        ConsensusConfig,
         "method",
         flag="--consensus-method",
         choices=_CONSENSUS_CHOICES,
     )
-    _add_field_arg(
-        cons, AverageConsensusConfig, "outlier_cutoff_lower", type=float
-    )
-    _add_field_arg(
-        cons, AverageConsensusConfig, "outlier_cutoff_upper", type=float
-    )
+    _add_field_arg(cons, ConsensusConfig, "outlier_cutoff_lower", type=float)
+    _add_field_arg(cons, ConsensusConfig, "outlier_cutoff_upper", type=float)
     return parser
 
 
@@ -386,34 +345,20 @@ def format_validation_error(exc: ValidationError) -> str:
     """Format a Pydantic ``ValidationError`` for display."""
     lines = ["Invalid configuration:"]
     for err in exc.errors(include_url=False):
-        loc = err["loc"]
-        parts = [
-            str(elem)
-            for idx, elem in enumerate(loc)
-            if not (
-                idx > 0
-                and str(loc[idx - 1]) == "consensus"
-                and str(elem) in _CONSENSUS_UNION_TAGS
-            )
-        ]
-        path = ".".join(parts) if parts else "config"
+        path = ".".join(str(elem) for elem in err["loc"]) or "config"
         msg = err["msg"].removeprefix("Value error, ")
         lines.append(f"  - {path}: {msg}")
     return "\n".join(lines)
 
 
 def _extract_cli_overrides(ns: dict[str, Any]) -> dict[str, Any]:
-    io_ov = {k: ns[k] for k in IOConfig.model_fields if k in ns}
-    prep_ov = {k: ns[k] for k in PreprocessingConfig.model_fields if k in ns}
-    clust_ov = {
-        k: ns[k]
-        for k in ClusteringConfig.model_fields
-        if k in ns and k not in {"precursor_tol", "precursor_charge_buckets"}
-    }
-    cons_ov = {
-        k: ns[k]
-        for k in AverageConsensusConfig.model_fields
-        if k in ns and k != "method"
+    sections: dict[str, dict[str, Any]] = {
+        name: {
+            k: ns[k]
+            for k in model.model_fields
+            if k in ns and k not in excluded
+        }
+        for name, model, excluded in _DIRECT_SECTIONS
     }
 
     paths: list[str] = ns.get("paths", [])
@@ -428,8 +373,8 @@ def _extract_cli_overrides(ns: dict[str, Any]) -> dict[str, Any]:
             "neither when specifying them in a config file"
         )
     if len(paths) >= 2:
-        io_ov["input_filenames"] = paths[:-1]
-        io_ov["output_filename"] = paths[-1]
+        sections["io"]["input_filenames"] = paths[:-1]
+        sections["io"]["output_filename"] = paths[-1]
 
     if "precursor_tol" in ns:
         raw_mass, raw_mode = ns["precursor_tol"]
@@ -439,74 +384,59 @@ def _extract_cli_overrides(ns: dict[str, Any]) -> dict[str, Any]:
             raise ConfigError(
                 f"--precursor-tol mass must be a number, got {raw_mass!r}"
             ) from exc
-        clust_ov["precursor_tol"] = {"mass": mass_val, "mode": raw_mode}
+        sections["clustering"]["precursor_tol"] = {
+            "mass": mass_val,
+            "mode": raw_mode,
+        }
 
     if "precursor_charge_buckets" in ns:
-        clust_ov["precursor_charge_buckets"] = _parse_cli_charge_buckets(
-            ns["precursor_charge_buckets"]
+        sections["clustering"]["precursor_charge_buckets"] = (
+            _parse_cli_charge_buckets(ns["precursor_charge_buckets"])
         )
 
     if "consensus_method" in ns:
-        cons_ov["method"] = ns["consensus_method"]
+        sections["consensus"]["method"] = ns["consensus_method"]
 
-    sections = {
-        "io": io_ov,
-        "preprocessing": prep_ov,
-        "clustering": clust_ov,
-        "consensus": cons_ov,
-    }
     return {name: values for name, values in sections.items() if values}
 
 
-def parse_cli(args: Sequence[str] | None = None) -> CliAction:
-    """Parse CLI arguments and resolve layered TOML + CLI config."""
+def main(args: Sequence[str] | None = None) -> int:
+    """Run the Falcon CLI entry point and return an exit code."""
     parser = build_parser()
     ns = vars(parser.parse_args(list(args) if args is not None else None))
 
     if ns["dump_schema"]:
-        return DumpSchemaAction()
+        print(json.dumps(build_json_schema(), indent=2))
+        return 0
 
     config_files: list[str] = ns["config_files"]
     try:
         overrides = _extract_cli_overrides(ns)
         if ns["print_config"]:
-            return PrintConfigAction(
-                settings=load_settings(
-                    config_files=config_files, overrides=overrides
-                )
+            settings = load_settings(
+                config_files=config_files, overrides=overrides
             )
-        return RunAction(
-            config=load_config(config_files=config_files, overrides=overrides),
-            save_config=ns["save_config"],
-        )
+            print(format_toml(settings), end="")
+            return 0
+        config = load_config(config_files=config_files, overrides=overrides)
     except ConfigError as exc:
         parser.error(str(exc))
     except ValidationError as exc:
         parser.error(format_validation_error(exc))
 
-
-def main(args: Sequence[str] | None = None) -> int:
-    """Run the Falcon CLI entry point and return an exit code."""
-    action = parse_cli(args)
-    if isinstance(action, DumpSchemaAction):
-        print(json.dumps(build_json_schema(), indent=2))
-        return 0
-    try:
-        if isinstance(action, PrintConfigAction):
-            print(format_toml(action.settings), end="")
-            return 0
-        if action.save_config is not None:
-            write_saved_config(action.config, action.save_config)
-    except ConfigError as exc:
-        print(f"falcon: error: {exc}", file=sys.stderr)
-        return 2
+    if ns["save_config"] is not None:
+        try:
+            write_saved_config(config, ns["save_config"])
+        except ConfigError as exc:
+            print(f"falcon: error: {exc}", file=sys.stderr)
+            return 2
 
     # Defer importing heavy pipeline dependencies until an actual run.
     from .pipeline import run
 
-    configure_logger()
+    _configure_logger()
     try:
-        return run(action.config)
+        return run(config)
     finally:
         for handler in logging.getLogger().handlers:
             handler.flush()

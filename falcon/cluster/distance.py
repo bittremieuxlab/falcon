@@ -11,27 +11,13 @@ import numba as nb
 import numpy as np
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
-
     import pyarrow as pa
 
-    from ..types import PathLike, SpectrumTuple
+    from ..config import PathLike
 
 # Allocate small condensed matrices (< ~8 MiB in float32) in RAM to
 # avoid per-interval temporary-file churn.
 MEMMAP_MIN_SPECTRA = 2**11
-
-__all__ = [
-    "MEMMAP_MIN_SPECTRA",
-    "close_memmap",
-    "compute_condensed_distance_matrix_csr",
-    "condensed_index",
-    "cosine_fast_arrays",
-    "extract_arrow_csr",
-    "fill_condensed_rows_csr",
-    "open_shared_condensed",
-    "pack_spectra_csr",
-]
 
 
 @nb.njit(cache=True)
@@ -122,27 +108,6 @@ def extract_arrow_csr(
     return mz_flat, intensity_flat, mz_offsets
 
 
-def pack_spectra_csr(
-    spec_tuples: Sequence[SpectrumTuple],
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Pack variable-length spectrum peaks into CSR arrays."""
-    n = len(spec_tuples)
-    offsets = np.empty(n + 1, dtype=np.int64)
-    offsets[0] = 0
-    mz_arrays: list[np.ndarray] = []
-    int_arrays: list[np.ndarray] = []
-    for i, spec in enumerate(spec_tuples):
-        mz_arr = np.asarray(spec.mz, dtype=np.float32)
-        int_arr = np.asarray(spec.intensity, dtype=np.float32)
-        offsets[i + 1] = offsets[i] + len(mz_arr)
-        mz_arrays.append(mz_arr)
-        int_arrays.append(int_arr)
-    if int(offsets[n]) == 0:
-        empty = np.empty(0, dtype=np.float32)
-        return empty, empty, offsets
-    return np.concatenate(mz_arrays), np.concatenate(int_arrays), offsets
-
-
 def open_shared_condensed(
     n: int,
     *,
@@ -197,7 +162,7 @@ def compute_condensed_distance_matrix_csr(
 
     try:
         if nb.get_num_threads() <= 1:
-            _condensed_rows_csr(
+            fill_condensed_rows_csr(
                 condensed,
                 mz_flat,
                 intensity_flat,
@@ -221,30 +186,6 @@ def compute_condensed_distance_matrix_csr(
             close_memmap(condensed)
         raise
     return condensed
-
-
-def fill_condensed_rows_csr(
-    condensed_dist_matrix: np.ndarray,
-    mz_flat: np.ndarray,
-    intensity_flat: np.ndarray,
-    offsets: np.ndarray,
-    r0: int,
-    r1: int,
-    fragment_tol: float,
-    min_matched_peaks: int,
-) -> None:
-    """Fill condensed distance rows ``[r0, r1)`` serially from CSR."""
-    if r0 < r1:
-        _condensed_rows_csr(
-            condensed_dist_matrix,
-            mz_flat,
-            intensity_flat,
-            offsets,
-            r0,
-            r1,
-            fragment_tol,
-            min_matched_peaks,
-        )
 
 
 @nb.njit(cache=True, boundscheck=False)
@@ -277,7 +218,7 @@ def _fill_distance_row(
 
 
 @nb.njit(cache=True, boundscheck=False)
-def _condensed_rows_csr(
+def fill_condensed_rows_csr(
     condensed_dist_matrix: np.ndarray,
     mz_flat: np.ndarray,
     intensity_flat: np.ndarray,
@@ -287,6 +228,7 @@ def _condensed_rows_csr(
     fragment_tol: float,
     min_matched_peaks: int,
 ) -> None:
+    """Fill condensed distance rows ``[r0, r1)`` serially from CSR."""
     n = len(offsets) - 1
     stop = min(r1, n - 1)
     for i in range(r0, stop):

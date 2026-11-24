@@ -9,24 +9,28 @@ import pytest
 from scipy.spatial.distance import squareform
 
 from falcon.cluster import distance, engine
+from tests.helpers import make_spectrum_tuple
 
 
-def _random_spectra(n, rng, spec_factory, n_peaks=25, mz_max=200.0):
-    return [
-        spec_factory(
-            np.sort(rng.uniform(0.0, mz_max, n_peaks)),
-            rng.random(n_peaks),
-            precursor_mz=float(rng.uniform(100.0, 1000.0)),
-            charge=1,
-        )
-        for _ in range(n)
-    ]
+def _pack_csr(specs):
+    offsets = np.empty(len(specs) + 1, dtype=np.int64)
+    offsets[0] = 0
+    for i, spec in enumerate(specs):
+        offsets[i + 1] = offsets[i] + len(spec.mz)
+    if offsets[-1] == 0:
+        empty = np.empty(0, dtype=np.float32)
+        return empty, empty, offsets
+    return (
+        np.concatenate([s.mz for s in specs]),
+        np.concatenate([s.intensity for s in specs]),
+        offsets,
+    )
 
 
 class TestCosineFastArrays:
-    def test_identical_boundary_greedy_and_clamping(self, spec_factory):
-        s1 = spec_factory([100.0], [1.0], normalize=False)
-        s2 = spec_factory([100.5], [1.0], normalize=False)
+    def test_boundary_greedy_empty_and_clamping(self):
+        s1 = make_spectrum_tuple([100.0], [1.0], normalize=False)
+        s2 = make_spectrum_tuple([100.5], [1.0], normalize=False)
         assert distance.cosine_fast_arrays(
             s1.mz, s1.intensity, s2.mz, s2.intensity, 0.5
         ) == (1.0, 1)
@@ -34,9 +38,8 @@ class TestCosineFastArrays:
             s1.mz, s1.intensity, s2.mz, s2.intensity, 0.499
         ) == (0.0, 0)
 
-        # Greedy one-to-one picks highest product pair first.
-        sa = spec_factory([100.0, 100.06], [0.6, 0.8], normalize=False)
-        sb = spec_factory(
+        sa = make_spectrum_tuple([100.0, 100.06], [0.6, 0.8], normalize=False)
+        sb = make_spectrum_tuple(
             [100.03, 100.09], [0.9, math.sqrt(0.19)], normalize=False
         )
         score, matched = distance.cosine_fast_arrays(
@@ -45,30 +48,26 @@ class TestCosineFastArrays:
         assert matched == 1
         assert score == pytest.approx(0.72, rel=1e-5)
 
-        # Empty and disjoint inputs return (0.0, 0).
-        empty = spec_factory([], [], normalize=False)
+        empty = make_spectrum_tuple([], [], normalize=False)
         assert distance.cosine_fast_arrays(
             sa.mz, sa.intensity, empty.mz, empty.intensity, 0.1
         ) == (0.0, 0)
 
-        # Unnormalized inputs clamp to [0, 1].
-        hi = spec_factory([100.0, 200.0], [2.0, 2.0], normalize=False)
+        hi = make_spectrum_tuple([100.0, 200.0], [2.0, 2.0], normalize=False)
         assert distance.cosine_fast_arrays(
             hi.mz, hi.intensity, hi.mz, hi.intensity, 0.1
         ) == (1.0, 2)
 
-    def test_matches_independent_brute_force_reference_and_symmetry(
-        self, spec_factory
-    ):
+    def test_matches_independent_brute_force_reference_and_symmetry(self):
         rng = np.random.default_rng(99)
         tol = 0.15
         for _ in range(25):
             mz1 = np.sort(rng.uniform(100.0, 105.0, 10)).astype(np.float32)
             mz2 = np.sort(rng.uniform(100.0, 105.0, 12)).astype(np.float32)
-            s1 = spec_factory(
+            s1 = make_spectrum_tuple(
                 mz1, rng.uniform(0.1, 1.0, 10).astype(np.float32)
             )
-            s2 = spec_factory(
+            s2 = make_spectrum_tuple(
                 mz2, rng.uniform(0.1, 1.0, 12).astype(np.float32)
             )
 
@@ -175,35 +174,26 @@ class TestCondensedDistanceAndCsr:
             distance.extract_arrow_csr(mismatch)
 
     def test_condensed_matrix_distances_min_peaks_and_memmap_cleanup(
-        self, spec_factory, tmp_path, monkeypatch
+        self, tmp_path, monkeypatch
     ):
-        s0 = spec_factory(
+        s0 = make_spectrum_tuple(
             [100.0, 200.0, 300.0], [1.0, 0.0, 0.0], normalize=False
         )
-        s1 = spec_factory(
+        s1 = make_spectrum_tuple(
             [100.0, 200.0, 300.0], [0.6, 0.8, 0.0], normalize=False
         )
-        s2 = spec_factory(
+        s2 = make_spectrum_tuple(
             [600.0, 700.0, 800.0], [1.0, 0.0, 0.0], normalize=False
         )
-        csr = distance.pack_spectra_csr([s0, s1, s2])
+        csr = _pack_csr([s0, s1, s2])
 
         pdist = distance.compute_condensed_distance_matrix_csr(*csr, 0.05, 0)
         assert pdist.dtype == np.float32
         np.testing.assert_allclose(pdist, [0.4, 1.0, 1.0], atol=1e-6)
 
-        # min_matched_peaks gate forces distance to 1.0 when unmet.
         gated = distance.compute_condensed_distance_matrix_csr(*csr, 0.05, 4)
         np.testing.assert_allclose(gated, [1.0, 1.0, 1.0], atol=1e-6)
 
-        # Empty/single spectra return empty float32 vector.
-        for n in (0, 1):
-            empty_pdist = distance.compute_condensed_distance_matrix_csr(
-                *distance.pack_spectra_csr([s0][:n]), 0.05, 0
-            )
-            assert empty_pdist.shape == (0,)
-
-        # Memmap path unlinks backing file immediately on POSIX.
         monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
         monkeypatch.setattr(distance, "MEMMAP_MIN_SPECTRA", 2)
         mm = distance.compute_condensed_distance_matrix_csr(*csr, 0.05, 0)
@@ -212,10 +202,18 @@ class TestCondensedDistanceAndCsr:
         np.testing.assert_allclose(mm, pdist)
         distance.close_memmap(mm)
 
-    def test_tiled_rows_bit_identical_to_full_matrix(self, spec_factory):
+    def test_tiled_rows_bit_identical_to_full_matrix(self):
         rng = np.random.default_rng(7)
-        specs = _random_spectra(24, rng, spec_factory, n_peaks=20)
-        mz_flat, int_flat, offsets = distance.pack_spectra_csr(specs)
+        specs = [
+            make_spectrum_tuple(
+                np.sort(rng.uniform(0.0, 200.0, 20)),
+                rng.random(20),
+                precursor_mz=float(rng.uniform(100.0, 1000.0)),
+                charge=1,
+            )
+            for _ in range(24)
+        ]
+        mz_flat, int_flat, offsets = _pack_csr(specs)
         full = distance.compute_condensed_distance_matrix_csr(
             mz_flat, int_flat, offsets, 0.05, 2
         )

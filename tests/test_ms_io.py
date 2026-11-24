@@ -1,6 +1,5 @@
 """Unit tests for falcon.ms_io readers, MGF writer, and dispatch."""
 
-import io
 import logging
 import math
 import shutil
@@ -9,6 +8,12 @@ import numpy as np
 import pytest
 
 from falcon import ms_io
+from tests.helpers import (
+    make_consensus_record,
+    write_mgf,
+    write_toy_mzml,
+    write_toy_mzxml,
+)
 
 
 class TestDispatch:
@@ -27,27 +32,7 @@ class TestDispatch:
         with pytest.raises(ValueError, match="Unsupported peak file format"):
             ms_io.write_spectra(tmp_path / "out.mzml", [])
 
-    @pytest.mark.parametrize("ext", [".mgf", ".MGF"])
-    def test_mgf_dispatch_and_write_case_insensitive(
-        self, tmp_path, ext, consensus_factory
-    ):
-        rep = consensus_factory(
-            precursor_mz=500.0,
-            charge=2,
-            mz=(150.0, 300.0),
-            intensity=(0.5, 1.0),
-            rt=42.0,
-            cluster_id=7,
-        )
-        out = tmp_path / f"reps{ext}"
-        ms_io.write_spectra(out, [rep])
-        read_back = list(ms_io.get_spectra(out))
-        assert len(read_back) == 1
-        assert read_back[0].precursor_mz == pytest.approx(500.0)
-        assert read_back[0].precursor_charge == 2
-        assert read_back[0].retention_time == pytest.approx(42.0)
-
-    def test_xml_dispatch_case_insensitive(self, tmp_path, data_dir):
+    def test_case_insensitive_extension_dispatch(self, tmp_path, data_dir):
         for src_name, dst_name in (
             ("sample.mzml", "run.MZML"),
             ("sample.mzxml", "run.MZXML"),
@@ -60,10 +45,10 @@ class TestDispatch:
 
 
 class TestMgfReaderAndWriter:
-    def test_parses_metadata_rt_range_negative_charge_and_identifiers(
-        self, tmp_path, mgf_writer
+    def test_parses_metadata_rt_range_negative_charge_and_skips_malformed(
+        self, tmp_path
     ):
-        mgf = mgf_writer(
+        mgf = write_mgf(
             tmp_path / "run.v1.mgf",
             [
                 "BEGIN IONS\n"
@@ -87,6 +72,8 @@ class TestMgfReaderAndWriter:
                 "PEPMASS=400.0\n"
                 "100.0 10.0\n"
                 "END IONS\n",
+                "BEGIN IONS\nTITLE=bad_no_pepmass\n100.0 10.0\nEND IONS\n",
+                "BEGIN IONS\nPEPMASS=nan\nSCANS=6\n100.0 10.0\nEND IONS\n",
                 "BEGIN IONS\nPEPMASS=700.0\n100.0 10.0\nEND IONS\n",
             ],
         )
@@ -95,7 +82,7 @@ class TestMgfReaderAndWriter:
             "mzspec:PXD000001:run:scan:10",
             "run.v1:scan:20",
             "override:cluster:5",
-            "run.v1:index:3",
+            "run.v1:index:5",
         ]
         assert spectra[0].precursor_charge == 2
         assert spectra[0].retention_time == pytest.approx(105.0)
@@ -103,20 +90,9 @@ class TestMgfReaderAndWriter:
         assert math.isnan(spectra[1].retention_time)
         assert spectra[2].precursor_charge is None
 
-    def test_skips_malformed_mgf_entries_and_supports_streams(self):
-        stream = io.StringIO(
-            "BEGIN IONS\nTITLE=bad_no_pepmass\n100.0 10.0\nEND IONS\n"
-            "BEGIN IONS\nPEPMASS=nan\nSCANS=6\n100.0 10.0\nEND IONS\n"
-            "BEGIN IONS\nPEPMASS=500.0\nSCANS=7\n100.0 10.0\nEND IONS\n"
-        )
-        spectra = list(ms_io.read_mgf(stream))
-        assert [s.identifier for s in spectra] == ["unknown:scan:7"]
-
-    def test_mgf_writer_roundtrip_scaling_and_missing_fields(
-        self, tmp_path, consensus_factory
-    ):
+    def test_mgf_writer_roundtrip_scaling_and_atomic_failure(self, tmp_path):
         reps = [
-            consensus_factory(
+            make_consensus_record(
                 precursor_mz=500.0,
                 charge=2,
                 mz=(100.0, 200.0),
@@ -124,7 +100,7 @@ class TestMgfReaderAndWriter:
                 rt=60.0,
                 cluster_id=0,
             ),
-            consensus_factory(
+            make_consensus_record(
                 precursor_mz=600.0,
                 charge=-2,
                 mz=(150.0, 250.0),
@@ -132,7 +108,7 @@ class TestMgfReaderAndWriter:
                 rt=None,
                 cluster_id=1,
             ),
-            consensus_factory(
+            make_consensus_record(
                 precursor_mz=700.0,
                 charge=None,
                 mz=(300.0,),
@@ -141,7 +117,7 @@ class TestMgfReaderAndWriter:
                 cluster_id=2,
             ),
         ]
-        out = tmp_path / "reps.mgf"
+        out = tmp_path / "reps.MGF"
         ms_io.write_spectra(out, reps)
         text = out.read_text(encoding="utf-8")
         assert "CHARGE=2+" in text
@@ -154,9 +130,10 @@ class TestMgfReaderAndWriter:
         assert math.isnan(read_back[1].retention_time)
         assert read_back[2].precursor_charge is None
 
-        # Non-finite peaks fail without leaving a partial file.
         bad_path = tmp_path / "bad.mgf"
-        bad_rep = consensus_factory(mz=(100.0, np.nan), intensity=(1.0, 1.0))
+        bad_rep = make_consensus_record(
+            mz=(100.0, np.nan), intensity=(1.0, 1.0)
+        )
         with pytest.raises(ValueError, match="finite"):
             ms_io.write_spectra(bad_path, [bad_rep])
         assert not bad_path.exists()
@@ -164,7 +141,7 @@ class TestMgfReaderAndWriter:
 
 class TestXmlReaders:
     def test_mzml_sample_negative_scan_possible_charge_and_missing_scan(
-        self, tmp_path, data_dir, mzml_writer, caplog
+        self, tmp_path, data_dir, caplog
     ):
         sample = list(ms_io.read_mzml(data_dir / "sample.mzml"))
         assert len(sample) == 1
@@ -172,7 +149,7 @@ class TestXmlReaders:
         assert sample[0].precursor_mz == pytest.approx(400.0, rel=1e-4)
         assert sample[0].precursor_charge == 2
 
-        custom = mzml_writer(
+        custom = write_toy_mzml(
             tmp_path / "custom.mzml",
             [
                 {
@@ -209,14 +186,14 @@ class TestXmlReaders:
         assert any("unrecognized id" in r.message for r in caplog.records)
 
     def test_mzxml_sample_negative_polarity_and_bad_xml_warning(
-        self, tmp_path, data_dir, mzxml_writer, caplog
+        self, tmp_path, data_dir, caplog
     ):
         sample = list(ms_io.read_mzxml(data_dir / "sample.mzxml"))
         assert len(sample) == 1
         assert sample[0].identifier == "sample:scan:2"
         assert sample[0].precursor_charge == 2
 
-        custom = mzxml_writer(
+        custom = write_toy_mzxml(
             tmp_path / "neg.mzxml",
             [
                 {

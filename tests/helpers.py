@@ -1,4 +1,4 @@
-"""Pure synthetic data builders and constants shared across tests."""
+"""Synthetic data builders and constants shared across tests."""
 
 from __future__ import annotations
 
@@ -7,14 +7,13 @@ import struct
 from typing import TYPE_CHECKING, Any
 
 from falcon.config import ClusteringConfig, PrecursorTolerance, load_config
-from falcon.types import SpectrumTuple, make_consensus_tuple
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
     from pathlib import Path
 
+    from falcon.cluster.consensus import ConsensusTuple, SpectrumTuple
     from falcon.config import FalconConfig
-    from falcon.types import ConsensusTuple
 
 TOY_PEAKS_5: list[tuple[float, float]] = [
     (150.0, 100.0),
@@ -38,6 +37,8 @@ def make_spectrum_tuple(
 ) -> SpectrumTuple:
     """Build a ``SpectrumTuple`` with float32 arrays and optional L2 norm."""
     import numpy as np
+
+    from falcon.cluster.consensus import SpectrumTuple
 
     mz_arr = np.asarray(mz, dtype=np.float32)
     int_arr = np.asarray(intensity, dtype=np.float32)
@@ -63,6 +64,8 @@ def make_consensus_record(
 ) -> ConsensusTuple:
     """Build a toy ``ConsensusTuple`` via ``make_consensus_tuple``."""
     import numpy as np
+
+    from falcon.cluster.consensus import make_consensus_tuple
 
     return make_consensus_tuple(
         precursor_mz=precursor_mz,
@@ -161,51 +164,33 @@ def write_toy_mzml(path: Path, spectra_specs: list[dict[str, Any]]) -> Path:
     for idx, spec in enumerate(spectra_specs):
         scan_nr = spec.get("scan", idx + 1)
         id_str = spec.get(
-            "id_str",
-            f"controllerType=0 controllerNumber=1 scan={scan_nr}",
+            "id_str", f"controllerType=0 controllerNumber=1 scan={scan_nr}"
         )
         ms_level = spec.get("ms_level", 2)
         mzs = [float(v) for v in spec.get("mz", ())]
         intensities = [float(v) for v in spec.get("intensity", ())]
-        raw_mz_b64 = spec.get("raw_mz_b64")
-        mz_b64 = (
-            raw_mz_b64
-            if raw_mz_b64 is not None
-            else base64.b64encode(struct.pack(f"<{len(mzs)}d", *mzs)).decode(
-                "ascii"
-            )
+        mz_b64 = base64.b64encode(struct.pack(f"<{len(mzs)}d", *mzs)).decode(
+            "ascii"
         )
         int_b64 = base64.b64encode(
             struct.pack(f"<{len(intensities)}d", *intensities)
         ).decode("ascii")
-        default_len = len(mzs) if raw_mz_b64 is None else max(len(mzs), 1)
 
         if spec.get("omit_scan_list"):
             scan_xml = ""
-        elif "rt" in spec and spec["rt"] is not None:
-            unit_attr = ' unitName="second"' if spec["rt"] != "" else ""
+        elif spec.get("rt") is not None:
             scan_xml = (
                 '    <scanList count="1"><scan>'
                 '<cvParam cvRef="MS" accession="MS:1000016" '
-                f'name="scan start time" value="{spec["rt"]}"{unit_attr}/>'
-                "</scan></scanList>\n"
+                f'name="scan start time" value="{spec["rt"]}" '
+                'unitName="second"/></scan></scanList>\n'
             )
         else:
             scan_xml = '    <scanList count="1"><scan/></scanList>\n'
 
         prec_xml = ""
-        if spec.get("empty_selected_ions"):
-            prec_xml = (
-                '    <precursorList count="1"><precursor>'
-                '<selectedIonList count="0"/>'
-                "</precursor></precursorList>\n"
-            )
-        elif (
-            ms_level is not None
-            and ms_level > 1
-            and spec.get("precursor_mz") is not None
-        ):
-            charge_parts: list[str] = []
+        if ms_level > 1 and spec.get("precursor_mz") is not None:
+            charge_parts = []
             if spec.get("charge") is not None:
                 charge_parts.append(
                     '<cvParam cvRef="MS" accession="MS:1000041" '
@@ -226,35 +211,24 @@ def write_toy_mzml(path: Path, spectra_specs: list[dict[str, Any]]) -> Path:
                 "</precursor></precursorList>\n"
             )
 
-        cv_parts: list[str] = []
-        if ms_level is not None:
-            cv_parts.append(
-                '    <cvParam cvRef="MS" accession="MS:1000511" '
-                f'name="ms level" value="{ms_level}"/>\n'
-            )
+        cv_parts = [
+            '    <cvParam cvRef="MS" accession="MS:1000511" '
+            f'name="ms level" value="{ms_level}"/>\n'
+        ]
         if spec.get("negative_scan"):
             cv_parts.append(
                 '    <cvParam cvRef="MS" accession="MS:1000129" '
                 'name="negative scan"/>\n'
             )
-        if spec.get("extra_cv"):
-            cv_parts.append(f"    {spec['extra_cv']}\n")
-
-        mz_extra_cv = (
-            f"      {spec['mz_extra_cv']}\n" if spec.get("mz_extra_cv") else ""
-        )
 
         blocks.append(
             f'   <spectrum index="{idx}" id="{id_str}" '
-            f'defaultArrayLength="{default_len}">\n'
-            f"{''.join(cv_parts)}"
-            f"{scan_xml}"
-            f"{prec_xml}"
+            f'defaultArrayLength="{len(mzs)}">\n'
+            f"{''.join(cv_parts)}{scan_xml}{prec_xml}"
             '    <binaryDataArrayList count="2">\n'
             f'     <binaryDataArray encodedLength="{len(mz_b64)}">\n'
             '      <cvParam cvRef="MS" accession="MS:1000523" '
             'name="64-bit float"/>\n'
-            f"{mz_extra_cv}"
             '      <cvParam cvRef="MS" accession="MS:1000514" '
             'name="m/z array"/>\n'
             f"      <binary>{mz_b64}</binary>\n"
@@ -294,52 +268,39 @@ def write_toy_mzxml(path: Path, spectra_specs: list[dict[str, Any]]) -> Path:
         ms_level = spec.get("ms_level", 2)
         mzs = [float(v) for v in spec.get("mz", ())]
         intensities = [float(v) for v in spec.get("intensity", ())]
-        raw_peaks_b64 = spec.get("raw_peaks_b64")
-        if raw_peaks_b64 is not None:
-            peaks_b64 = raw_peaks_b64
-            peaks_count = max(len(mzs), 1)
-        else:
-            interleaved = []
-            for mz_val, int_val in zip(mzs, intensities, strict=True):
-                interleaved.extend([mz_val, int_val])
-            peaks_b64 = base64.b64encode(
-                struct.pack(f">{len(interleaved)}f", *interleaved)
-            ).decode("ascii")
-            peaks_count = len(mzs)
+        interleaved = [
+            v for pair in zip(mzs, intensities, strict=True) for v in pair
+        ]
+        peaks_b64 = base64.b64encode(
+            struct.pack(f">{len(interleaved)}f", *interleaved)
+        ).decode("ascii")
 
-        raw_attrs = spec.get("raw_attrs")
-        if raw_attrs is not None:
-            attrs = [raw_attrs]
-            if "peaksCount=" not in raw_attrs:
-                attrs.append(f'peaksCount="{peaks_count}"')
-        else:
-            attrs = [f'num="{scan_num}"']
-            if ms_level is not None:
-                attrs.append(f'msLevel="{ms_level}"')
-            if spec.get("polarity") is not None:
-                attrs.append(f'polarity="{spec["polarity"]}"')
-            attrs.append(f'peaksCount="{peaks_count}"')
-            if "rt" in spec and spec["rt"] is not None:
-                attrs.append(f'retentionTime="PT{spec["rt"]}S"')
+        attrs = [
+            f'num="{scan_num}"',
+            f'msLevel="{ms_level}"',
+            f'peaksCount="{len(mzs)}"',
+        ]
+        if spec.get("polarity") is not None:
+            attrs.append(f'polarity="{spec["polarity"]}"')
+        if spec.get("rt") is not None:
+            attrs.append(f'retentionTime="PT{spec["rt"]}S"')
 
         prec_xml = ""
         if spec.get("precursor_mz") is not None:
-            if spec.get("charge") is not None:
-                charge_attr = f' precursorCharge="{spec["charge"]}"'
-            elif spec.get("empty_charge"):
-                charge_attr = ' precursorCharge=""'
-            else:
-                charge_attr = ""
+            charge_attr = (
+                f' precursorCharge="{spec["charge"]}"'
+                if spec.get("charge") is not None
+                else ""
+            )
             prec_xml = (
                 f"   <precursorMz{charge_attr}>"
                 f"{spec['precursor_mz']}</precursorMz>\n"
             )
 
-        compression = spec.get("compression", "none")
         scans.append(
             f"  <scan {' '.join(attrs)}>\n"
             f"{prec_xml}"
-            f'   <peaks compressionType="{compression}" precision="32" '
+            '   <peaks compressionType="none" precision="32" '
             f'byteOrder="network" contentType="m/z-int">{peaks_b64}</peaks>\n'
             "  </scan>\n"
         )

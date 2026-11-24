@@ -13,14 +13,6 @@ if TYPE_CHECKING:
 
     from ..config import ClusteringConfig
 
-__all__ = [
-    "cut_linkage",
-    "iter_cluster_groups",
-    "linkage_1d",
-    "postprocess_cluster",
-    "refine_clusters",
-]
-
 
 def cut_linkage(linkage_matrix: np.ndarray, threshold: float) -> np.ndarray:
     """Cut a linkage tree into 0-based int32 cluster labels."""
@@ -29,23 +21,24 @@ def cut_linkage(linkage_matrix: np.ndarray, threshold: float) -> np.ndarray:
     )
 
 
-@nb.njit(cache=True)
 def iter_cluster_groups(clusters: np.ndarray) -> Iterator[tuple[int, int]]:
     """
     Yield ``(start, stop)`` index slices for contiguous cluster labels.
 
     Each ``-1`` noise entry is yielded as its own length-1 slice.
     """
-    n = clusters.shape[0]
-    pos = 0
-    while pos < n:
-        label = clusters[pos]
-        start_i = pos
-        pos += 1
-        if label != -1:
-            while pos < n and clusters[pos] == label:
-                pos += 1
-        yield start_i, pos
+    n = len(clusters)
+    if n == 0:
+        return
+    breaks = (
+        np.flatnonzero((clusters[1:] != clusters[:-1]) | (clusters[:-1] == -1))
+        + 1
+    ).tolist()
+    prev = 0
+    for pos in breaks:
+        yield prev, pos
+        prev = pos
+    yield prev, n
 
 
 @nb.njit(cache=True)
@@ -146,19 +139,15 @@ def postprocess_cluster(
     cluster_labels: np.ndarray,
     cluster_mzs: np.ndarray,
     cluster_rts: np.ndarray,
-    precursor_tol_mass: float,
-    precursor_tol_mode: str,
-    rt_tol: float | None,
+    clustering: ClusteringConfig,
     min_samples: int,
     start_label: int,
 ) -> int:
     """
     Refine an initial cluster by precursor m/z and optional RT span.
 
-    Splits by full precursor m/z span via 1D complete linkage, then
-    optionally refines each m/z sub-cluster independently by RT. Writes
-    contiguous labels starting at ``start_label`` in place and returns
-    the number of resulting clusters (including singletons).
+    Writes contiguous int32 labels starting at ``start_label`` in place
+    and returns the number of resulting clusters (including singletons).
     """
     n_points = cluster_labels.shape[0]
     if n_points <= 1 or n_points < min_samples:
@@ -168,11 +157,12 @@ def postprocess_cluster(
         return n_points
 
     assignments = cut_linkage(
-        linkage_1d(cluster_mzs, precursor_tol_mode), precursor_tol_mass
+        linkage_1d(cluster_mzs, clustering.precursor_tol.mode),
+        clustering.precursor_tol.mass,
     )
-    if rt_tol is not None:
+    if clustering.rt_tol is not None:
         assignments = _refine_assignments_by_rt(
-            assignments, cluster_rts, rt_tol, max(2, min_samples)
+            assignments, cluster_rts, clustering.rt_tol, max(2, min_samples)
         )
 
     counts = np.bincount(assignments)
@@ -221,9 +211,7 @@ def refine_clusters(
             refined_labels[start_i:stop_i],
             mzs_ord[start_i:stop_i],
             rts_ord[start_i:stop_i],
-            clustering.precursor_tol.mass,
-            clustering.precursor_tol.mode,
-            clustering.rt_tol,
+            clustering,
             min_samples,
             current_label,
         )

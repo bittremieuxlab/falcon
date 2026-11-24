@@ -1,39 +1,88 @@
-"""Representative spectrum selection via medoids or peak averaging."""
+"""Representative spectrum records, medoid selection, and averaging."""
 
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import numba as nb
 import numpy as np
 
-from ..types import (
-    DEFAULT_OUTLIER_CUTOFF_LOWER,
-    DEFAULT_OUTLIER_CUTOFF_UPPER,
-    ConsensusTuple,
-    make_consensus_tuple,
-    mz_bin_bounds,
-)
-from .distance import condensed_index, pack_spectra_csr
+from ..config import mz_bin_bounds
+from .distance import condensed_index
 from .refine import iter_cluster_groups
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from ..config import ConsensusConfig
-    from ..types import SpectrumTuple
 
 _MIN_MEDOID_CLUSTER_SIZE = 3
 _MIN_BIN_OCCUPANCY_FRACTION = 0.7
 
-__all__ = [
-    "bin_cluster_peaks",
-    "get_cluster_averages",
-    "get_cluster_medoids",
-    "get_representative_spectra",
-    "sigma_clip",
-]
+
+class SpectrumTuple(NamedTuple):
+    """Compact spectrum record for similarity and consensus code."""
+
+    precursor_mz: float | np.floating[Any]
+    precursor_charge: Any
+    mz: np.ndarray
+    intensity: np.ndarray
+
+
+class ConsensusTuple(NamedTuple):
+    """Representative spectrum produced for one cluster."""
+
+    precursor_mz: np.float32
+    precursor_charge: np.int32 | float
+    mz: np.ndarray
+    intensity: np.ndarray
+    retention_time: np.float32
+    cluster_id: np.int32
+
+    @classmethod
+    def from_spectrum(
+        cls,
+        spec: SpectrumTuple,
+        retention_time: float | np.floating[Any],
+        cluster_id: int,
+    ) -> ConsensusTuple:
+        """Build a ``ConsensusTuple`` from a ``SpectrumTuple``."""
+        return make_consensus_tuple(
+            precursor_mz=spec.precursor_mz,
+            precursor_charge=spec.precursor_charge,
+            mz=spec.mz,
+            intensity=spec.intensity,
+            retention_time=retention_time,
+            cluster_id=cluster_id,
+        )
+
+
+def make_consensus_tuple(
+    precursor_mz: float | np.floating[Any],
+    precursor_charge: Any,
+    mz: np.ndarray,
+    intensity: np.ndarray,
+    retention_time: float | np.floating[Any],
+    cluster_id: int,
+) -> ConsensusTuple:
+    """
+    Construct a ``ConsensusTuple`` with canonical float32/int32 dtypes.
+
+    Missing or non-finite precursor charges normalize to ``np.nan``.
+    """
+    if precursor_charge is None or not math.isfinite(float(precursor_charge)):
+        norm_charge: np.int32 | float = np.nan
+    else:
+        norm_charge = np.int32(int(precursor_charge))
+    return ConsensusTuple(
+        precursor_mz=np.float32(precursor_mz),
+        precursor_charge=norm_charge,
+        mz=np.array(mz, dtype=np.float32, copy=True),
+        intensity=np.array(intensity, dtype=np.float32, copy=True),
+        retention_time=np.float32(retention_time),
+        cluster_id=np.int32(cluster_id),
+    )
 
 
 def get_representative_spectra(
@@ -44,33 +93,26 @@ def get_representative_spectra(
     consensus: ConsensusConfig,
     *,
     pdist: np.ndarray | None = None,
-    min_mz: float | None = None,
-    max_mz: float | None = None,
-    fragment_tol: float | None = None,
+    min_mz: float = 101.0,
+    max_mz: float = 1500.0,
+    fragment_tol: float = 0.05,
 ) -> list[ConsensusTuple]:
     """Compute a representative spectrum per cluster in an interval."""
     if consensus.method == "medoid":
         if pdist is None:
             raise ValueError("pdist is required for medoid consensus")
         return get_cluster_medoids(spectra, labels, rts, order_map, pdist)
-    if consensus.method == "average":
-        if min_mz is None or max_mz is None or fragment_tol is None:
-            raise ValueError(
-                "min_mz, max_mz, and fragment_tol are required for "
-                "average consensus"
-            )
-        return get_cluster_averages(
-            spectra,
-            labels,
-            rts,
-            order_map,
-            min_mz=min_mz,
-            max_mz=max_mz,
-            fragment_tol=fragment_tol,
-            outlier_cutoff_lower=consensus.outlier_cutoff_lower,
-            outlier_cutoff_upper=consensus.outlier_cutoff_upper,
-        )
-    raise ValueError(f"Unsupported consensus config: {consensus!r}")
+    return get_cluster_averages(
+        spectra,
+        labels,
+        rts,
+        order_map,
+        min_mz=min_mz,
+        max_mz=max_mz,
+        fragment_tol=fragment_tol,
+        outlier_cutoff_lower=consensus.outlier_cutoff_lower,
+        outlier_cutoff_upper=consensus.outlier_cutoff_upper,
+    )
 
 
 @nb.njit(cache=True, boundscheck=False)
@@ -84,8 +126,6 @@ def _select_medoid_positions(
     positions = np.empty(n, dtype=np.int64)
     group_idx = 0
     pos = 0
-    # Keep group scanning inline: calling a cached @njit generator from
-    # another cached @njit kernel triggers Numba cache KeyError bugs.
     while pos < n:
         label = labels[pos]
         start_i = pos
@@ -150,33 +190,35 @@ def bin_cluster_peaks(
     Returns ``(sorted_mz, sorted_intensity, bin_starts, bin_stops)``.
     """
     n_spectra = len(spectra)
-    empty_f32 = np.empty(0, dtype=np.float32)
-    empty_i64 = np.empty(0, dtype=np.int64)
-    if n_spectra == 0:
-        return empty_f32, empty_f32, empty_i64, empty_i64
-
-    all_mz, all_int, offsets = pack_spectra_csr(spectra)
-    if len(all_mz) == 0:
-        return empty_f32, empty_f32, empty_i64, empty_i64
-
-    spec_ids = np.repeat(
-        np.arange(n_spectra, dtype=np.int32), np.diff(offsets)
+    empty = (
+        np.empty(0, dtype=np.float32),
+        np.empty(0, dtype=np.float32),
+        np.empty(0, dtype=np.int64),
+        np.empty(0, dtype=np.int64),
     )
+    lengths = [len(s.mz) for s in spectra]
+    if n_spectra == 0 or sum(lengths) == 0:
+        return empty
+
+    all_mz = np.concatenate(
+        [np.asarray(s.mz, dtype=np.float32) for s in spectra]
+    )
+    all_int = np.concatenate(
+        [np.asarray(s.intensity, dtype=np.float32) for s in spectra]
+    )
+    spec_ids = np.repeat(np.arange(n_spectra, dtype=np.int32), lengths)
+
     bin_idx = np.floor((all_mz.astype(np.float64) - start_dim) / bin_size)
     valid = (bin_idx >= 0) & (bin_idx < n_bins)
     if not np.any(valid):
-        return empty_f32, empty_f32, empty_i64, empty_i64
+        return empty
 
     bin_idx_i64 = bin_idx[valid].astype(np.int64)
-    all_mz = all_mz[valid]
-    all_int = all_int[valid]
-    spec_ids = spec_ids[valid]
-
     order = np.argsort(bin_idx_i64, kind="stable")
     sorted_bins = bin_idx_i64[order]
-    sorted_mz = all_mz[order]
-    sorted_int = all_int[order]
-    sorted_spec_ids = spec_ids[order]
+    sorted_mz = all_mz[valid][order]
+    sorted_int = all_int[valid][order]
+    sorted_spec_ids = spec_ids[valid][order]
 
     bin_changed = sorted_bins[1:] != sorted_bins[:-1]
     change = np.flatnonzero(bin_changed) + 1
@@ -193,21 +235,8 @@ def bin_cluster_peaks(
     distinct_spectra = np.add.reduceat(is_new_spec, starts)
     keep = distinct_spectra >= _MIN_BIN_OCCUPANCY_FRACTION * n_spectra
     if not np.any(keep):
-        return empty_f32, empty_f32, empty_i64, empty_i64
+        return empty
     return sorted_mz, sorted_int, starts[keep], stops[keep]
-
-
-@nb.njit(cache=True)
-def _std_float64(values: np.ndarray) -> float:
-    n = len(values)
-    mean = 0.0
-    m2 = 0.0
-    for i in range(n):
-        x = float(values[i])
-        delta = x - mean
-        mean += delta / (i + 1)
-        m2 += delta * (x - mean)
-    return math.sqrt(max(0.0, m2 / n))
 
 
 @nb.njit(cache=True)
@@ -219,13 +248,14 @@ def sigma_clip(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Clip intensity outliers iteratively in an m/z bin in float64."""
     while len(intensities) > 2:
-        med = float(np.median(intensities.astype(np.float64)))
-        std = _std_float64(intensities)
+        vals_f64 = intensities.astype(np.float64)
+        med = float(np.median(vals_f64))
+        std = float(np.std(vals_f64))
         if std == 0.0:
             break
-        lower_bound = med - outlier_cutoff_lower * std
-        upper_bound = med + outlier_cutoff_upper * std
-        mask = (intensities >= lower_bound) & (intensities <= upper_bound)
+        lower = med - outlier_cutoff_lower * std
+        upper = med + outlier_cutoff_upper * std
+        mask = (intensities >= lower) & (intensities <= upper)
         if np.sum(mask) == len(intensities):
             break
         intensities = intensities[mask]
@@ -279,8 +309,8 @@ def get_cluster_averages(
     min_mz: float,
     max_mz: float,
     fragment_tol: float,
-    outlier_cutoff_lower: float = DEFAULT_OUTLIER_CUTOFF_LOWER,
-    outlier_cutoff_upper: float = DEFAULT_OUTLIER_CUTOFF_UPPER,
+    outlier_cutoff_lower: float = 1.5,
+    outlier_cutoff_upper: float = 1.5,
 ) -> list[ConsensusTuple]:
     """
     Compute intensity-averaged consensus spectra for each cluster.
