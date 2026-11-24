@@ -10,10 +10,9 @@ from falcon.cluster import (
     engine,
     generate_clusters,
     generate_clusters_multi,
-    scheduling,
 )
 from falcon.config import AverageConsensusConfig, MedoidConsensusConfig
-from falcon.dataset import CANONICAL_SORT_COLUMNS, read_canonical_metadata
+from falcon.staging import CANONICAL_SORT_COLUMNS, read_canonical_metadata
 from falcon.types import ClusterResult
 
 pytestmark = pytest.mark.integration
@@ -26,16 +25,18 @@ def _attach_labels(dataset, labels):
 
 
 def _spy_giant_allocations(monkeypatch) -> list[int]:
-    """Record how many giant intervals each clustering run allocates."""
-    seen: list[int] = []
-    real_alloc = engine.allocate_giant_tiles
+    """Record how many giant memmaps are allocated per clustering run."""
+    counts: list[int] = []
+    real_alloc = engine.GiantMemmapStore.allocate
 
-    def _spy(raw_giants, *args, **kwargs):
-        seen.append(len(raw_giants))
-        return real_alloc(raw_giants, *args, **kwargs)
+    def _spy(self, giant_idx, n_spectra):
+        if giant_idx == 0:
+            counts.append(0)
+        counts[-1] += 1
+        return real_alloc(self, giant_idx, n_spectra)
 
-    monkeypatch.setattr(engine, "allocate_giant_tiles", _spy)
-    return seen
+    monkeypatch.setattr(engine.GiantMemmapStore, "allocate", _spy)
+    return counts
 
 
 class TestClusteringPipelineIntegration:
@@ -149,9 +150,9 @@ class TestClusteringPipelineIntegration:
         monkeypatch.setattr(tempfile, "tempdir", str(temp_sub))
         # Lower pair-per-tile budget and pin worker count so n=6 always
         # runs >= 2 parallel tiles even on 1-vCPU runners.
-        monkeypatch.setattr(scheduling, "MIN_PAIRS_PER_TILE", 4)
+        monkeypatch.setattr(engine, "MIN_PAIRS_PER_TILE", 4)
         monkeypatch.setattr(engine, "effective_n_workers", lambda: 4)
-        assert len(scheduling.plan_tile_bounds(6, n_workers=4)) >= 2
+        assert len(engine.plan_tile_bounds(6, n_workers=4)) >= 2
 
         seen_giants = _spy_giant_allocations(monkeypatch)
 
@@ -160,6 +161,7 @@ class TestClusteringPipelineIntegration:
             (MedoidConsensusConfig(), temp_sub),
             (AverageConsensusConfig(), None),
         ):
+            before = len(seen_giants)
             res_giant = generate_clusters(
                 dataset,
                 da_clustering_factory(batch_size=8),
@@ -168,6 +170,7 @@ class TestClusteringPipelineIntegration:
                 max_mz=700.0,
                 temp_dir=memmap_dir,
             )
+            assert len(seen_giants) == before + 1
             assert seen_giants[-1] >= 1
             res_normal = generate_clusters(
                 dataset,
@@ -176,7 +179,7 @@ class TestClusteringPipelineIntegration:
                 min_mz=100.0,
                 max_mz=700.0,
             )
-            assert seen_giants[-1] == 0
+            assert len(seen_giants) == before + 1
             assert isinstance(res_giant, ClusterResult)
             assert isinstance(res_normal, ClusterResult)
             labels_giant, reps_giant = res_giant
@@ -279,7 +282,7 @@ class TestClusteringPipelineIntegration:
             for i in range(8)
         ]
         ds = lance_dataset(rows)
-        monkeypatch.setattr(scheduling, "MIN_PAIRS_PER_TILE", 3)
+        monkeypatch.setattr(engine, "MIN_PAIRS_PER_TILE", 3)
         monkeypatch.setattr(engine, "effective_n_workers", lambda: 2)
         seen_giants = _spy_giant_allocations(monkeypatch)
         res = generate_clusters(

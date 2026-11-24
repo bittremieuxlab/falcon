@@ -1,112 +1,202 @@
-"""Unit tests for falcon.pipeline orchestration."""
+"""Unit tests for falcon.pipeline orchestration and CSV/MGF export."""
 
 import logging
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from falcon import pipeline
 from falcon.types import ClusterResult
 
 
-class TestWorkDirLifecycleAndWarnings:
-    def test_creates_and_cleans_temp_dir_without_mutating_config(
-        self, tmp_path, monkeypatch, config_factory, track_mkdtemp
+class TestPrepareOutputsAndExport:
+    def test_prepare_outputs_validation_and_overwrite_flag(
+        self, tmp_path, config_factory
     ):
-        observed = []
+        inp = tmp_path / "sample.mgf"
+        inp.write_text("MGF", encoding="utf-8")
+        prefix = tmp_path / "run_v1.2"
+        cfg = config_factory(
+            input_filenames=[str(inp)], output_filename=prefix
+        )
+        assert pipeline.prepare_outputs(cfg.io) is True
 
-        def _spy_stage(_cfg, work_dir, _proc):
-            observed.append((work_dir, (work_dir / "spectra").is_dir()))
-            return []
+        # Existing CSV or MGF blocks without overwrite.
+        csv_file = tmp_path / "run_v1.2.csv"
+        csv_file.write_text("keep", encoding="utf-8")
+        assert pipeline.prepare_outputs(cfg.io) is False
+        assert csv_file.read_text(encoding="utf-8") == "keep"
 
-        monkeypatch.setattr(pipeline, "load_or_stage_buckets", _spy_stage)
-        cfg = config_factory(output_filename=tmp_path / "temp_out")
+        # With overwrite=True, prepare_outputs allows run non-destructively.
+        cfg_ow = config_factory(
+            input_filenames=[str(inp)],
+            output_filename=prefix,
+            io={"overwrite": True},
+        )
+        assert pipeline.prepare_outputs(cfg_ow.io) is True
+        assert csv_file.read_text(encoding="utf-8") == "keep"
 
-        assert pipeline.run(cfg) == 0
-        assert cfg.io.work_dir is None
-        assert len(track_mkdtemp) == 1
-        assert observed == [(track_mkdtemp[0], True)]
-        assert not track_mkdtemp[0].exists()
+        # Colliding with input, work_dir, missing parent, or directory raises.
+        with pytest.raises(ValueError, match="aliases input file"):
+            pipeline.prepare_outputs(
+                config_factory(
+                    input_filenames=[str(inp)],
+                    output_filename=tmp_path / "sample",
+                ).io
+            )
+        with pytest.raises(ValueError, match="aliases working directory"):
+            pipeline.prepare_outputs(
+                config_factory(
+                    output_filename=tmp_path / "run",
+                    io={"work_dir": str(tmp_path / "run.csv")},
+                ).io
+            )
+        with pytest.raises(FileNotFoundError, match="Output directory"):
+            pipeline.prepare_outputs(
+                config_factory(
+                    output_filename=tmp_path / "no_such_dir" / "out"
+                ).io
+            )
+        (tmp_path / "dir_out.csv").mkdir()
+        with pytest.raises(IsADirectoryError, match="directory"):
+            pipeline.prepare_outputs(
+                config_factory(output_filename=tmp_path / "dir_out").io
+            )
 
-    def test_explicit_work_dir_new_and_existing_warns(
-        self, tmp_path, monkeypatch, caplog, config_factory
+    def test_export_results_offsets_natural_sorts_and_formats_nullable_int8(
+        self,
+        tmp_path,
+        lance_dataset,
+        spectrum_row,
+        consensus_factory,
+        config_factory,
+    ):
+        ds1 = lance_dataset(
+            [
+                spectrum_row("run:scan:10", 500.0, retention_time=10.0),
+                spectrum_row("run:scan:2", 500.0, retention_time=10.0),
+            ],
+            charge=2,
+        )
+        ds2 = lance_dataset(
+            [
+                spectrum_row(
+                    "run:scan:1",
+                    600.0,
+                    precursor_charge=None,
+                    retention_time=np.nan,
+                )
+            ],
+            charge="unknown",
+        )
+        labels1 = np.array([0, 0], dtype=np.int32)
+        labels2 = np.array([0], dtype=np.int32)
+        reps1 = [consensus_factory(precursor_mz=500.0, charge=2, cluster_id=0)]
+        reps2 = [
+            consensus_factory(precursor_mz=600.0, charge=None, cluster_id=0)
+        ]
+
+        out_prefix = tmp_path / "run_v1.2"
+        cfg = config_factory(
+            output_filename=out_prefix, io={"export_representatives": True}
+        )
+        pipeline.export_results(
+            cfg,
+            tmp_path,
+            [ds1, ds2],
+            [ClusterResult(labels1, reps1), ClusterResult(labels2, reps2)],
+        )
+
+        # Caller arrays must not be mutated.
+        np.testing.assert_array_equal(labels1, [0, 0])
+        np.testing.assert_array_equal(labels2, [0])
+
+        raw_lines = [
+            line
+            for line in (tmp_path / "run_v1.2.csv")
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if not line.startswith("#")
+        ]
+        rows_by_id = {
+            parts[0]: parts
+            for parts in (line.split(",") for line in raw_lines[1:])
+        }
+        # Known charge formats as integer "2" (never "2.0"), unknown as "".
+        assert rows_by_id["run:scan:2"][1] == "2"
+        assert rows_by_id["run:scan:1"][1] == ""
+
+        df = pd.read_csv(f"{out_prefix}.csv", comment="#")
+        assert list(df["identifier"]) == [
+            "run:scan:1",
+            "run:scan:2",
+            "run:scan:10",
+        ]
+        mgf_text = (tmp_path / "run_v1.2.mgf").read_text(encoding="utf-8")
+        assert "TITLE=falcon:cluster:0" in mgf_text
+        assert "TITLE=falcon:cluster:1" in mgf_text
+
+    def test_overwrite_clears_stale_mgf_when_representatives_disabled(
+        self, tmp_path, lance_dataset, spectrum_row, config_factory
+    ):
+        ds = lance_dataset([spectrum_row("s:1", 500.0)], charge=2)
+        prefix = tmp_path / "stale"
+        (tmp_path / "stale.csv").write_text("old", encoding="utf-8")
+        stale_mgf = tmp_path / "stale.mgf"
+        stale_mgf.write_text("old mgf", encoding="utf-8")
+        cfg = config_factory(
+            output_filename=prefix,
+            io={"overwrite": True, "export_representatives": False},
+        )
+        pipeline.export_results(
+            cfg, tmp_path, [ds], [ClusterResult(np.array([0], np.int32), [])]
+        )
+        assert not stale_mgf.exists()
+        assert (tmp_path / "stale.csv").is_file()
+
+
+class TestPipelineRunLifecycle:
+    def test_temp_work_dir_cleanup_and_explicit_work_dir_preservation(
+        self, tmp_path, monkeypatch, config_factory, track_mkdtemp
     ):
         monkeypatch.setattr(
             pipeline, "load_or_stage_buckets", lambda *_a, **_kw: []
         )
-        wd = tmp_path / "work"
-
-        # First run creates work_dir/spectra without warning.
-        cfg_new = config_factory(
-            output_filename=tmp_path / "out1",
-            io={"work_dir": str(wd)},
-        )
-        with caplog.at_level(logging.WARNING, logger="falcon"):
-            assert pipeline.run(cfg_new) == 0
-        assert (wd / "spectra").is_dir()
-        assert not any("already exists" in r.message for r in caplog.records)
-
-        # Second run with existing work_dir warns about cache reuse.
-        caplog.clear()
-        cfg_reuse = config_factory(
-            output_filename=tmp_path / "out2",
-            io={"work_dir": str(wd), "overwrite": False},
-        )
-        with caplog.at_level(logging.WARNING, logger="falcon"):
-            assert pipeline.run(cfg_reuse) == 0
-        assert any(
-            "already exists" in r.message and "reused" in r.message
-            for r in caplog.records
-        )
-
-        # Third run with overwrite=True warns about overwriting cache.
-        caplog.clear()
-        cfg_overwrite = config_factory(
-            output_filename=tmp_path / "out2",
-            io={"work_dir": str(wd), "overwrite": True},
-        )
-        with caplog.at_level(logging.WARNING, logger="falcon"):
-            assert pipeline.run(cfg_overwrite) == 0
-        assert any(
-            "already exists" in r.message and "overwritten" in r.message
-            for r in caplog.records
-        )
-
-    def test_explicit_relative_work_dir_is_absolutized(
-        self, tmp_path, monkeypatch, config_factory
-    ):
-        observed = []
-
-        def _spy_stage(_cfg, work_dir, _proc):
-            observed.append(work_dir)
-            return []
-
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setattr(pipeline, "load_or_stage_buckets", _spy_stage)
-        cfg = config_factory(
-            output_filename=tmp_path / "rel_out",
-            io={"work_dir": "rel_work"},
-        )
-        assert pipeline.run(cfg) == 0
-        assert observed == [tmp_path / "rel_work"]
-        assert observed[0].is_absolute()
-        assert (tmp_path / "rel_work" / "spectra").is_dir()
-
-    def test_cleans_up_temp_dir_if_spectra_subdir_creation_fails(
-        self, tmp_path, monkeypatch, config_factory, track_mkdtemp
-    ):
-        class _FailDir:
-            def mkdir(self, **_kwargs):
-                raise OSError("disk full")
-
-        monkeypatch.setattr(pipeline, "spectra_dir", lambda _p: _FailDir())
-        cfg = config_factory(output_filename=tmp_path / "fail_out")
-        with pytest.raises(OSError, match="disk full"):
-            pipeline.run(cfg)
+        cfg_tmp = config_factory(output_filename=tmp_path / "tmp_out")
+        assert pipeline.run(cfg_tmp) == 0
         assert len(track_mkdtemp) == 1
         assert not track_mkdtemp[0].exists()
 
-    def test_warns_only_for_average_when_both_outlier_cutoffs_below_one(
+        wd = tmp_path / "explicit_work"
+        cfg_exp = config_factory(
+            output_filename=tmp_path / "exp_out", io={"work_dir": str(wd)}
+        )
+        assert pipeline.run(cfg_exp) == 0
+        assert (wd / "spectra").is_dir()
+
+    def test_run_returns_1_on_existing_output_and_preserves_on_staging_error(
+        self, tmp_path, config_factory, track_mkdtemp
+    ):
+        existing = tmp_path / "existing.csv"
+        existing.write_text("precious", encoding="utf-8")
+        cfg = config_factory(output_filename=tmp_path / "existing")
+        assert pipeline.run(cfg) == 1
+        assert track_mkdtemp == []
+
+        # Overwrite=True still preserves existing CSV if staging fails.
+        cfg_fail = config_factory(
+            input_filenames=[str(tmp_path / "missing_*.mgf")],
+            output_filename=tmp_path / "existing",
+            io={"overwrite": True},
+        )
+        with pytest.raises(FileNotFoundError):
+            pipeline.run(cfg_fail)
+        assert existing.read_text(encoding="utf-8") == "precious"
+        assert len(track_mkdtemp) == 1
+        assert not track_mkdtemp[0].exists()
+
+    def test_warns_when_both_average_outlier_cutoffs_below_one(
         self, tmp_path, monkeypatch, caplog, config_factory
     ):
         monkeypatch.setattr(
@@ -123,215 +213,3 @@ class TestWorkDirLifecycleAndWarnings:
         with caplog.at_level(logging.WARNING, logger="falcon"):
             assert pipeline.run(cfg) == 0
         assert any("less than 1" in r.message for r in caplog.records)
-
-    @pytest.mark.parametrize(
-        "consensus_section",
-        [
-            {"method": "medoid"},
-            {
-                "method": "average",
-                "outlier_cutoff_lower": 0.5,
-                "outlier_cutoff_upper": 1.0,
-            },
-            {
-                "method": "average",
-                "outlier_cutoff_lower": 1.0,
-                "outlier_cutoff_upper": 0.5,
-            },
-        ],
-    )
-    def test_no_outlier_warning_outside_aggressive_average_regime(
-        self,
-        tmp_path,
-        monkeypatch,
-        caplog,
-        config_factory,
-        consensus_section,
-    ):
-        monkeypatch.setattr(
-            pipeline, "load_or_stage_buckets", lambda *_a, **_kw: []
-        )
-        cfg = config_factory(
-            output_filename=tmp_path / "no_warn",
-            consensus=consensus_section,
-        )
-        with caplog.at_level(logging.WARNING, logger="falcon"):
-            assert pipeline.run(cfg) == 0
-        assert not any("less than 1" in r.message for r in caplog.records)
-
-
-class TestRunClusteringAndPipeline:
-    @pytest.mark.parametrize("export_reps", [False, True])
-    def test_run_clustering_passes_typed_configs_and_skips_empty_buckets(
-        self,
-        tmp_path,
-        lance_dataset,
-        spectrum_row,
-        monkeypatch,
-        export_reps,
-        config_factory,
-    ):
-        (tmp_path / "spectra").mkdir()
-        lance_dataset([], name="spectra/spectra_charge_1.lance")
-        lance_dataset(
-            [spectrum_row("s:1", 500.0, [100.0, 200.0], [1.0, 1.0], 2, 10.0)],
-            name="spectra/spectra_charge_2.lance",
-        )
-        cfg = config_factory(
-            io={
-                "work_dir": str(tmp_path),
-                "export_representatives": export_reps,
-            },
-            clustering={"fragment_tol": 0.05},
-            consensus={
-                "method": "average",
-                "outlier_cutoff_lower": 2.0,
-                "outlier_cutoff_upper": 2.5,
-            },
-        )
-
-        captured = {}
-
-        def _fake_multi(datasets, clustering, consensus, **kwargs):
-            captured["datasets"] = datasets
-            captured["clustering"] = clustering
-            captured["consensus"] = consensus
-            captured["kwargs"] = kwargs
-            return [ClusterResult(np.array([0], dtype=np.int32), [])]
-
-        monkeypatch.setattr(pipeline, "generate_clusters_multi", _fake_multi)
-
-        datasets, results = pipeline._run_clustering(
-            cfg, tmp_path, [(1,), (2,)]
-        )
-        assert len(datasets) == 1
-        assert datasets[0].count_rows() == 1
-        assert len(results) == 1
-        assert captured["clustering"] == cfg.clustering
-        assert captured["consensus"] == cfg.consensus
-        assert captured["kwargs"] == {
-            "min_mz": 101.0,
-            "max_mz": 1500.0,
-            "bucket_labels": ["2"],
-            "compute_representatives": export_reps,
-            "temp_dir": tmp_path,
-        }
-
-    def test_run_clustering_short_circuits_when_no_non_empty_buckets(
-        self, tmp_path, lance_dataset, monkeypatch, config_factory
-    ):
-        (tmp_path / "spectra").mkdir()
-        lance_dataset([], name="spectra/spectra_charge_1.lance")
-        cfg = config_factory(io={"work_dir": str(tmp_path)})
-
-        def _forbid_multi(*_args, **_kwargs):
-            raise AssertionError("generate_clusters_multi must not run")
-
-        monkeypatch.setattr(pipeline, "generate_clusters_multi", _forbid_multi)
-        assert pipeline._run_clustering(cfg, tmp_path, []) == ([], [])
-        assert pipeline._run_clustering(cfg, tmp_path, [(1,)]) == ([], [])
-
-    def test_programmatic_run_does_not_shutdown_logging(
-        self,
-        tmp_path,
-        monkeypatch,
-        config_factory,
-        track_mkdtemp,
-    ):
-        shutdown_called = False
-
-        def _spy_shutdown():
-            nonlocal shutdown_called
-            shutdown_called = True
-
-        monkeypatch.setattr(logging, "shutdown", _spy_shutdown)
-        monkeypatch.setattr(
-            pipeline, "load_or_stage_buckets", lambda *_a, **_kw: []
-        )
-        cfg = config_factory(output_filename=tmp_path / "prog_out")
-        assert pipeline.run(cfg) == 0
-        assert shutdown_called is False
-        assert (tmp_path / "prog_out.csv").is_file()
-        assert len(track_mkdtemp) == 1
-        assert not track_mkdtemp[0].exists()
-
-    def test_run_returns_1_when_output_exists_without_overwrite(
-        self, tmp_path, config_factory, track_mkdtemp
-    ):
-        existing_csv = tmp_path / "existing.csv"
-        existing_csv.write_text("keep", encoding="utf-8")
-        explicit_wd = tmp_path / "never_created_work"
-        cfg = config_factory(output_filename=tmp_path / "existing")
-
-        assert pipeline.run(cfg) == 1
-        assert existing_csv.read_text(encoding="utf-8") == "keep"
-        assert track_mkdtemp == []
-
-        cfg_explicit = config_factory(
-            output_filename=tmp_path / "existing",
-            io={"work_dir": str(explicit_wd)},
-        )
-        assert pipeline.run(cfg_explicit) == 1
-        assert not explicit_wd.exists()
-
-    def test_run_preserves_explicit_work_dir(
-        self, tmp_path, monkeypatch, config_factory
-    ):
-        explicit_wd = tmp_path / "work"
-        monkeypatch.setattr(
-            pipeline, "load_or_stage_buckets", lambda *_a, **_kw: []
-        )
-        cfg = config_factory(
-            output_filename=tmp_path / "explicit_out",
-            io={"work_dir": str(explicit_wd)},
-        )
-        assert pipeline.run(cfg) == 0
-        assert explicit_wd.is_dir()
-        assert (tmp_path / "explicit_out.csv").is_file()
-
-    def test_run_fails_before_creating_work_dir_on_missing_output_parent(
-        self, tmp_path, config_factory, track_mkdtemp
-    ):
-        cfg = config_factory(
-            output_filename=tmp_path / "nonexistent_dir" / "out"
-        )
-        with pytest.raises(FileNotFoundError, match="Output directory"):
-            pipeline.run(cfg)
-        assert track_mkdtemp == []
-
-    def test_run_overwrite_preserves_existing_outputs_on_staging_failure(
-        self, tmp_path, config_factory, track_mkdtemp
-    ):
-        existing_csv = tmp_path / "existing.csv"
-        existing_mgf = tmp_path / "existing.mgf"
-        existing_csv.write_text("precious csv", encoding="utf-8")
-        existing_mgf.write_text("precious mgf", encoding="utf-8")
-        cfg = config_factory(
-            input_filenames=[str(tmp_path / "typo_*.mgf")],
-            output_filename=tmp_path / "existing",
-            io={"overwrite": True},
-        )
-        with pytest.raises(FileNotFoundError):
-            pipeline.run(cfg)
-        assert existing_csv.read_text(encoding="utf-8") == "precious csv"
-        assert existing_mgf.read_text(encoding="utf-8") == "precious mgf"
-        assert len(track_mkdtemp) == 1
-        assert not track_mkdtemp[0].exists()
-
-    def test_run_overwrite_removes_stale_mgf_when_export_reps_disabled(
-        self, tmp_path, monkeypatch, config_factory
-    ):
-        existing_csv = tmp_path / "run.csv"
-        stale_mgf = tmp_path / "run.mgf"
-        existing_csv.write_text("old csv", encoding="utf-8")
-        stale_mgf.write_text("stale mgf", encoding="utf-8")
-        monkeypatch.setattr(
-            pipeline, "load_or_stage_buckets", lambda *_a, **_kw: []
-        )
-        cfg = config_factory(
-            output_filename=tmp_path / "run",
-            io={"overwrite": True, "export_representatives": False},
-        )
-        assert pipeline.run(cfg) == 0
-        assert existing_csv.is_file()
-        assert not stale_mgf.exists()

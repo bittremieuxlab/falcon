@@ -1,16 +1,12 @@
 """Shared domain data types, charge-bucket parsing, and m/z bin math.
 
-This leaf module imports only stdlib at module load time so lightweight
-entry points (``falcon.config`` and ``falcon.cli``) never pull in NumPy,
-Numba, SciPy, Lance, or ``spectrum_utils``. Array helpers import NumPy
-lazily when called.
+Imports only the standard library at module load time so CLI inspection
+commands never pull in NumPy, Numba, SciPy, Lance, or spectrum_utils.
 """
 
 from __future__ import annotations
 
-import functools
 import math
-import numbers
 import os
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypedDict
 
@@ -19,7 +15,6 @@ if TYPE_CHECKING:
 
 INT8_MIN = -128
 INT8_MAX = 127
-INT32_MAX = 2**31 - 1
 
 DEFAULT_MIN_MZ: float = 101.0
 DEFAULT_MAX_MZ: float = 1500.0
@@ -48,7 +43,6 @@ __all__ = [
     "DEFAULT_OUTLIER_CUTOFF_UPPER",
     "INT8_MAX",
     "INT8_MIN",
-    "INT32_MAX",
     "NONE_SENTINEL",
     "OTHER_BUCKET",
     "UNKNOWN_CHARGE",
@@ -64,21 +58,12 @@ __all__ = [
     "ScalingMethod",
     "SpectrumTuple",
     "charge_sort_key",
-    "coerce_exact_int",
     "make_consensus_tuple",
     "mz_bin_bounds",
     "offset_cluster_result",
     "parse_charge_bucket_list",
     "parse_optional_charge_buckets",
 ]
-
-
-@functools.lru_cache(maxsize=1)
-def _numpy() -> Any:
-    """Lazily import and cache ``numpy`` on first array-helper call."""
-    import numpy as np
-
-    return np
 
 
 class ProcessedSpectrum(TypedDict):
@@ -118,24 +103,7 @@ class ConsensusTuple(NamedTuple):
         retention_time: float | np.floating[Any],
         cluster_id: int,
     ) -> ConsensusTuple:
-        """
-        Build a ``ConsensusTuple`` directly from a ``SpectrumTuple``.
-
-        Parameters
-        ----------
-        spec : SpectrumTuple
-            Source spectrum whose precursor and fragment peaks become
-            the representative.
-        retention_time : float
-            Retention time for the representative (or ``NaN``).
-        cluster_id : int
-            Cluster label assigned to this representative.
-
-        Returns
-        -------
-        ConsensusTuple
-            Representative spectrum record with canonical dtypes.
-        """
+        """Build a ``ConsensusTuple`` from a ``SpectrumTuple``."""
         return make_consensus_tuple(
             precursor_mz=spec.precursor_mz,
             precursor_charge=spec.precursor_charge,
@@ -153,43 +121,6 @@ class ClusterResult(NamedTuple):
     representatives: list[ConsensusTuple]
 
 
-def coerce_exact_int(value: Any, *, label: str = "Value") -> int:
-    """
-    Convert an integer, integral float, or integer string to ``int``.
-
-    Rejects booleans and non-integral or non-finite floats instead of
-    silently truncating them.
-
-    Parameters
-    ----------
-    value : Any
-        Numeric or integer-string value to convert.
-    label : str, default="Value"
-        Field label used in validation error messages.
-
-    Returns
-    -------
-    int
-        Exact integer value.
-
-    Raises
-    ------
-    ValueError
-        If ``value`` is a boolean, a non-integral or non-finite real
-        number, or an unparsable string.
-    """
-    if isinstance(value, bool):
-        raise ValueError(f"{label} must be an integer, not bool")
-    if isinstance(value, numbers.Integral):
-        return int(value)
-    if isinstance(value, numbers.Real):
-        fval = float(value)
-        if not math.isfinite(fval) or not fval.is_integer():
-            raise ValueError(f"{label} must be an integer, got {value!r}")
-        return int(fval)
-    return int(value)
-
-
 def make_consensus_tuple(
     precursor_mz: float | np.floating[Any],
     precursor_charge: Any,
@@ -202,44 +133,13 @@ def make_consensus_tuple(
     Construct a ``ConsensusTuple`` with canonical float32/int32 dtypes.
 
     Missing or non-finite precursor charges normalize to ``np.nan``.
-
-    Parameters
-    ----------
-    precursor_mz : float | np.floating
-        Representative precursor m/z value.
-    precursor_charge : Any
-        Precursor charge state, or ``None``/``NaN`` when unknown.
-    mz : np.ndarray
-        Fragment peak m/z array.
-    intensity : np.ndarray
-        Fragment peak intensity array.
-    retention_time : float | np.floating
-        Representative retention time (or ``NaN`` when missing).
-    cluster_id : int
-        Cluster label assigned to this representative.
-
-    Returns
-    -------
-    ConsensusTuple
-        Typed representative spectrum record.
-
-    Raises
-    ------
-    ValueError
-        If ``precursor_charge`` is a boolean or a non-integral finite
-        float.
     """
-    np = _numpy()
+    import numpy as np
 
-    if precursor_charge is None or (
-        not isinstance(precursor_charge, bool)
-        and not math.isfinite(float(precursor_charge))
-    ):
+    if precursor_charge is None or not math.isfinite(float(precursor_charge)):
         norm_charge: np.int32 | float = np.nan
     else:
-        norm_charge = np.int32(
-            coerce_exact_int(precursor_charge, label="precursor_charge")
-        )
+        norm_charge = np.int32(int(precursor_charge))
     return ConsensusTuple(
         precursor_mz=np.float32(precursor_mz),
         precursor_charge=norm_charge,
@@ -259,81 +159,30 @@ def offset_cluster_result(
     """
     Shift cluster labels and representative IDs by ``offset``.
 
-    Never mutates ``result.labels`` in place.
-
-    Parameters
-    ----------
-    result : ClusterResult
-        Source cluster labels and representative spectra.
-    offset : int
-        Non-negative integer offset added to every label and cluster ID.
-    include_representatives : bool, default=True
-        When ``False``, skip offsetting representative spectra and
-        return an empty list.
-
-    Returns
-    -------
-    tuple[ClusterResult, int]
-        Shifted ``ClusterResult`` and the next available global label
-        offset (``max(shifted_labels) + 1``, or ``offset`` if empty).
-
-    Raises
-    ------
-    ValueError
-        If ``offset`` is negative or ``result.labels`` is not 1D.
-    OverflowError
-        If adding ``offset`` overflows int32 cluster IDs.
+    Does not mutate ``result.labels`` in place. Returns the shifted
+    ``ClusterResult`` and the next available global label offset.
     """
-    np = _numpy()
+    import numpy as np
 
-    if offset < 0:
-        raise ValueError(f"offset must be non-negative, got {offset}")
     labels_arr = np.asarray(result.labels, dtype=np.int32)
-    if labels_arr.ndim != 1:
-        raise ValueError(
-            f"result.labels must be 1D, got shape {labels_arr.shape}"
-        )
     if labels_arr.size == 0:
         return ClusterResult(np.empty(0, dtype=np.int32), []), offset
 
-    max_label = int(np.max(labels_arr))
-    if max_label + offset > INT32_MAX:
-        raise OverflowError(
-            f"Offsetting max cluster label {max_label} by {offset} exceeds "
-            f"int32 maximum ({INT32_MAX})"
-        )
     offset_labels = labels_arr + np.int32(offset)
-    if include_representatives and result.representatives:
-        offset_reps: list[ConsensusTuple] = []
-        for rep in result.representatives:
-            shifted_id = int(rep.cluster_id) + offset
-            if shifted_id > INT32_MAX:
-                raise OverflowError(
-                    f"Offsetting representative cluster_id "
-                    f"{int(rep.cluster_id)} by {offset} exceeds int32 "
-                    f"maximum ({INT32_MAX})"
-                )
-            offset_reps.append(rep._replace(cluster_id=np.int32(shifted_id)))
-    else:
-        offset_reps = []
-    next_offset = max_label + offset + 1
+    offset_reps = (
+        [
+            rep._replace(cluster_id=np.int32(int(rep.cluster_id) + offset))
+            for rep in result.representatives
+        ]
+        if include_representatives and result.representatives
+        else []
+    )
+    next_offset = int(np.max(offset_labels)) + 1
     return ClusterResult(offset_labels, offset_reps), next_offset
 
 
 def charge_sort_key(value: ChargeValue) -> tuple[bool, int | str]:
-    """
-    Sort numeric precursor charges ascending before ``"unknown"``.
-
-    Parameters
-    ----------
-    value : ChargeValue
-        Integer charge state or ``"unknown"``.
-
-    Returns
-    -------
-    tuple[bool, int | str]
-        Deterministic sort key ordering integers before strings.
-    """
+    """Sort numeric precursor charges ascending before ``"unknown"``."""
     return (isinstance(value, str), value)
 
 
@@ -346,19 +195,14 @@ def _parse_single_charge_bucket(
         raise ValueError(
             "Each charge bucket must be a sequence of charges or 'other'"
         )
-    if len(raw_bucket) == 0:
+    if not raw_bucket:
         raise ValueError("Charge bucket must not be empty")
 
     bucket_seen: set[ChargeValue] = set()
     for elem in raw_bucket:
-        if isinstance(elem, bool):
-            raise ValueError(
-                "Charge bucket entries must be integers or 'unknown', "
-                "not booleans"
-            )
         if elem == UNKNOWN_CHARGE:
             parsed: ChargeValue = UNKNOWN_CHARGE
-        elif isinstance(elem, int):
+        elif isinstance(elem, int) and not isinstance(elem, bool):
             if not (INT8_MIN <= elem <= INT8_MAX):
                 raise ValueError(
                     f"Precursor charge {elem} is outside int8 range "
@@ -391,28 +235,12 @@ def parse_charge_bucket_list(value: Any) -> tuple[ChargeBucket, ...]:
 
     Accepts a non-empty list or tuple of non-overlapping
     int8/``"unknown"`` buckets and at most one ``"other"`` sentinel.
-
-    Parameters
-    ----------
-    value : Any
-        Raw sequence of charge buckets.
-
-    Returns
-    -------
-    tuple[ChargeBucket, ...]
-        Canonical immutable charge bucket tuple.
-
-    Raises
-    ------
-    ValueError
-        If ``value`` is not a non-empty sequence of valid,
-        non-overlapping charge buckets.
     """
     if not isinstance(value, (list, tuple)):
         raise ValueError(
             "Charge buckets must be a non-empty list or tuple of buckets"
         )
-    if len(value) == 0:
+    if not value:
         raise ValueError("Charge buckets must not be empty")
 
     buckets: list[ChargeBucket] = []
@@ -426,29 +254,17 @@ def parse_charge_bucket_list(value: Any) -> tuple[ChargeBucket, ...]:
                 )
             seen_other = True
             buckets.append(OTHER_BUCKET)
-            continue
-        buckets.append(_parse_single_charge_bucket(raw_bucket, seen_values))
-
+        else:
+            buckets.append(
+                _parse_single_charge_bucket(raw_bucket, seen_values)
+            )
     return tuple(buckets)
 
 
 def parse_optional_charge_buckets(
     value: Any,
 ) -> tuple[ChargeBucket, ...] | None:
-    """
-    Validate ``precursor_charge_buckets``, allowing ``None``/``"auto"``.
-
-    Parameters
-    ----------
-    value : Any
-        Raw charge bucket specification from Python, TOML, or CLI.
-
-    Returns
-    -------
-    tuple[ChargeBucket, ...] | None
-        Canonical immutable charge bucket tuple, or ``None`` for auto
-        mode.
-    """
+    """Validate ``precursor_charge_buckets`` (or ``None``/``auto``)."""
     if value is None or value == AUTO_SENTINEL:
         return None
     return parse_charge_bucket_list(value)
@@ -458,71 +274,25 @@ def mz_bin_bounds(
     min_mz: float, max_mz: float, bin_size: float
 ) -> tuple[int, float, float]:
     """
-    Compute aligned m/z bin boundaries and exact bin count.
+    Compute outward-aligned m/z bin boundaries and exact bin count.
 
-    Guarantees ``start_dim <= min_mz``, ``end_dim > max_mz``, and an
-    exact integer bin count ``n_bins >= 1`` in float64 precision.
-
-    Parameters
-    ----------
-    min_mz : float
-        Lower bound of the mass range (inclusive).
-    max_mz : float
-        Upper bound of the mass range (inclusive).
-    bin_size : float
-        Positive bin width in Da.
+    Guarantees ``start_dim <= min_mz``, ``end_dim > max_mz``, and
+    ``n_bins >= 1`` in float64 precision.
 
     Returns
     -------
     tuple[int, float, float]
-        ``(n_bins, start_dim, end_dim)`` on the ``bin_size`` grid with
-        outward-safe float64 bounds ``start_dim <= min_mz`` and
-        ``end_dim > max_mz``.
-
-    Raises
-    ------
-    ValueError
-        If inputs are non-finite, ``bin_size <= 0``,
-        ``min_mz > max_mz``, or the grid overflows float precision.
+        ``(n_bins, start_dim, end_dim)`` on the ``bin_size`` grid.
     """
-    if not (
-        math.isfinite(min_mz)
-        and math.isfinite(max_mz)
-        and math.isfinite(bin_size)
-    ):
-        raise ValueError("min_mz, max_mz, and bin_size must be finite")
-    if bin_size <= 0.0:
-        raise ValueError(f"bin_size must be positive, got {bin_size}")
-    if min_mz > max_mz:
+    if bin_size <= 0.0 or min_mz > max_mz:
         raise ValueError(
-            f"min_mz ({min_mz}) must not exceed max_mz ({max_mz})"
+            f"Invalid m/z bin bounds: min_mz={min_mz}, max_mz={max_mz}, "
+            f"bin_size={bin_size}"
         )
-
-    start_ratio = min_mz / bin_size
-    end_ratio = max_mz / bin_size
-    if not (math.isfinite(start_ratio) and math.isfinite(end_ratio)):
-        raise ValueError(
-            f"bin_size ({bin_size}) causes non-finite m/z bin count over "
-            f"[{min_mz}, {max_mz}]"
-        )
-
-    start_idx = math.floor(start_ratio)
+    start_idx = math.floor(min_mz / bin_size)
     if start_idx * bin_size > min_mz:
         start_idx -= 1
-    end_idx = math.floor(end_ratio) + 1
+    end_idx = math.floor(max_mz / bin_size) + 1
     if end_idx * bin_size <= max_mz:
         end_idx += 1
-
-    start_dim = start_idx * bin_size
-    end_dim = end_idx * bin_size
-    if not (math.isfinite(start_dim) and math.isfinite(end_dim)):
-        raise ValueError(
-            f"bin_size ({bin_size}) causes non-finite m/z bounds over "
-            f"[{min_mz}, {max_mz}]"
-        )
-    if start_dim > min_mz or end_dim <= max_mz:
-        raise ValueError(
-            f"bin_size ({bin_size}) is below float64 precision at "
-            f"[{min_mz}, {max_mz}]"
-        )
-    return end_idx - start_idx, start_dim, end_dim
+    return end_idx - start_idx, start_idx * bin_size, end_idx * bin_size

@@ -7,20 +7,16 @@ import glob
 import logging
 import math
 import os
-import stat
 import sys
 import tempfile
 from pathlib import Path
 from typing import IO, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from collections.abc import Generator, Iterable, Sequence
+    from collections.abc import Generator, Sequence
 
     import joblib
 
-_PROC_CGROUP_PATH = "/proc/self/cgroup"
-_CGROUP_V2_ROOT = "/sys/fs/cgroup"
-_CGROUP_V1_MEMORY_ROOT = "/sys/fs/cgroup/memory"
 _CGROUP_MEMORY_PATHS: tuple[str, ...] = (
     "/sys/fs/cgroup/memory.max",
     "/sys/fs/cgroup/memory/memory.limit_in_bytes",
@@ -31,14 +27,9 @@ __all__ = [
     "configure_logger",
     "effective_memory_bytes",
     "effective_n_workers",
-    "expand_input_globs",
-    "find_path_alias",
     "format_hms",
     "loky_unordered_pool",
-    "paths_alias",
-    "require_regular_file",
     "resolve_input_files",
-    "resolve_path",
 ]
 
 
@@ -49,11 +40,6 @@ def configure_logger() -> logging.Logger:
     Attaches a debug-level stderr handler if the root logger has no
     handlers yet, enables warning capture, and suppresses verbose debug
     logs from ``numba``.
-
-    Returns
-    -------
-    logging.Logger
-        The ``"falcon"`` application logger.
     """
     logger = logging.getLogger("falcon")
     logging.captureWarnings(True)
@@ -70,219 +56,8 @@ def configure_logger() -> logging.Logger:
             )
         )
         root.addHandler(handler)
-    # Silence verbose third-party debug/info logs.
     logging.getLogger("numba").setLevel(logging.WARNING)
     return logger
-
-
-def resolve_path(path: Path) -> Path:
-    """
-    Resolve ``path`` strictly, falling back when the target is absent.
-
-    Using ``strict=True`` first surfaces symlink loops and permission
-    errors while still allowing non-existent destination paths.
-
-    Parameters
-    ----------
-    path : Path
-        Filesystem path to canonicalize.
-
-    Returns
-    -------
-    Path
-        Canonicalized path.
-    """
-    try:
-        return path.resolve(strict=True)
-    except FileNotFoundError:
-        return path.resolve(strict=False)
-
-
-def paths_alias(
-    target: Path,
-    candidate: Path,
-    *,
-    resolved_target: Path | None = None,
-    target_exists: bool | None = None,
-) -> bool:
-    """
-    Return whether ``target`` and ``candidate`` refer to the same file.
-
-    Checks both canonical resolved paths (covering non-existent paths
-    and symlinks) and ``os.path.samefile`` (covering hard links).
-
-    Parameters
-    ----------
-    target : Path
-        Destination or output path to test.
-    candidate : Path
-        Existing or literal input path to compare against.
-    resolved_target : Path | None, default=None
-        Optional pre-resolved canonical form of ``target``.
-    target_exists : bool | None, default=None
-        Optional precomputed ``target.exists()`` flag.
-
-    Returns
-    -------
-    bool
-        ``True`` if both paths alias the same filesystem location.
-    """
-    if resolved_target is None:
-        try:
-            resolved_target = resolve_path(target)
-        except (OSError, RuntimeError, ValueError):
-            return False
-    try:
-        if resolved_target == resolve_path(candidate):
-            return True
-    except (OSError, RuntimeError, ValueError):
-        return False
-    if target_exists is False:
-        return False
-    try:
-        return os.path.samefile(target, candidate)
-    except (OSError, ValueError):
-        return False
-
-
-def find_path_alias(
-    target: Path,
-    candidates: Iterable[Path],
-    *,
-    resolved_target: Path | None = None,
-    strict: bool = False,
-) -> Path | None:
-    """
-    Return the first candidate in ``candidates`` aliasing ``target``.
-
-    Pre-resolves ``target`` and checks its existence once before
-    testing each candidate via :func:`paths_alias`.
-
-    Parameters
-    ----------
-    target : Path
-        Destination or output path to check.
-    candidates : Iterable[Path]
-        Existing or literal paths to test against ``target``.
-    resolved_target : Path | None, default=None
-        Optional pre-resolved canonical form of ``target``.
-    strict : bool, default=False
-        When ``True``, propagate resolution errors on ``target``
-        instead of returning ``None``.
-
-    Returns
-    -------
-    Path | None
-        First aliasing candidate path, or ``None`` if no candidate
-        aliases ``target``.
-    """
-    if resolved_target is None:
-        try:
-            resolved_target = resolve_path(target)
-        except (OSError, RuntimeError, ValueError):
-            if strict:
-                raise
-            return None
-    try:
-        target_exists = target.exists()
-    except (OSError, ValueError):
-        target_exists = False
-    for candidate in candidates:
-        if paths_alias(
-            target,
-            candidate,
-            resolved_target=resolved_target,
-            target_exists=target_exists,
-        ):
-            return candidate
-    return None
-
-
-def expand_input_globs(
-    patterns: Sequence[str],
-    *,
-    keep_unmatched_literals: bool = False,
-) -> list[Path]:
-    """
-    Expand file paths and glob patterns in deterministic sorted order.
-
-    Matches within each pattern are sorted lexicographically so results
-    never depend on filesystem iteration order. Repeated matches across
-    patterns are preserved. Existing literal paths containing glob
-    metacharacters (such as ``[1]``) are retained even when ``glob``
-    finds no wildcard expansion.
-
-    Parameters
-    ----------
-    patterns : Sequence[str]
-        Literal paths or glob patterns.
-    keep_unmatched_literals : bool, default=False
-        When ``True``, preserve unmatched patterns containing no glob
-        metacharacters as literal ``Path`` entries (useful for checking
-        path aliasing before files exist).
-
-    Returns
-    -------
-    list[Path]
-        Expanded file paths.
-    """
-    resolved: list[Path] = []
-    for pattern in patterns:
-        matches = sorted(glob.glob(pattern))
-        if matches:
-            resolved.extend(Path(match) for match in matches)
-            continue
-        literal = Path(pattern)
-        if (
-            literal.exists()
-            or literal.is_symlink()
-            or (keep_unmatched_literals and not glob.has_magic(pattern))
-        ):
-            resolved.append(literal)
-    return resolved
-
-
-def require_regular_file(
-    path: Path,
-    *,
-    dir_message: str,
-    missing_message: str,
-) -> None:
-    """
-    Verify ``path`` resolves to an existing regular file.
-
-    Uses ``os.stat`` directly so symlink loops (``ELOOP``) and
-    permission errors propagate instead of being masked as missing
-    files.
-
-    Parameters
-    ----------
-    path : Path
-        Filesystem path to verify.
-    dir_message : str
-        Message for ``IsADirectoryError`` when ``path`` is a directory.
-    missing_message : str
-        Message for ``FileNotFoundError`` when ``path`` does not exist
-        or is not a regular file.
-
-    Raises
-    ------
-    IsADirectoryError
-        If ``path`` refers to a directory.
-    FileNotFoundError
-        If ``path`` does not exist, is a broken symlink, or is not a
-        regular file.
-    OSError
-        If ``os.stat`` fails for another OS error such as ``ELOOP``.
-    """
-    try:
-        st = os.stat(path)
-    except FileNotFoundError as exc:
-        raise FileNotFoundError(missing_message) from exc
-    if stat.S_ISDIR(st.st_mode):
-        raise IsADirectoryError(dir_message)
-    if not stat.S_ISREG(st.st_mode):
-        raise FileNotFoundError(missing_message)
 
 
 def resolve_input_files(patterns: Sequence[str]) -> list[Path]:
@@ -290,45 +65,38 @@ def resolve_input_files(patterns: Sequence[str]) -> list[Path]:
     Expand input peak-file glob patterns in deterministic sorted order.
 
     Matches within each pattern are sorted lexicographically so staging
-    order and cache provenance do not depend on filesystem iteration
-    order. Repeated matches across patterns are preserved.
-
-    Parameters
-    ----------
-    patterns : Sequence[str]
-        File paths or glob patterns from ``config.io.input_filenames``.
-
-    Returns
-    -------
-    list[Path]
-        Expanded peak file paths.
+    order never depends on filesystem iteration order. Existing literal
+    paths containing glob metacharacters (e.g. ``sample_[1].mgf``) are
+    also accepted.
 
     Raises
     ------
     FileNotFoundError
-        If ``patterns`` is empty, any supplied pattern matches no
-        files, or any matched path is not an existing regular file
-        (e.g. a broken symlink).
+        If ``patterns`` is empty, a pattern matches no files, or a
+        matched path does not refer to an existing file.
     IsADirectoryError
-        If any literal path or glob match refers to a directory.
+        If any path or glob match refers to a directory.
     """
     resolved: list[Path] = []
     for pattern in patterns:
-        matches = expand_input_globs([pattern])
+        matches = [Path(m) for m in sorted(glob.glob(pattern))]
         if not matches:
-            raise FileNotFoundError(
-                f"Input peak path/pattern matched no files: {pattern!r}"
-            )
+            literal = Path(pattern)
+            if literal.exists() or literal.is_symlink():
+                matches = [literal]
+            else:
+                raise FileNotFoundError(
+                    f"Input peak path/pattern matched no files: {pattern!r}"
+                )
         for path in matches:
-            require_regular_file(
-                path,
-                dir_message=(
+            if path.is_dir():
+                raise IsADirectoryError(
                     f"Input peak path is a directory, not a file: {path}"
-                ),
-                missing_message=(
+                )
+            if not path.is_file():
+                raise FileNotFoundError(
                     f"Input peak path is not an existing regular file: {path}"
-                ),
-            )
+                )
         resolved.extend(matches)
     if not resolved:
         raise FileNotFoundError("No input peak files supplied")
@@ -342,39 +110,13 @@ def atomic_write_text(
     prefix: str = ".falcon_",
     encoding: str = "utf-8",
 ) -> Generator[IO[str], None, None]:
-    """
-    Atomically write text to ``path`` via a sibling temporary file.
-
-    Creates a temporary file in ``path.parent``, yields an open text
-    stream, and atomically replaces ``path`` on normal exit. Closes the
-    descriptor and unlinks the temporary file if opening or writing
-    fails.
-
-    Parameters
-    ----------
-    path : Path
-        Destination file path whose parent directory must exist.
-    prefix : str, default=".falcon_"
-        Filename prefix for the sibling temporary file.
-    encoding : str, default="utf-8"
-        Text encoding for the yielded stream.
-
-    Yields
-    ------
-    IO[str]
-        Writable text stream backed by the sibling temporary file.
-    """
+    """Atomically write text to ``path`` via a sibling temp file."""
     fd, tmp_name = tempfile.mkstemp(
         dir=path.parent, prefix=prefix, suffix=".tmp"
     )
     tmp_path = Path(tmp_name)
     try:
-        try:
-            f_out = os.fdopen(fd, "w", encoding=encoding)
-        except BaseException:
-            os.close(fd)
-            raise
-        with f_out:
+        with os.fdopen(fd, "w", encoding=encoding) as f_out:
             yield f_out
         os.replace(tmp_path, path)
     except BaseException:
@@ -383,20 +125,7 @@ def atomic_write_text(
 
 
 def format_hms(seconds: float) -> str:
-    """
-    Format a duration in seconds as ``H:MM:SS``, clamping below zero.
-
-    Parameters
-    ----------
-    seconds : float
-        Elapsed or estimated duration in seconds. Non-finite or
-        negative inputs are clamped to ``0:00:00``.
-
-    Returns
-    -------
-    str
-        Human-readable ``H:MM:SS`` string.
-    """
+    """Format a duration in seconds as ``H:MM:SS``, clamping at zero."""
     if not math.isfinite(seconds) or seconds <= 0:
         return "0:00:00"
     total = int(seconds)
@@ -406,34 +135,14 @@ def format_hms(seconds: float) -> str:
 
 
 def effective_n_workers() -> int:
-    """
-    Return the effective worker count for ``joblib`` parallel pools.
-
-    Returns
-    -------
-    int
-        Positive worker count derived from ``joblib.effective_n_jobs``.
-    """
+    """Return the effective worker count for ``joblib`` pools."""
     import joblib
 
     return max(1, int(joblib.effective_n_jobs(-1)))
 
 
 def loky_unordered_pool(n_jobs: int) -> joblib.Parallel:
-    """
-    Create a ``loky`` parallel pool streaming unordered results.
-
-    Parameters
-    ----------
-    n_jobs : int
-        Requested worker count (clamped to at least 1).
-
-    Returns
-    -------
-    joblib.Parallel
-        Configured ``loky`` pool with
-        ``return_as="generator_unordered"``.
-    """
+    """Create a ``loky`` parallel pool streaming unordered results."""
     import joblib
 
     return joblib.Parallel(
@@ -444,90 +153,12 @@ def loky_unordered_pool(n_jobs: int) -> joblib.Parallel:
     )
 
 
-def _read_positive_int(path: Path) -> int | None:
-    """Read a positive decimal integer from ``path``, or ``None``."""
-    try:
-        raw = path.read_text(encoding="ascii").strip()
-    except (OSError, UnicodeDecodeError):
-        return None
-    if raw.isdigit():
-        value = int(raw)
-        if value > 0:
-            return value
-    return None
-
-
-def _collect_limit(
-    candidate: Path, seen: set[Path], limits: list[int]
-) -> None:
-    """Read a positive cgroup limit from ``candidate`` once."""
-    if candidate not in seen:
-        seen.add(candidate)
-        limit = _read_positive_int(candidate)
-        if limit is not None:
-            limits.append(limit)
-
-
-def _walk_cgroup_limits(
-    root: Path,
-    rel_path: str,
-    filename: str,
-    seen: set[Path],
-    limits: list[int],
-) -> None:
-    """Collect finite limits from ``root / rel_path`` up to ``root``."""
-    parts = [p for p in rel_path.split("/") if p and p not in (".", "..")]
-    current = root.joinpath(*parts)
-    while True:
-        _collect_limit(current / filename, seen, limits)
-        if current == root:
-            break
-        current = current.parent
-
-
-def _cgroup_memory_limit() -> int | None:
-    """Return minimum finite Linux cgroup memory limit in bytes."""
-    limits: list[int] = []
-    seen: set[Path] = set()
-    try:
-        proc_text = Path(_PROC_CGROUP_PATH).read_text(
-            encoding="utf-8", errors="surrogateescape"
-        )
-    except (OSError, UnicodeError):
-        proc_text = ""
-    for line in proc_text.splitlines():
-        fields = line.split(":", 2)
-        if len(fields) != 3:
-            continue
-        hierarchy, controllers, rel_path = fields
-        if hierarchy == "0" and controllers == "":
-            _walk_cgroup_limits(
-                Path(_CGROUP_V2_ROOT), rel_path, "memory.max", seen, limits
-            )
-        elif "memory" in controllers.split(","):
-            _walk_cgroup_limits(
-                Path(_CGROUP_V1_MEMORY_ROOT),
-                rel_path,
-                "memory.limit_in_bytes",
-                seen,
-                limits,
-            )
-    for fallback in _CGROUP_MEMORY_PATHS:
-        _collect_limit(Path(fallback), seen, limits)
-    return min(limits) if limits else None
-
-
 def effective_memory_bytes() -> int | None:
     """
     Return effective available physical RAM in bytes, or ``None``.
 
     Combines POSIX ``sysconf`` physical memory with any stricter Linux
-    cgroup v1/v2 memory limits along the current process hierarchy.
-
-    Returns
-    -------
-    int | None
-        Effective memory limit in bytes, or ``None`` if unavailable.
+    cgroup memory limit when readable.
     """
     try:
         page_size = os.sysconf("SC_PAGE_SIZE")
@@ -537,7 +168,11 @@ def effective_memory_bytes() -> int | None:
     if page_size <= 0 or phys_pages <= 0:
         return None
     total_ram = int(page_size) * int(phys_pages)
-    cgroup_limit = _cgroup_memory_limit()
-    if cgroup_limit is not None:
-        total_ram = min(total_ram, cgroup_limit)
+    for cg_path in _CGROUP_MEMORY_PATHS:
+        try:
+            raw = Path(cg_path).read_text(encoding="ascii").strip()
+        except OSError:
+            continue
+        if raw.isdigit() and int(raw) > 0:
+            total_ram = min(total_ram, int(raw))
     return total_ram

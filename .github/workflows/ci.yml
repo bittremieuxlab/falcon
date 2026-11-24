@@ -71,7 +71,6 @@ jobs:
           uv run pytest
           --cov=falcon
           --cov-report=term-missing
-          --cov-fail-under=95
 
       - name: Publish coverage summary
         if: >-

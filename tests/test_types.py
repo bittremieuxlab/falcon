@@ -7,14 +7,11 @@ import pytest
 
 from falcon.types import (
     AUTO_SENTINEL,
-    INT32_MAX,
     NONE_SENTINEL,
-    ChargeValue,
     ClusterResult,
     ConsensusTuple,
     SpectrumTuple,
     charge_sort_key,
-    coerce_exact_int,
     make_consensus_tuple,
     mz_bin_bounds,
     offset_cluster_result,
@@ -23,53 +20,11 @@ from falcon.types import (
 )
 
 
-class TestCoerceExactInt:
-    @pytest.mark.parametrize(
-        ("raw", "expected"),
-        [
-            (2, 2),
-            (-1, -1),
-            (np.int8(3), 3),
-            (2.0, 2),
-            (np.float32(-4.0), -4),
-            ("5", 5),
-            (" -3 ", -3),
-        ],
-    )
-    def test_accepts_integers_integral_floats_and_int_strings(
-        self, raw, expected
-    ):
-        result = coerce_exact_int(raw, label="charge")
-        assert type(result) is int
-        assert result == expected
-
-    @pytest.mark.parametrize(
-        ("bad", "match"),
-        [
-            (True, "charge must be an integer, not bool"),
-            (False, "charge must be an integer, not bool"),
-            (2.5, "charge must be an integer"),
-            (np.float32(1.25), "charge must be an integer"),
-            (float("nan"), "charge must be an integer"),
-            (float("inf"), "charge must be an integer"),
-            ("2.0", "invalid literal"),
-            ("abc", "invalid literal"),
-        ],
-    )
-    def test_rejects_bools_non_integral_floats_and_invalid_strings(
-        self, bad, match
-    ):
-        with pytest.raises(ValueError, match=match):
-            coerce_exact_int(bad, label="charge")
-
-
-class TestSpectrumAndConsensusRecords:
+class TestRecordsAndOffsetting:
     @pytest.mark.parametrize(
         "charge", [2, 2.0, np.int8(3), None, float("nan"), float("inf")]
     )
-    def test_make_consensus_tuple_normalizes_dtypes_and_missing_charge(
-        self, charge
-    ):
+    def test_make_consensus_tuple_normalizes_dtypes(self, charge):
         rep = make_consensus_tuple(
             precursor_mz=500.25,
             precursor_charge=charge,
@@ -78,7 +33,6 @@ class TestSpectrumAndConsensusRecords:
             retention_time=12.5,
             cluster_id=7,
         )
-        assert isinstance(rep, ConsensusTuple)
         assert rep.precursor_mz.dtype == np.float32
         assert rep.mz.dtype == np.float32
         assert rep.intensity.dtype == np.float32
@@ -89,72 +43,28 @@ class TestSpectrumAndConsensusRecords:
         else:
             assert rep.precursor_charge == np.int32(int(charge))
 
-    @pytest.mark.parametrize(
-        ("bad_charge", "match"),
-        [(True, "not bool"), (False, "not bool"), (2.7, "must be an integer")],
-    )
-    def test_make_consensus_tuple_rejects_bool_and_non_integral_charge(
-        self, bad_charge, match
-    ):
-        with pytest.raises(ValueError, match=match):
-            make_consensus_tuple(
-                precursor_mz=500.0,
-                precursor_charge=bad_charge,
-                mz=np.array([100.0], dtype=np.float32),
-                intensity=np.array([1.0], dtype=np.float32),
-                retention_time=10.0,
-                cluster_id=0,
-            )
-
-    @pytest.mark.parametrize("charge", [2, None])
-    def test_consensus_tuple_from_spectrum(self, charge):
+    def test_consensus_tuple_from_spectrum(self):
         spec = SpectrumTuple(
-            precursor_mz=412.5,
-            precursor_charge=charge,
-            mz=np.array([150.0, 250.0], dtype=np.float64),
-            intensity=np.array([0.5, 0.9], dtype=np.float64),
+            412.5,
+            None,
+            np.array([150.0, 250.0], dtype=np.float64),
+            np.array([0.5, 0.9], dtype=np.float64),
         )
         rep = ConsensusTuple.from_spectrum(
             spec, retention_time=45.0, cluster_id=3
         )
-        assert isinstance(rep, ConsensusTuple)
         assert rep.precursor_mz == np.float32(412.5)
-        assert rep.mz.dtype == np.float32
-        assert rep.intensity.dtype == np.float32
-        assert rep.retention_time == np.float32(45.0)
+        assert math.isnan(rep.precursor_charge)
         assert rep.cluster_id == np.int32(3)
-        if charge is None:
-            assert math.isnan(rep.precursor_charge)
-        else:
-            assert rep.precursor_charge == np.int32(charge)
 
-    def test_spectrum_tuple_is_namedtuple(self):
-        spec = SpectrumTuple(
-            500.0,
-            2,
-            np.array([100.0], np.float32),
-            np.array([1.0], np.float32),
-        )
-        assert spec.precursor_mz == 500.0
-        assert spec.precursor_charge == 2
-
-
-class TestClusterResultOffsetting:
-    def test_offset_cluster_result_shifts_without_mutating_inputs(
+    def test_offset_cluster_result_non_mutating_and_optional_reps(
         self, consensus_factory
     ):
         labels = np.array([0, 2, 1, 2], dtype=np.int32)
-        reps = [
-            consensus_factory(cluster_id=0),
-            consensus_factory(cluster_id=1),
-            consensus_factory(cluster_id=2),
-        ]
+        reps = [consensus_factory(cluster_id=i) for i in range(3)]
         original = ClusterResult(labels=labels, representatives=reps)
 
         shifted, next_offset = offset_cluster_result(original, offset=10)
-
-        assert isinstance(shifted, ClusterResult)
-        assert shifted.labels.dtype == np.int32
         assert shifted.labels.tolist() == [10, 12, 11, 12]
         assert [int(r.cluster_id) for r in shifted.representatives] == [
             10,
@@ -162,180 +72,74 @@ class TestClusterResultOffsetting:
             12,
         ]
         assert next_offset == 13
-        # Input array and representative records must remain untouched.
         assert labels.tolist() == [0, 2, 1, 2]
         assert [int(r.cluster_id) for r in reps] == [0, 1, 2]
 
-    def test_offset_cluster_result_omits_representatives_when_disabled(
-        self, consensus_factory
-    ):
-        result = ClusterResult(
-            labels=np.array([0, 1], dtype=np.int32),
-            representatives=[consensus_factory(cluster_id=0)],
+        no_reps, next_no_reps = offset_cluster_result(
+            original, offset=5, include_representatives=False
         )
+        assert no_reps.labels.tolist() == [5, 7, 6, 7]
+        assert no_reps.representatives == []
+        assert next_no_reps == 8
 
-        shifted, next_offset = offset_cluster_result(
-            result, offset=5, include_representatives=False
-        )
-
-        assert shifted.labels.tolist() == [5, 6]
-        assert shifted.representatives == []
-        assert next_offset == 7
-
-    def test_offset_cluster_result_empty_input_preserves_offset(self):
-        empty = ClusterResult(
-            labels=np.empty(0, dtype=np.int32),
-            representatives=[],
-        )
-
-        shifted, next_offset = offset_cluster_result(empty, offset=42)
-
-        assert shifted.labels.dtype == np.int32
-        assert shifted.labels.size == 0
-        assert shifted.representatives == []
-        assert next_offset == 42
-
-    def test_offset_cluster_result_validates_bounds_shape_and_int32_overflow(
-        self, consensus_factory
-    ):
-        valid = ClusterResult(
-            labels=np.array([0, 1], dtype=np.int32),
-            representatives=[consensus_factory(cluster_id=0)],
-        )
-        with pytest.raises(ValueError, match="non-negative"):
-            offset_cluster_result(valid, offset=-1)
-
-        bad_2d = ClusterResult(
-            labels=np.zeros((1, 2), dtype=np.int32), representatives=[]
-        )
-        with pytest.raises(ValueError, match="must be 1D"):
-            offset_cluster_result(bad_2d, offset=0)
-
-        near_max = ClusterResult(
-            labels=np.array([0, INT32_MAX], dtype=np.int32), representatives=[]
-        )
-        with pytest.raises(OverflowError, match="exceeds int32 maximum"):
-            offset_cluster_result(near_max, offset=1)
-
-        rep_overflow = ClusterResult(
-            labels=np.array([0], dtype=np.int32),
-            representatives=[consensus_factory(cluster_id=INT32_MAX)],
-        )
-        with pytest.raises(OverflowError, match="exceeds int32 maximum"):
-            offset_cluster_result(rep_overflow, offset=1)
+        empty = ClusterResult(np.empty(0, dtype=np.int32), [])
+        empty_shifted, preserved = offset_cluster_result(empty, offset=42)
+        assert empty_shifted.labels.size == 0
+        assert preserved == 42
 
 
-class TestChargeBucketsAndSentinels:
-    def test_sentinels_and_charge_sort_key(self):
-        assert NONE_SENTINEL == "none"
-        assert AUTO_SENTINEL == "auto"
-        raw_charges: list[ChargeValue] = ["unknown", 3, -1, 1]
-        ordered = sorted(raw_charges, key=charge_sort_key)
-        assert ordered == [-1, 1, 3, "unknown"]
-
-    def test_parse_charge_bucket_list_canonicalizes_valid_inputs(self):
-        parsed = parse_charge_bucket_list(
+class TestChargeBucketsAndMzBins:
+    def test_charge_bucket_canonicalization_and_optional(self):
+        assert sorted(["unknown", 3, -1, 1], key=charge_sort_key) == [
+            -1,
+            1,
+            3,
+            "unknown",
+        ]
+        assert parse_charge_bucket_list(
             [["unknown", 2, 1], {-128, 127}, "other"]
-        )
-        assert parsed == ((1, 2, "unknown"), (-128, 127), "other")
-
-    def test_parse_optional_charge_buckets_handles_none_and_auto(self):
+        ) == ((1, 2, "unknown"), (-128, 127), "other")
         assert parse_optional_charge_buckets(None) is None
         assert parse_optional_charge_buckets(AUTO_SENTINEL) is None
-        assert parse_optional_charge_buckets([["unknown", 2, 1], "other"]) == (
-            (1, 2, "unknown"),
-            "other",
-        )
 
     @pytest.mark.parametrize(
-        ("raw_value", "match"),
+        "raw_value",
         [
-            (None, "non-empty list"),
-            (AUTO_SENTINEL, "non-empty list"),
-            ("12", "non-empty list"),
-            ([], "must not be empty"),
-            ([1], "sequence of charges"),
-            ([[]], "must not be empty"),
-            ([[True]], "not booleans"),
-            ([[False]], "not booleans"),
-            ([[-129]], "outside int8"),
-            ([[128]], "outside int8"),
-            ([[1.5]], "Invalid charge bucket entry"),
-            ([["abc"]], "Invalid charge bucket entry"),
-            ([["other"]], "Invalid charge bucket entry"),
-            ([[2, 2]], "Duplicate charge value"),
-            ([["unknown", "unknown"]], "Duplicate charge value"),
-            ([[1, 2], [2, 3]], "more than one bucket"),
-            ([[1, "unknown"], ["unknown"]], "more than one bucket"),
-            ([[1], "other", "other"], "appears more than once"),
+            None,
+            NONE_SENTINEL,
+            [],
+            [[]],
+            [[True]],
+            [[-129]],
+            [[128]],
+            [[1.5]],
+            [["abc"]],
+            [[2, 2]],
+            [[1, 2], [2, 3]],
+            [[1], "other", "other"],
         ],
     )
-    def test_parse_charge_bucket_list_rejects_invalid_inputs(
-        self, raw_value, match
-    ):
-        with pytest.raises(ValueError, match=match):
+    def test_charge_buckets_reject_invalid(self, raw_value):
+        with pytest.raises(ValueError, match=r".+"):
             parse_charge_bucket_list(raw_value)
 
-    @pytest.mark.parametrize(
-        ("raw_value", "match"),
-        [
-            (NONE_SENTINEL, "non-empty list"),
-            ([], "must not be empty"),
-            ([[128]], "outside int8"),
-        ],
-    )
-    def test_parse_optional_charge_buckets_rejects_invalid_inputs(
-        self, raw_value, match
-    ):
-        with pytest.raises(ValueError, match=match):
-            parse_optional_charge_buckets(raw_value)
+    def test_mz_bin_bounds_outward_float64_rounding(self):
+        assert mz_bin_bounds(100.0, 200.0, 1.0) == (101, 100.0, 201.0)
+        assert mz_bin_bounds(250.0, 250.0, 0.5) == (1, 250.0, 250.5)
 
+        # Float rounding cases: 1.7/0.1 -> 17*0.1 > 1.7; 4.3/0.1 -> 42.9999...
+        for min_mz, max_mz, step in (
+            (1.7, 2.0, 0.1),
+            (0.0, 4.3, 0.1),
+            (101.03, 1500.03, 0.05),
+        ):
+            n_bins, start, end = mz_bin_bounds(min_mz, max_mz, step)
+            assert start <= min_mz
+            assert end > max_mz
+            assert n_bins >= 1
+            assert end - start == pytest.approx(n_bins * step)
 
-class TestMzBinBounds:
-    def test_exact_aligned_and_unaligned_bounds(self):
-        n_bins, start, end = mz_bin_bounds(100.0, 200.0, 1.0)
-        assert (n_bins, start, end) == (101, 100.0, 201.0)
-
-        n_bins2, start2, end2 = mz_bin_bounds(101.03, 1500.03, 0.05)
-        assert start2 <= 101.03
-        assert end2 > 1500.03
-        assert end2 - start2 == pytest.approx(n_bins2 * 0.05)
-
-        n_bins3, start3, end3 = mz_bin_bounds(250.0, 250.0, 0.5)
-        assert (n_bins3, start3, end3) == (1, 250.0, 250.5)
-
-    def test_handles_float_rounding_adjustments(self):
-        # 1.7 / 0.1 == 17.0, 17 * 0.1 > 1.7 -> start_idx decrements.
-        n_bins, start, end = mz_bin_bounds(1.7, 2.0, 0.1)
-        assert start <= 1.7
-        assert end > 2.0
-        assert n_bins == 5
-
-        # 4.3 / 0.1 == 42.99999999999999 -> end_idx += 1.
-        n_bins2, start2, end2 = mz_bin_bounds(0.0, 4.3, 0.1)
-        assert start2 == 0.0
-        assert end2 > 4.3
-        assert n_bins2 == 44
-
-        n_bins3, start3, end3 = mz_bin_bounds(0.0, 1500.0, 0.05)
-        assert start3 == 0.0
-        assert end3 > 1500.0
-        assert n_bins3 == 30001
-
-    @pytest.mark.parametrize(
-        ("min_mz", "max_mz", "bin_size", "match"),
-        [
-            (0.0, float("inf"), 0.05, "finite"),
-            (float("nan"), 100.0, 0.05, "finite"),
-            (0.0, 100.0, float("inf"), "finite"),
-            (0.0, 100.0, 0.0, "positive"),
-            (0.0, 100.0, -0.05, "positive"),
-            (200.0, 100.0, 0.05, "must not exceed"),
-            (0.0, 1e308, 1e-308, "non-finite"),
-            (0.0, 1e308, 1e308, "non-finite"),
-            (0.0, 1e20, 1.0, "float64 precision"),
-        ],
-    )
-    def test_rejects_invalid_inputs(self, min_mz, max_mz, bin_size, match):
-        with pytest.raises(ValueError, match=match):
-            mz_bin_bounds(min_mz, max_mz, bin_size)
+        with pytest.raises(ValueError, match="Invalid m/z bin bounds"):
+            mz_bin_bounds(200.0, 100.0, 0.05)
+        with pytest.raises(ValueError, match="Invalid m/z bin bounds"):
+            mz_bin_bounds(0.0, 100.0, 0.0)

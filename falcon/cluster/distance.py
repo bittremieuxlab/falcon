@@ -1,17 +1,14 @@
-"""Condensed pairwise cosine distance matrix kernels and memmaps."""
+"""Greedy cosine similarity and condensed distance matrix kernels."""
 
 from __future__ import annotations
 
 import contextlib
-import math
 import os
 import tempfile
 from typing import TYPE_CHECKING
 
 import numba as nb
 import numpy as np
-
-from .similarity import cosine_fast_arrays
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -20,21 +17,75 @@ if TYPE_CHECKING:
 
     from ..types import PathLike, SpectrumTuple
 
-# Allocate small condensed matrices (< ~8 MiB in float32) directly in
-# RAM to avoid per-interval temporary-file churn in /tmp.
+# Allocate small condensed matrices (< ~8 MiB in float32) in RAM to
+# avoid per-interval temporary-file churn.
 MEMMAP_MIN_SPECTRA = 2**11
 
 __all__ = [
     "MEMMAP_MIN_SPECTRA",
     "close_memmap",
-    "compute_condensed_distance_matrix",
     "compute_condensed_distance_matrix_csr",
     "condensed_index",
+    "cosine_fast_arrays",
     "extract_arrow_csr",
     "fill_condensed_rows_csr",
     "open_shared_condensed",
     "pack_spectra_csr",
 ]
+
+
+@nb.njit(cache=True)
+def cosine_fast_arrays(
+    mz1: np.ndarray,
+    intensity1: np.ndarray,
+    mz2: np.ndarray,
+    intensity2: np.ndarray,
+    fragment_tol: float,
+) -> tuple[float, int]:
+    """
+    Compute greedy one-to-one cosine similarity over peak arrays.
+
+    Assumes both ``mz`` arrays are sorted ascending and both
+    ``intensity`` arrays are L2-normalized with matching length.
+    """
+    n1 = len(mz1)
+    n2 = len(mz2)
+    if n1 == 0 or n2 == 0:
+        return 0.0, 0
+
+    other_idx = 0
+    peak_matches = []
+    for i in range(n1):
+        peak_mz = mz1[i]
+        peak_intensity = intensity1[i]
+        while other_idx < n2 and peak_mz - mz2[other_idx] > fragment_tol:
+            other_idx += 1
+        if other_idx == n2:
+            break
+        j = other_idx
+        while j < n2 and mz2[j] - peak_mz <= fragment_tol:
+            # Negate score so plain tuple sort orders by descending
+            # score with ascending (i, j) tie-breaking and stays
+            # Numba-cacheable.
+            peak_matches.append((-(peak_intensity * intensity2[j]), i, j))
+            j += 1
+
+    if len(peak_matches) == 0:
+        return 0.0, 0
+
+    score = 0.0
+    n_matches = 0
+    peak_matches.sort()
+    used1 = np.zeros(n1, np.bool_)
+    used2 = np.zeros(n2, np.bool_)
+    for neg_score, i, j in peak_matches:
+        if not used1[i] and not used2[j]:
+            score -= neg_score
+            used1[i] = True
+            used2[j] = True
+            n_matches += 1
+
+    return max(0.0, min(score, 1.0)), n_matches
 
 
 def close_memmap(mm: np.ndarray) -> None:
@@ -45,62 +96,25 @@ def close_memmap(mm: np.ndarray) -> None:
 
 
 def _extract_list_csr(
-    column: pa.ChunkedArray, name: str
+    column: pa.ChunkedArray,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Validate one PyArrow list column into ``(values, offsets)``."""
-    import pyarrow as pa
-
     col = (
         column.chunk(0) if column.num_chunks == 1 else column.combine_chunks()
     )
-    if not isinstance(col, (pa.ListArray, pa.LargeListArray)):
-        raise TypeError(
-            "Expected PyArrow list arrays for 'mz' and 'intensity' "
-            f"columns, got {type(col).__name__} for {name!r}"
-        )
-    if col.null_count:
-        raise ValueError(f"Null lists are not allowed in {name!r} column")
     offsets = col.offsets.to_numpy().astype(np.int64, copy=False)
     start, stop = int(offsets[0]), int(offsets[-1])
     if start != 0:
         offsets = offsets - start
     values = col.values.slice(start, stop - start)
-    if values.null_count:
-        raise ValueError(f"Null values are not allowed in {name!r} column")
-    flat = np.asarray(values.to_numpy(), dtype=np.float32)
-    return flat, offsets
+    return np.asarray(values.to_numpy(), dtype=np.float32), offsets
 
 
 def extract_arrow_csr(
     table: pa.Table,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Extract contiguous float32 CSR peak buffers from a PyArrow table.
-
-    Parameters
-    ----------
-    table : pa.Table
-        Arrow table containing non-null ``mz`` and ``intensity`` float
-        list columns with matching per-row lengths.
-
-    Returns
-    -------
-    tuple[np.ndarray, np.ndarray, np.ndarray]
-        ``(mz_flat, intensity_flat, offsets)`` where spectrum ``i``
-        occupies slice ``offsets[i]:offsets[i + 1]``.
-
-    Raises
-    ------
-    TypeError
-        If ``mz`` or ``intensity`` is not a PyArrow list array.
-    ValueError
-        If either column contains null lists/values or mismatched
-        offsets.
-    """
-    mz_flat, mz_offsets = _extract_list_csr(table["mz"], "mz")
-    intensity_flat, int_offsets = _extract_list_csr(
-        table["intensity"], "intensity"
-    )
+    """Extract contiguous float32 CSR peaks from a PyArrow table."""
+    mz_flat, mz_offsets = _extract_list_csr(table["mz"])
+    intensity_flat, int_offsets = _extract_list_csr(table["intensity"])
     if not np.array_equal(mz_offsets, int_offsets):
         raise ValueError(
             "Mismatched PyArrow list offsets between 'mz' and 'intensity'"
@@ -111,28 +125,7 @@ def extract_arrow_csr(
 def pack_spectra_csr(
     spec_tuples: Sequence[SpectrumTuple],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Pack variable-length spectrum peaks into contiguous CSR arrays.
-
-    Packing avoids Numba's deprecated reflected-list boxing and improves
-    cache locality across quadratic pairwise distance evaluations.
-
-    Parameters
-    ----------
-    spec_tuples : Sequence[SpectrumTuple]
-        Preprocessed spectra to pack.
-
-    Returns
-    -------
-    tuple[np.ndarray, np.ndarray, np.ndarray]
-        ``(mz_flat, intensity_flat, offsets)`` where spectrum ``i``
-        occupies slice ``offsets[i]:offsets[i + 1]``.
-
-    Raises
-    ------
-    ValueError
-        If any spectrum has mismatched ``mz`` and ``intensity`` lengths.
-    """
+    """Pack variable-length spectrum peaks into CSR arrays."""
     n = len(spec_tuples)
     offsets = np.empty(n + 1, dtype=np.int64)
     offsets[0] = 0
@@ -141,29 +134,13 @@ def pack_spectra_csr(
     for i, spec in enumerate(spec_tuples):
         mz_arr = np.asarray(spec.mz, dtype=np.float32)
         int_arr = np.asarray(spec.intensity, dtype=np.float32)
-        if mz_arr.ndim != 1 or int_arr.ndim != 1:
-            raise ValueError(
-                f"Spectrum {i} peak arrays must be 1D, got shapes "
-                f"{mz_arr.shape} and {int_arr.shape}"
-            )
-        n_mz = len(mz_arr)
-        if n_mz != len(int_arr):
-            raise ValueError(
-                f"Spectrum {i} has mismatched mz ({n_mz}) and intensity "
-                f"({len(int_arr)}) lengths"
-            )
-        offsets[i + 1] = offsets[i] + n_mz
+        offsets[i + 1] = offsets[i] + len(mz_arr)
         mz_arrays.append(mz_arr)
         int_arrays.append(int_arr)
-    total_peaks = int(offsets[n])
-    if total_peaks == 0:
+    if int(offsets[n]) == 0:
         empty = np.empty(0, dtype=np.float32)
         return empty, empty, offsets
-    return (
-        np.concatenate(mz_arrays),
-        np.concatenate(int_arrays),
-        offsets,
-    )
+    return np.concatenate(mz_arrays), np.concatenate(int_arrays), offsets
 
 
 def open_shared_condensed(
@@ -171,42 +148,14 @@ def open_shared_condensed(
     *,
     temp_dir: PathLike | None = None,
 ) -> tuple[str, np.memmap]:
-    """
-    Create a named memmapped condensed distance matrix for tiling.
-
-    The backing ``.npy`` file stays named on disk so worker processes
-    can reopen it by path; the caller must unlink the file when done.
-
-    Parameters
-    ----------
-    n : int
-        Number of spectra in the interval (must be at least 2).
-    temp_dir : PathLike | None, default=None
-        Optional directory for the backing ``.npy`` file; defaults to
-        Python's system temporary directory.
-
-    Returns
-    -------
-    tuple[str, np.memmap]
-        Backing ``.npy`` file path and writable float32 memmap of shape
-        ``(n * (n - 1) // 2,)``.
-
-    Raises
-    ------
-    ValueError
-        If ``n < 2``.
-    """
-    if n < 2:
-        raise ValueError(
-            f"open_shared_condensed requires at least 2 spectra, got {n}"
-        )
+    """Create a named float32 memmap for a condensed distance matrix."""
     target_dir = os.fspath(temp_dir) if temp_dir is not None else None
     with tempfile.NamedTemporaryFile(
         suffix=".npy", dir=target_dir, delete=False
     ) as pdist_file:
         pdist_filename = pdist_file.name
     try:
-        condensed_dist_matrix = np.lib.format.open_memmap(
+        mm = np.lib.format.open_memmap(
             pdist_filename,
             mode="w+",
             dtype=np.float32,
@@ -216,54 +165,7 @@ def open_shared_condensed(
         with contextlib.suppress(OSError):
             os.unlink(pdist_filename)
         raise
-    return pdist_filename, condensed_dist_matrix
-
-
-def _validate_csr_buffers(
-    mz_flat: np.ndarray,
-    intensity_flat: np.ndarray,
-    offsets: np.ndarray,
-) -> int:
-    """Validate 1D CSR peak arrays and offsets; return count."""
-    if offsets.ndim != 1 or offsets.shape[0] < 1:
-        raise ValueError(
-            f"offsets must be 1D with length >= 1, got shape {offsets.shape}"
-        )
-    if not np.issubdtype(offsets.dtype, np.integer):
-        raise ValueError(
-            f"offsets must have an integer dtype, got {offsets.dtype}"
-        )
-    if bool(np.any(offsets[1:] < offsets[:-1])):
-        raise ValueError("offsets must be monotonically non-decreasing")
-    if (
-        mz_flat.ndim != 1
-        or intensity_flat.ndim != 1
-        or mz_flat.shape[0] != intensity_flat.shape[0]
-    ):
-        raise ValueError(
-            "mz_flat and intensity_flat must be 1D arrays of equal length"
-        )
-    if int(offsets[0]) < 0 or int(offsets[-1]) > mz_flat.shape[0]:
-        raise ValueError(
-            f"CSR offsets [{int(offsets[0])}, {int(offsets[-1])}] exceed "
-            f"peak buffer length {mz_flat.shape[0]}"
-        )
-    return int(offsets.shape[0]) - 1
-
-
-def _validate_distance_params(
-    fragment_tol: float, min_matched_peaks: int
-) -> None:
-    """Validate fragment matching tolerance and peak-match floor."""
-    if not math.isfinite(fragment_tol) or fragment_tol < 0.0:
-        raise ValueError(
-            "fragment_tol must be finite and non-negative, got "
-            f"{fragment_tol!r}"
-        )
-    if min_matched_peaks < 0:
-        raise ValueError(
-            f"min_matched_peaks must be non-negative, got {min_matched_peaks}"
-        )
+    return pdist_filename, mm
 
 
 def compute_condensed_distance_matrix_csr(
@@ -276,67 +178,27 @@ def compute_condensed_distance_matrix_csr(
     temp_dir: PathLike | None = None,
 ) -> np.ndarray:
     """
-    Compute the float32 condensed pairwise distance matrix from CSR.
+    Compute the float32 condensed pairwise cosine distance matrix.
 
-    Validates CSR shapes, dtypes, monotonicity, and bounds before
-    invoking the unchecked Numba kernels. Small intervals (fewer than
-    ``MEMMAP_MIN_SPECTRA`` spectra) use an in-memory float32 array;
-    larger intervals allocate a NumPy memmap in ``temp_dir`` (or the
-    system temp directory) and unlink its path immediately on POSIX so
-    space is reclaimed when the memmap is released.
-
-    Parameters
-    ----------
-    mz_flat, intensity_flat : np.ndarray
-        Contiguous 1D fragment m/z and unit-norm intensity buffers.
-    offsets : np.ndarray
-        Monotonic 1D integer CSR offsets of length ``n + 1``.
-    fragment_tol : float
-        Fragment m/z matching tolerance (in Da).
-    min_matched_peaks : int
-        Minimum matched fragment peaks required; pairs below this gate
-        receive distance ``1.0``.
-    temp_dir : PathLike | None, default=None
-        Optional directory for large interval distance memmaps.
-
-    Returns
-    -------
-    np.ndarray
-        Float32 condensed upper-triangle distance vector of length
-        ``n * (n - 1) // 2``.
-
-    Raises
-    ------
-    ValueError
-        If CSR arrays or offsets have invalid shape, dtype, order, or
-        bounds.
+    Small intervals (``< MEMMAP_MIN_SPECTRA``) stay in RAM; larger
+    intervals allocate a memmap in ``temp_dir`` and unlink its path
+    immediately on POSIX so disk space is reclaimed on release.
     """
-    _validate_distance_params(fragment_tol, min_matched_peaks)
-    n = _validate_csr_buffers(mz_flat, intensity_flat, offsets)
+    n = int(offsets.shape[0]) - 1
     if n < 2:
         return np.empty(0, dtype=np.float32)
 
     is_memmap = n >= MEMMAP_MIN_SPECTRA
     if not is_memmap:
-        condensed_dist_matrix: np.ndarray = np.empty(
-            n * (n - 1) // 2, dtype=np.float32
-        )
+        condensed: np.ndarray = np.empty(n * (n - 1) // 2, dtype=np.float32)
     else:
-        pdist_filename, condensed_dist_matrix = open_shared_condensed(
-            n, temp_dir=temp_dir
-        )
-        try:
-            # Unlink immediately after mapping: on POSIX the inode lives
-            # until the memmap is released, preventing temp-file leaks.
-            os.unlink(pdist_filename)
-        except BaseException:
-            close_memmap(condensed_dist_matrix)
-            raise
+        pdist_filename, condensed = open_shared_condensed(n, temp_dir=temp_dir)
+        os.unlink(pdist_filename)
 
     try:
         if nb.get_num_threads() <= 1:
             _condensed_rows_csr(
-                condensed_dist_matrix,
+                condensed,
                 mz_flat,
                 intensity_flat,
                 offsets,
@@ -347,7 +209,7 @@ def compute_condensed_distance_matrix_csr(
             )
         else:
             _condensed_distance_matrix_parallel(
-                condensed_dist_matrix,
+                condensed,
                 mz_flat,
                 intensity_flat,
                 offsets,
@@ -356,54 +218,9 @@ def compute_condensed_distance_matrix_csr(
             )
     except BaseException:
         if is_memmap:
-            close_memmap(condensed_dist_matrix)
+            close_memmap(condensed)
         raise
-    return condensed_dist_matrix
-
-
-def compute_condensed_distance_matrix(
-    spec_tuples: Sequence[SpectrumTuple],
-    fragment_tol: float,
-    min_matched_peaks: int,
-    *,
-    temp_dir: PathLike | None = None,
-) -> np.ndarray:
-    """
-    Compute the float32 condensed pairwise cosine distance matrix.
-
-    Packs ``spec_tuples`` into CSR buffers and delegates to
-    :func:`compute_condensed_distance_matrix_csr`.
-
-    Parameters
-    ----------
-    spec_tuples : Sequence[SpectrumTuple]
-        Preprocessed spectra to compare pairwise.
-    fragment_tol : float
-        Fragment m/z matching tolerance (in Da).
-    min_matched_peaks : int
-        Minimum matched fragment peaks required; pairs below this gate
-        receive distance ``1.0``.
-    temp_dir : PathLike | None, default=None
-        Optional directory for large interval distance memmaps.
-
-    Returns
-    -------
-    np.ndarray
-        Float32 condensed upper-triangle distance vector of length
-        ``n * (n - 1) // 2``.
-    """
-    _validate_distance_params(fragment_tol, min_matched_peaks)
-    if len(spec_tuples) < 2:
-        return np.empty(0, dtype=np.float32)
-    mz_flat, intensity_flat, offsets = pack_spectra_csr(spec_tuples)
-    return compute_condensed_distance_matrix_csr(
-        mz_flat,
-        intensity_flat,
-        offsets,
-        fragment_tol,
-        min_matched_peaks,
-        temp_dir=temp_dir,
-    )
+    return condensed
 
 
 def fill_condensed_rows_csr(
@@ -416,70 +233,18 @@ def fill_condensed_rows_csr(
     fragment_tol: float,
     min_matched_peaks: int,
 ) -> None:
-    """
-    Fill condensed distance rows ``[r0, r1)`` serially from CSR arrays.
-
-    Validates array shapes, dtypes, and bounds in Python before invoking
-    the unchecked Numba kernel. Enables tile workers to stream directly
-    from PyArrow ``ListArray`` CSR buffers without constructing
-    intermediate ``SpectrumTuple`` objects.
-
-    Parameters
-    ----------
-    condensed_dist_matrix : np.ndarray
-        Shared floating-point condensed distance buffer written in
-        place.
-    mz_flat, intensity_flat : np.ndarray
-        Contiguous 1D fragment m/z and unit-norm intensity buffers.
-    offsets : np.ndarray
-        Monotonic 1D integer CSR offsets of length ``n + 1``.
-    r0 : int
-        Start row index (inclusive, ``0 <= r0 <= r1 <= n``).
-    r1 : int
-        Stop row index (exclusive, ``0 <= r0 <= r1 <= n``).
-    fragment_tol : float
-        Fragment m/z matching tolerance (in Da).
-    min_matched_peaks : int
-        Minimum matched peaks required for nonzero similarity.
-
-    Raises
-    ------
-    ValueError
-        If row bounds, condensed buffer dtype/size, or CSR arrays are
-        invalid.
-    """
-    _validate_distance_params(fragment_tol, min_matched_peaks)
-    n = _validate_csr_buffers(mz_flat, intensity_flat, offsets)
-    if r0 < 0 or r1 < 0 or r0 > n or r1 > n or r0 > r1:
-        raise ValueError(
-            f"Row band [{r0}, {r1}) out of bounds for n={n} spectra"
+    """Fill condensed distance rows ``[r0, r1)`` serially from CSR."""
+    if r0 < r1:
+        _condensed_rows_csr(
+            condensed_dist_matrix,
+            mz_flat,
+            intensity_flat,
+            offsets,
+            r0,
+            r1,
+            fragment_tol,
+            min_matched_peaks,
         )
-    required = n * (n - 1) // 2
-    if not np.issubdtype(condensed_dist_matrix.dtype, np.floating):
-        raise ValueError(
-            "condensed_dist_matrix must have a floating dtype, got "
-            f"{condensed_dist_matrix.dtype}"
-        )
-    if (
-        condensed_dist_matrix.ndim != 1
-        or condensed_dist_matrix.shape[0] < required
-    ):
-        raise ValueError(
-            f"condensed_dist_matrix must be 1D with length >= {required}, "
-            f"got shape {condensed_dist_matrix.shape}"
-        )
-    if r0 == r1:
-        return
-    _condensed_rows_csr(
-        condensed_dist_matrix,
-        mz_flat,
-        intensity_flat,
-        offsets,
-        r0,
-        r1,
-        fragment_tol,
-        min_matched_peaks,
-    )
 
 
 @nb.njit(cache=True, boundscheck=False)
@@ -493,7 +258,6 @@ def _fill_distance_row(
     fragment_tol: float,
     min_matched_peaks: int,
 ) -> None:
-    """Fill condensed upper-triangle row ``i`` from CSR peak arrays."""
     s1, e1 = offsets[i], offsets[i + 1]
     mz1 = mz_flat[s1:e1]
     int1 = intensity_flat[s1:e1]
@@ -523,7 +287,6 @@ def _condensed_rows_csr(
     fragment_tol: float,
     min_matched_peaks: int,
 ) -> None:
-    """Fill condensed upper-triangle rows ``[r0, r1)`` from CSR data."""
     n = len(offsets) - 1
     stop = min(r1, n - 1)
     for i in range(r0, stop):
@@ -548,7 +311,6 @@ def _condensed_distance_matrix_parallel(
     fragment_tol: float,
     min_matched_peaks: int,
 ) -> None:
-    """Fill the condensed pairwise distance matrix with paired rows."""
     n = len(offsets) - 1
     n_rows = n - 1
     half = (n_rows + 1) // 2
@@ -579,27 +341,7 @@ def _condensed_distance_matrix_parallel(
 
 @nb.njit(cache=True, boundscheck=False)
 def condensed_index(i: int, j: int, n: int) -> int:
-    """
-    Map a pair ``(i, j)`` to its SciPy condensed distance matrix index.
-
-    Symmetric in ``i`` and ``j``; indices are swapped when ``i > j``.
-    Hot-loop helper with no bounds checks; callers must guarantee
-    ``0 <= i, j < n`` and ``i != j``.
-
-    Parameters
-    ----------
-    i : int
-        First spectrum index (``0 <= i < n``).
-    j : int
-        Second spectrum index (``0 <= j < n``, ``j != i``).
-    n : int
-        Total number of spectra (``n > 1``).
-
-    Returns
-    -------
-    int
-        Flat 0-based index into the condensed upper-triangle array.
-    """
+    """Map an index pair ``(i, j)`` to its condensed matrix offset."""
     if i > j:
         i, j = j, i
     return int(n * i + j - ((i + 2) * (i + 1)) // 2)

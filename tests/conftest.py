@@ -85,21 +85,6 @@ def spectrum_row():
 
 
 @pytest.fixture(scope="session")
-def mock_spectra():
-    """Factory fixture creating identical L2-normalized SpectrumTuples."""
-
-    def _make(n, n_peaks=3):
-        mz = [100.0 + float(j) for j in range(n_peaks)]
-        intensity = [0.5 + 0.1 * j for j in range(n_peaks)]
-        return [
-            make_spectrum_tuple(mz, intensity, precursor_mz=100.0, charge=2)
-            for _ in range(n)
-        ]
-
-    return _make
-
-
-@pytest.fixture(scope="session")
 def mgf_block():
     """Expose ``format_mgf_spectrum`` as a session fixture."""
     return format_mgf_spectrum
@@ -133,7 +118,7 @@ def lance_dataset(tmp_path):
         import lance
         import pyarrow as pa
 
-        from falcon.dataset import SPECTRUM_SCHEMA, bucket_dataset_name
+        from falcon.staging import SPECTRUM_SCHEMA, bucket_dataset_name
 
         filename = name if name is not None else bucket_dataset_name((charge,))
         target = tmp_path / filename

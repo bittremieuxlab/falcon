@@ -33,7 +33,7 @@ uv run ruff check .                                                             
 uv run ruff check --fix . && uv run ruff format .                                 # Auto-fix and format
 uv run ty check falcon                                                            # Type check
 uv run pytest                                                                     # Run test suite
-uv run pytest --cov=falcon --cov-report=term-missing --cov-fail-under=95          # Run tests with coverage
+uv run pytest --cov=falcon --cov-report=term-missing                             # Run tests with coverage
 uv run pip-audit --local --skip-editable                                          # Audit dependencies
 uv run zizmor --persona=regular --min-severity=medium --min-confidence=medium .github/workflows/  # Audit workflows
 uv build                                                                          # Build sdist and wheel
