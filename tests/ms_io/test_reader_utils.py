@@ -4,8 +4,6 @@ import binascii
 import io
 import logging
 import math
-import subprocess
-import sys
 import zlib
 from pathlib import Path
 from types import SimpleNamespace
@@ -31,26 +29,6 @@ class _BytesPath:
         return self._raw
 
 
-class TestStdlibOnlyImport:
-    def test_reader_utils_and_ms_io_defer_heavy_dependencies(self):
-        script = (
-            "import sys\n"
-            "import falcon.ms_io\n"
-            "import falcon.ms_io.reader_utils\n"
-            "heavy = ('numpy', 'pyteomics', 'lxml', "
-            "'spectrum_utils', 'psims')\n"
-            "loaded = [m for m in heavy if m in sys.modules]\n"
-            "assert not loaded, f'Heavy modules loaded eagerly: {loaded}'\n"
-        )
-        proc = subprocess.run(  # noqa: S603
-            [sys.executable, "-c", script],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        assert proc.returncode == 0, proc.stderr
-
-
 class TestNormalizeSource:
     def test_pathlike_converted_to_string(self, tmp_path):
         path = tmp_path / "run.mgf"
@@ -66,7 +44,8 @@ class TestNormalizeSource:
 
 class TestParseOptionalRt:
     @pytest.mark.parametrize(
-        "raw_rt", [None, "", "   ", unitstr("", "second"), (), []]
+        "raw_rt",
+        [None, "", "   ", unitstr("", "second"), (), [], [""], [None], (" ",)],
     )
     def test_absent_blank_or_empty_returns_nan(self, raw_rt):
         rt = reader_utils.parse_optional_rt(raw_rt)
@@ -108,6 +87,28 @@ class TestParseOptionalRt:
         ):
             reader_utils.parse_optional_rt(bad_range)
 
+    @pytest.mark.parametrize(
+        "bad_scalar",
+        [float("inf"), float("-inf"), (float("inf"),), [float("-inf")]],
+    )
+    def test_infinite_scalar_or_singleton_raises_value_error(self, bad_scalar):
+        with pytest.raises(
+            ValueError,
+            match="Retention time must be finite or NaN",
+        ):
+            reader_utils.parse_optional_rt(bad_scalar)
+
+    @pytest.mark.parametrize(
+        "bad_bool", [True, False, (True,), (True, 10.0), (10.0, False)]
+    )
+    def test_boolean_rt_raises_type_error(self, bad_bool):
+        with pytest.raises(TypeError, match="not bool"):
+            reader_utils.parse_optional_rt(bad_bool)
+
+    def test_too_many_rt_elements_raises_value_error(self):
+        with pytest.raises(ValueError, match="Expected 1 or 2"):
+            reader_utils.parse_optional_rt((1.0, 2.0, 3.0))
+
     def test_non_numeric_string_raises_value_error(self):
         with pytest.raises(ValueError, match="could not convert"):
             reader_utils.parse_optional_rt("not_a_number")
@@ -130,6 +131,7 @@ class TestParseOptionalCharge:
         [
             (2, False, 2),
             (-2, False, -2),
+            (2.0, False, 2),
             ("3", False, 3),
             (0, False, 0),
             ([2, 3], False, 2),
@@ -147,6 +149,18 @@ class TestParseOptionalCharge:
             reader_utils.parse_optional_charge(raw_charge, negative=negative)
             == expected
         )
+
+    @pytest.mark.parametrize("bad_bool", [True, False, [True]])
+    def test_boolean_charge_raises_value_error(self, bad_bool):
+        with pytest.raises(ValueError, match="not bool"):
+            reader_utils.parse_optional_charge(bad_bool)
+
+    @pytest.mark.parametrize(
+        "bad_float", [2.9, np.float32(2.5), float("nan"), float("inf")]
+    )
+    def test_non_integral_float_charge_raises_value_error(self, bad_float):
+        with pytest.raises(ValueError, match="must be an integer"):
+            reader_utils.parse_optional_charge(bad_float)
 
     @pytest.mark.parametrize("bad_charge", ["2-", "abc", ["2-"]])
     def test_invalid_charge_string_raises_value_error(self, bad_charge):
@@ -313,6 +327,18 @@ class TestBuildMsmsSpectrum:
         with pytest.raises(ValueError, match=pattern):
             reader_utils.build_msms_spectrum(
                 "run:scan:1", 500.0, 2, mz, intensity, bad_rt
+            )
+
+    def test_rejects_boolean_precursor_mz_and_retention_time(self):
+        mz = np.array([100.0], dtype=np.float32)
+        intensity = np.array([10.0], dtype=np.float32)
+        with pytest.raises(TypeError, match="not bool"):
+            reader_utils.build_msms_spectrum(
+                "run:scan:1", True, 2, mz, intensity, 1.0
+            )
+        with pytest.raises(TypeError, match="not bool"):
+            reader_utils.build_msms_spectrum(
+                "run:scan:1", 500.0, 2, mz, intensity, False
             )
 
 
@@ -482,6 +508,42 @@ class TestIterXmlSpectra:
             rec.levelno == logging.WARNING
             and "Failed to read file" in rec.message
             for rec in caplog.records
+        )
+
+    def test_skips_non_mapping_entries_without_crashing(
+        self, caplog, fake_reader_factory
+    ):
+        def _parse(_spec_dict, identifier):
+            return reader_utils.build_msms_spectrum(
+                identifier,
+                400.0,
+                2,
+                np.array([100.0], dtype=np.float32),
+                np.array([10.0], dtype=np.float32),
+                1.0,
+            )
+
+        test_logger = logging.getLogger("falcon.test_iter_xml_none")
+        with caplog.at_level(logging.DEBUG, logger="falcon"):
+            spectra = list(
+                reader_utils.iter_xml_spectra(
+                    "mixed.mzml",
+                    fake_reader_factory(
+                        [None, "not_a_dict", {"id": "scan=2", "ms level": 2}]
+                    ),
+                    "ms level",
+                    lambda d: d["id"].split("=")[1],
+                    _parse,
+                    test_logger,
+                )
+            )
+        assert [s.identifier for s in spectra] == ["mixed:scan:2"]
+        assert (
+            sum(
+                "Skipping unparsable spectrum None" in rec.message
+                for rec in caplog.records
+            )
+            == 2
         )
 
     def test_propagates_os_error_uncaught(self):

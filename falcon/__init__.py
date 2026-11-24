@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 from importlib.metadata import PackageNotFoundError, version
 from typing import TYPE_CHECKING, Any
 
@@ -31,29 +32,23 @@ __all__ = [
 ]
 
 
-_CONFIG_EXPORTS = frozenset(
-    {
-        "FalconConfig",
-        "FalconSettings",
-        "load_config",
-        "load_settings",
-    }
-)
+_LAZY_EXPORTS: dict[str, str] = {
+    "FalconConfig": ".config",
+    "FalconSettings": ".config",
+    "load_config": ".config",
+    "load_settings": ".config",
+    "run": ".pipeline",
+}
 
 
 def __getattr__(name: str) -> Any:
     """Lazily expose configuration and pipeline APIs at module level."""
-    if name in _CONFIG_EXPORTS:
-        from . import config
-
-        value = getattr(config, name)
+    module_name = _LAZY_EXPORTS.get(name)
+    if module_name is not None:
+        module = importlib.import_module(module_name, __name__)
+        value = getattr(module, name)
         globals()[name] = value
         return value
-    if name == "run":
-        from .pipeline import run
-
-        globals()[name] = run
-        return run
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 

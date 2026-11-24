@@ -7,12 +7,14 @@ import pytest
 
 from falcon.types import (
     AUTO_SENTINEL,
+    INT32_MAX,
     NONE_SENTINEL,
     ChargeValue,
     ClusterResult,
     ConsensusTuple,
     SpectrumTuple,
     charge_sort_key,
+    coerce_exact_int,
     make_consensus_tuple,
     mz_bin_bounds,
     offset_cluster_result,
@@ -21,9 +23,49 @@ from falcon.types import (
 )
 
 
+class TestCoerceExactInt:
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            (2, 2),
+            (-1, -1),
+            (np.int8(3), 3),
+            (2.0, 2),
+            (np.float32(-4.0), -4),
+            ("5", 5),
+            (" -3 ", -3),
+        ],
+    )
+    def test_accepts_integers_integral_floats_and_int_strings(
+        self, raw, expected
+    ):
+        result = coerce_exact_int(raw, label="charge")
+        assert type(result) is int
+        assert result == expected
+
+    @pytest.mark.parametrize(
+        ("bad", "match"),
+        [
+            (True, "charge must be an integer, not bool"),
+            (False, "charge must be an integer, not bool"),
+            (2.5, "charge must be an integer"),
+            (np.float32(1.25), "charge must be an integer"),
+            (float("nan"), "charge must be an integer"),
+            (float("inf"), "charge must be an integer"),
+            ("2.0", "invalid literal"),
+            ("abc", "invalid literal"),
+        ],
+    )
+    def test_rejects_bools_non_integral_floats_and_invalid_strings(
+        self, bad, match
+    ):
+        with pytest.raises(ValueError, match=match):
+            coerce_exact_int(bad, label="charge")
+
+
 class TestSpectrumAndConsensusRecords:
     @pytest.mark.parametrize(
-        "charge", [2, np.int8(3), None, float("nan"), float("inf")]
+        "charge", [2, 2.0, np.int8(3), None, float("nan"), float("inf")]
     )
     def test_make_consensus_tuple_normalizes_dtypes_and_missing_charge(
         self, charge
@@ -45,7 +87,24 @@ class TestSpectrumAndConsensusRecords:
         if charge is None or not math.isfinite(float(charge)):
             assert math.isnan(rep.precursor_charge)
         else:
-            assert rep.precursor_charge == np.int32(charge)
+            assert rep.precursor_charge == np.int32(int(charge))
+
+    @pytest.mark.parametrize(
+        ("bad_charge", "match"),
+        [(True, "not bool"), (False, "not bool"), (2.7, "must be an integer")],
+    )
+    def test_make_consensus_tuple_rejects_bool_and_non_integral_charge(
+        self, bad_charge, match
+    ):
+        with pytest.raises(ValueError, match=match):
+            make_consensus_tuple(
+                precursor_mz=500.0,
+                precursor_charge=bad_charge,
+                mz=np.array([100.0], dtype=np.float32),
+                intensity=np.array([1.0], dtype=np.float32),
+                retention_time=10.0,
+                cluster_id=0,
+            )
 
     @pytest.mark.parametrize("charge", [2, None])
     def test_consensus_tuple_from_spectrum(self, charge):
@@ -135,6 +194,35 @@ class TestClusterResultOffsetting:
         assert shifted.labels.size == 0
         assert shifted.representatives == []
         assert next_offset == 42
+
+    def test_offset_cluster_result_validates_bounds_shape_and_int32_overflow(
+        self, consensus_factory
+    ):
+        valid = ClusterResult(
+            labels=np.array([0, 1], dtype=np.int32),
+            representatives=[consensus_factory(cluster_id=0)],
+        )
+        with pytest.raises(ValueError, match="non-negative"):
+            offset_cluster_result(valid, offset=-1)
+
+        bad_2d = ClusterResult(
+            labels=np.zeros((1, 2), dtype=np.int32), representatives=[]
+        )
+        with pytest.raises(ValueError, match="must be 1D"):
+            offset_cluster_result(bad_2d, offset=0)
+
+        near_max = ClusterResult(
+            labels=np.array([0, INT32_MAX], dtype=np.int32), representatives=[]
+        )
+        with pytest.raises(OverflowError, match="exceeds int32 maximum"):
+            offset_cluster_result(near_max, offset=1)
+
+        rep_overflow = ClusterResult(
+            labels=np.array([0], dtype=np.int32),
+            representatives=[consensus_factory(cluster_id=INT32_MAX)],
+        )
+        with pytest.raises(OverflowError, match="exceeds int32 maximum"):
+            offset_cluster_result(rep_overflow, offset=1)
 
 
 class TestChargeBucketsAndSentinels:

@@ -58,6 +58,17 @@ class TestPrepareOutputs:
             export.prepare_outputs(cfg.io)
         assert input_file.read_text(encoding="utf-8") == "precious input"
 
+    @pytest.mark.parametrize("alias_ext", ["csv", "mgf"])
+    def test_rejects_output_aliasing_work_dir_before_creating_work_dir(
+        self, tmp_path, alias_ext, config_factory
+    ):
+        cfg = config_factory(
+            output_filename=tmp_path / "run",
+            io={"work_dir": str(tmp_path / f"run.{alias_ext}")},
+        )
+        with pytest.raises(ValueError, match="aliases working directory"):
+            export.prepare_outputs(cfg.io)
+
     def test_rejects_missing_output_parent_directory(
         self, tmp_path, config_factory
     ):

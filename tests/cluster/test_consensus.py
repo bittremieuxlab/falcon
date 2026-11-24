@@ -523,6 +523,31 @@ class TestClusterAveragesAndDispatch:
         )
         assert reps == []
 
+    @pytest.mark.parametrize(
+        ("lower", "upper"),
+        [
+            (0.0, 1.5),
+            (-1.0, 1.5),
+            (float("nan"), 1.5),
+            (float("inf"), 1.5),
+            (1.5, 0.0),
+            (1.5, float("nan")),
+        ],
+    )
+    def test_average_rejects_invalid_outlier_cutoffs(self, lower, upper):
+        with pytest.raises(ValueError, match="finite and positive"):
+            consensus.get_cluster_averages(
+                [],
+                np.empty(0, dtype=np.int32),
+                np.empty(0, dtype=np.float32),
+                np.empty(0, dtype=np.int64),
+                min_mz=50.0,
+                max_mz=300.0,
+                fragment_tol=0.5,
+                outlier_cutoff_lower=lower,
+                outlier_cutoff_upper=upper,
+            )
+
     def test_get_representative_spectra_dispatches_and_rejects_unknown(
         self, spec_factory
     ):

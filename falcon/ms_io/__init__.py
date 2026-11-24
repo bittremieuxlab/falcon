@@ -6,6 +6,8 @@ import importlib
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from ..utils import require_regular_file
+
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator
 
@@ -60,12 +62,11 @@ def get_spectra(filename: PathLike) -> Iterator[sus.MsmsSpectrum]:
         If ``filename`` has an unsupported extension.
     """
     path = Path(filename)
-    if path.is_dir():
-        raise IsADirectoryError(
-            f"Peak file path is a directory, not a file: {filename}"
-        )
-    if not path.is_file():
-        raise FileNotFoundError(f"Non-existing peak file {filename}")
+    require_regular_file(
+        path,
+        dir_message=f"Peak file path is a directory, not a file: {filename}",
+        missing_message=f"Non-existing peak file {filename}",
+    )
 
     ext = path.suffix.lower()
     if ext == ".mgf":

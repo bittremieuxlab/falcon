@@ -17,14 +17,10 @@ from .config import (
     AverageConsensusConfig,
     ClusteringConfig,
     ConfigError,
-    ConsensusMethod,
     IOConfig,
-    LinkageMethod,
     MedoidConsensusConfig,
     PrecursorTolerance,
-    PrecursorTolMode,
     PreprocessingConfig,
-    ScalingMethod,
     build_json_schema,
     format_toml,
     load_config,
@@ -33,7 +29,16 @@ from .config import (
     validate_file_path,
     write_saved_config,
 )
-from .types import AUTO_SENTINEL, NONE_SENTINEL, OTHER_BUCKET, UNKNOWN_CHARGE
+from .types import (
+    AUTO_SENTINEL,
+    NONE_SENTINEL,
+    OTHER_BUCKET,
+    UNKNOWN_CHARGE,
+    ConsensusMethod,
+    LinkageMethod,
+    PrecursorTolMode,
+    ScalingMethod,
+)
 from .utils import configure_logger
 
 if TYPE_CHECKING:
@@ -190,6 +195,36 @@ _cli_optional_float = _cli_optional(_cli_float)
 _cli_optional_int = _cli_optional(_cli_int)
 
 
+def _parse_cli_charge_bucket(raw: str) -> list[int | str] | str:
+    """Parse one stripped CLI charge-bucket token."""
+    if raw == OTHER_BUCKET:
+        return OTHER_BUCKET
+    has_open = raw.startswith("[")
+    has_close = raw.endswith("]")
+    if has_open != has_close:
+        raise ConfigError(f"Unbalanced brackets in charge bucket {raw!r}")
+    inner = raw[1:-1] if has_open else raw
+    if not inner.strip():
+        raise ConfigError(f"Empty charge bucket: {raw!r}")
+
+    bucket: list[int | str] = []
+    for part in inner.split(","):
+        part_clean = part.strip()
+        if not part_clean:
+            raise ConfigError(f"Empty charge entry in bucket {raw!r}")
+        if part_clean == UNKNOWN_CHARGE:
+            bucket.append(UNKNOWN_CHARGE)
+            continue
+        try:
+            bucket.append(int(part_clean))
+        except ValueError as exc:
+            raise ConfigError(
+                f"Invalid charge value {part_clean!r} in bucket "
+                f"{raw!r} (expected integer or '{UNKNOWN_CHARGE}')"
+            ) from exc
+    return bucket
+
+
 def _parse_cli_charge_buckets(
     tokens: Sequence[str],
 ) -> str | list[list[int | str] | str]:
@@ -202,39 +237,7 @@ def _parse_cli_charge_buckets(
             f"Cannot combine '{AUTO_SENTINEL}' with explicit "
             "--precursor-charge-buckets"
         )
-
-    buckets: list[list[int | str] | str] = []
-    for raw in stripped:
-        if raw == OTHER_BUCKET:
-            buckets.append(OTHER_BUCKET)
-            continue
-        inner = raw
-        has_open = inner.startswith("[")
-        has_close = inner.endswith("]")
-        if has_open != has_close:
-            raise ConfigError(f"Unbalanced brackets in charge bucket {raw!r}")
-        if has_open:
-            inner = inner[1:-1]
-        if not inner.strip():
-            raise ConfigError(f"Empty charge bucket: {raw!r}")
-
-        bucket: list[int | str] = []
-        for part in inner.split(","):
-            part_clean = part.strip()
-            if not part_clean:
-                raise ConfigError(f"Empty charge entry in bucket {raw!r}")
-            if part_clean == UNKNOWN_CHARGE:
-                bucket.append(UNKNOWN_CHARGE)
-            else:
-                try:
-                    bucket.append(int(part_clean))
-                except ValueError as exc:
-                    raise ConfigError(
-                        f"Invalid charge value {part_clean!r} in bucket "
-                        f"{raw!r} (expected integer or '{UNKNOWN_CHARGE}')"
-                    ) from exc
-        buckets.append(bucket)
-    return buckets
+    return [_parse_cli_charge_bucket(raw) for raw in stripped]
 
 
 def _add_config_args(parser: argparse.ArgumentParser) -> None:
@@ -626,20 +629,15 @@ def main(args: Sequence[str] | None = None) -> int:
     if isinstance(action, DumpSchemaAction):
         print(json.dumps(build_json_schema(), indent=2))
         return 0
-    if isinstance(action, PrintConfigAction):
-        try:
+    try:
+        if isinstance(action, PrintConfigAction):
             print(format_toml(action.settings), end="")
-        except ConfigError as exc:
-            print(f"falcon: error: {exc}", file=sys.stderr)
-            return 2
-        return 0
-
-    if action.save_config is not None:
-        try:
+            return 0
+        if action.save_config is not None:
             write_saved_config(action.config, action.save_config)
-        except ConfigError as exc:
-            print(f"falcon: error: {exc}", file=sys.stderr)
-            return 2
+    except ConfigError as exc:
+        print(f"falcon: error: {exc}", file=sys.stderr)
+        return 2
 
     # Defer importing heavy pipeline dependencies until an actual run.
     from .pipeline import run

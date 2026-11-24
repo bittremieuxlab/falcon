@@ -6,7 +6,6 @@ import json
 import logging
 import os
 import shutil
-import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -18,7 +17,7 @@ from ..dataset import (
     spectra_dir,
 )
 from ..types import OTHER_BUCKET, charge_sort_key, parse_charge_bucket_list
-from ..utils import resolve_path
+from ..utils import atomic_write_text, resolve_input_files, resolve_path
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -143,15 +142,18 @@ def build_staging_manifest(
     """
     input_entries: list[dict[str, Any]] = []
     for input_path in resolved_inputs:
+        abs_path = Path(os.path.abspath(input_path))
+        logical = resolve_path(abs_path.parent) / abs_path.name
         resolved = resolve_path(input_path)
         st = os.stat(resolved)
-        input_entries.append(
-            {
-                "path": str(resolved),
-                "size": st.st_size,
-                "mtime_ns": st.st_mtime_ns,
-            }
-        )
+        entry: dict[str, Any] = {
+            "path": str(logical),
+            "size": st.st_size,
+            "mtime_ns": st.st_mtime_ns,
+        }
+        if resolved != logical:
+            entry["target"] = str(resolved)
+        input_entries.append(entry)
 
     return {
         "schema_version": STAGING_CACHE_SCHEMA_VERSION,
@@ -210,25 +212,11 @@ def _cache_error(message: str) -> ValueError:
     return ValueError(f"{message}; {_CACHE_HINT}")
 
 
-def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
     """Atomically write JSON metadata to ``path`` via rename."""
-    fd, tmp_name = tempfile.mkstemp(
-        dir=path.parent, prefix=".staging_cache_", suffix=".tmp"
-    )
-    tmp_path = Path(tmp_name)
-    try:
-        try:
-            f_out = os.fdopen(fd, "w", encoding="utf-8")
-        except BaseException:
-            os.close(fd)
-            raise
-        with f_out:
-            json.dump(payload, f_out, indent=2, allow_nan=False)
-            f_out.write("\n")
-        os.replace(tmp_path, path)
-    except BaseException:
-        tmp_path.unlink(missing_ok=True)
-        raise
+    with atomic_write_text(path, prefix=".staging_cache_") as f_out:
+        json.dump(payload, f_out, indent=2, allow_nan=False)
+        f_out.write("\n")
 
 
 def _has_unverified_staging_files(target_dir: Path) -> bool:
@@ -331,9 +319,18 @@ def load_or_stage_buckets(
     -------
     list[ChargeBucket]
         Charge bucket keys with staged Lance datasets.
-    """
-    from .ingest import resolve_input_files, stage_spectra
 
+    Raises
+    ------
+    FileNotFoundError
+        If an input pattern matches no files or refers to a missing
+        file.
+    IsADirectoryError
+        If an input path refers to a directory.
+    ValueError
+        If an existing cache is corrupted, mismatched, or unverified
+        when ``config.io.overwrite`` is ``False``.
+    """
     resolved_inputs = resolve_input_files(config.io.input_filenames)
     expected_manifest = build_staging_manifest(config, resolved_inputs)
     target_dir = spectra_dir(work_dir)
@@ -351,6 +348,8 @@ def load_or_stage_buckets(
             f"Working directory {work_dir} contains an unverified or legacy "
             "staging cache without staging_cache.json"
         )
+
+    from .ingest import stage_spectra
 
     charge_buckets = stage_spectra(
         resolved_inputs,

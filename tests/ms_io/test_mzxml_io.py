@@ -374,7 +374,7 @@ class TestMzxmlGetSpectra:
         assert bare_spectra[0].precursor_mz == pytest.approx(450.25)
         assert bare_spectra[0].precursor_charge is None
 
-    def test_skips_none_precursor_mz_type_error(
+    def test_skips_none_or_bare_string_precursor_mz(
         self, monkeypatch, fake_reader_factory
     ):
         raws = [
@@ -383,13 +383,17 @@ class TestMzxmlGetSpectra:
                 "id": "1",
                 "precursorMz": [{"precursorMz": None}],
             },
-            {**_mzxml_dict(), "id": "2"},
+            {
+                **_mzxml_dict(),
+                "id": "2",
+                "precursorMz": "450.25",
+            },
+            {**_mzxml_dict(), "id": "3"},
         ]
-        monkeypatch.setattr(
-            pyteomics.mzxml, "MzXML", fake_reader_factory(raws)
+        spectra = _read_mzxml_dicts(
+            monkeypatch, fake_reader_factory, raws, source="bad_prec.mzxml"
         )
-        spectra = list(mzxml_io.get_spectra("bad_prec.mzxml"))
-        assert [s.identifier for s in spectra] == ["bad_prec:scan:2"]
+        assert [s.identifier for s in spectra] == ["bad_prec:scan:3"]
 
     def test_blank_retention_time_yields_nan_rt(
         self, monkeypatch, fake_reader_factory
@@ -398,10 +402,9 @@ class TestMzxmlGetSpectra:
             {**_mzxml_dict(rt=""), "id": "10"},
             {**_mzxml_dict(rt="   "), "id": "11"},
         ]
-        monkeypatch.setattr(
-            pyteomics.mzxml, "MzXML", fake_reader_factory(raws)
+        spectra = _read_mzxml_dicts(
+            monkeypatch, fake_reader_factory, raws, source="blank_rt.mzxml"
         )
-        spectra = list(mzxml_io.get_spectra("blank_rt.mzxml"))
         assert [s.identifier for s in spectra] == [
             "blank_rt:scan:10",
             "blank_rt:scan:11",

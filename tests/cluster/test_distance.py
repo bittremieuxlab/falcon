@@ -74,10 +74,20 @@ class TestPackAndExtractCsr:
         np.testing.assert_allclose(int_flat, [0.6, 0.8, 1.0])
         np.testing.assert_array_equal(offsets, [0, 2, 3])
 
-    def test_pack_rejects_mismatched_peak_lengths(self, spec_factory):
+    def test_pack_rejects_mismatched_and_non_1d_peak_arrays(
+        self, spec_factory
+    ):
         bad = spec_factory([100.0, 200.0], [1.0], normalize=False)
         with pytest.raises(ValueError, match="mismatched mz"):
             distance.pack_spectra_csr([bad])
+
+        bad_2d = spec_factory(
+            np.zeros((2, 2), dtype=np.float32),
+            np.zeros((2, 2), dtype=np.float32),
+            normalize=False,
+        )
+        with pytest.raises(ValueError, match="must be 1D"):
+            distance.pack_spectra_csr([bad_2d])
 
     def test_extract_arrow_csr_validates_columns_and_types(self):
         table = pa.table(
@@ -405,6 +415,46 @@ class TestComputeCondensedDistanceMatrix:
                 offsets,
                 fragment_tol=0.05,
                 min_matched_peaks=0,
+            )
+
+    @pytest.mark.parametrize(
+        ("frag_tol", "min_peaks", "match"),
+        [
+            (-0.01, 0, "fragment_tol must be finite"),
+            (float("nan"), 0, "fragment_tol must be finite"),
+            (float("inf"), 0, "fragment_tol must be finite"),
+            (0.05, -1, "min_matched_peaks must be non-negative"),
+        ],
+    )
+    def test_distance_apis_reject_invalid_tol_and_min_matched_peaks(
+        self, mock_spectra, frag_tol, min_peaks, match
+    ):
+        specs = mock_spectra(2, n_peaks=2)
+        mz_flat, int_flat, offsets = distance.pack_spectra_csr(specs)
+        buf = np.empty(1, dtype=np.float32)
+
+        with pytest.raises(ValueError, match=match):
+            distance.compute_condensed_distance_matrix(
+                [], fragment_tol=frag_tol, min_matched_peaks=min_peaks
+            )
+        with pytest.raises(ValueError, match=match):
+            distance.compute_condensed_distance_matrix_csr(
+                mz_flat,
+                int_flat,
+                offsets,
+                fragment_tol=frag_tol,
+                min_matched_peaks=min_peaks,
+            )
+        with pytest.raises(ValueError, match=match):
+            distance.fill_condensed_rows_csr(
+                buf,
+                mz_flat,
+                int_flat,
+                offsets,
+                0,
+                2,
+                fragment_tol=frag_tol,
+                min_matched_peaks=min_peaks,
             )
 
 

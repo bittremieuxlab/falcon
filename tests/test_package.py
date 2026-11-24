@@ -9,7 +9,7 @@ import pytest
 
 import falcon
 import falcon.__main__
-from falcon import cli, config, pipeline, staging
+from falcon import cli, config, pipeline, staging, utils
 from falcon.staging import cache as staging_cache
 from falcon.staging import ingest as staging_ingest
 
@@ -35,6 +35,9 @@ _LAZY_SUBPACKAGE_FORBIDDEN = (
     "fastcluster",
     "numba",
     "spectrum_utils",
+    "pyteomics",
+    "lxml",
+    "psims",
 )
 
 
@@ -97,13 +100,34 @@ class TestPackageMetadataAndExports:
         )
         assert proc.returncode == 0, proc.stderr
 
-    def test_lazy_subpackages_defer_heavy_runtime_deps(self):
+    def test_lazy_subpackages_defer_heavy_runtime_deps(self, tmp_path):
+        mgf = tmp_path / "sample.mgf"
+        mgf.write_text("", encoding="utf-8")
+        work_dir = tmp_path / "work"
+        s_dir = work_dir / "spectra"
+        s_dir.mkdir(parents=True)
+        forbidden = (*_LAZY_SUBPACKAGE_FORBIDDEN, "falcon.staging.ingest")
         script = (
-            "import sys\n"
+            "import json, sys\n"
+            "from pathlib import Path\n"
             "import falcon, falcon.types, falcon.utils, falcon.dataset, "
             "falcon.ms_io, falcon.ms_io.reader_utils, "
             "falcon.cluster, falcon.staging, falcon.staging.cache\n"
-            f"forbidden = {_LAZY_SUBPACKAGE_FORBIDDEN!r}\n"
+            "from falcon.config import load_config\n"
+            f"mgf = Path({str(mgf)!r})\n"
+            f"work_dir = Path({str(work_dir)!r})\n"
+            "resolved = falcon.staging.resolve_input_files([str(mgf)])\n"
+            "assert resolved == [mgf]\n"
+            "cfg = load_config(overrides={'io': {'input_filenames': "
+            "[str(mgf)], 'output_filename': str(work_dir / 'out')}})\n"
+            "manifest = falcon.staging.build_staging_manifest("
+            "cfg, [mgf], buckets=[])\n"
+            "(work_dir / 'spectra' / "
+            "falcon.staging.STAGING_CACHE_FILENAME).write_text("
+            "json.dumps(manifest), encoding='utf-8')\n"
+            "assert falcon.staging.load_or_stage_buckets("
+            "cfg, work_dir, lambda _s: None) == []\n"
+            f"forbidden = {forbidden!r}\n"
             "loaded = [m for m in forbidden if m in sys.modules]\n"
             "assert not loaded, f'Forbidden modules loaded: {loaded}'\n"
         )
@@ -132,6 +156,20 @@ class TestPackageMetadataAndExports:
 
 
 class TestStagingPackageLazyExports:
+    def test_public_exports_match_expected_surface(self):
+        assert staging.__all__ == [
+            "STAGING_CACHE_FILENAME",
+            "STAGING_CACHE_SCHEMA_VERSION",
+            "ChargeRouter",
+            "build_staging_manifest",
+            "deserialize_cached_buckets",
+            "diff_staging_manifests",
+            "load_or_stage_buckets",
+            "resolve_input_files",
+            "serialize_cached_buckets",
+            "stage_spectra",
+        ]
+
     @pytest.mark.parametrize(
         ("attr_name", "expected"),
         [
@@ -152,7 +190,7 @@ class TestStagingPackageLazyExports:
                 staging_cache.serialize_cached_buckets,
             ),
             ("ChargeRouter", staging_ingest.ChargeRouter),
-            ("resolve_input_files", staging_ingest.resolve_input_files),
+            ("resolve_input_files", utils.resolve_input_files),
             ("stage_spectra", staging_ingest.stage_spectra),
         ],
     )

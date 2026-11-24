@@ -322,7 +322,8 @@ def bin_cluster_peaks(
     sorted_int = all_int[order]
     sorted_spec_ids = spec_ids[order]
 
-    change = np.flatnonzero(sorted_bins[1:] != sorted_bins[:-1]) + 1
+    bin_changed = sorted_bins[1:] != sorted_bins[:-1]
+    change = np.flatnonzero(bin_changed) + 1
     starts = np.concatenate((np.array([0], dtype=np.int64), change))
     stops = np.concatenate(
         (change, np.array([len(sorted_bins)], dtype=np.int64))
@@ -330,7 +331,7 @@ def bin_cluster_peaks(
 
     is_new_spec = np.empty(len(sorted_bins), dtype=np.int64)
     is_new_spec[0] = 1
-    is_new_spec[1:] = (sorted_bins[1:] != sorted_bins[:-1]) | (
+    is_new_spec[1:] = bin_changed | (
         sorted_spec_ids[1:] != sorted_spec_ids[:-1]
     )
     distinct_spectra = np.add.reduceat(is_new_spec, starts)
@@ -490,9 +491,21 @@ def get_cluster_averages(
     Raises
     ------
     ValueError
-        If input arrays are not 1D, lengths disagree, or ``order_map``
-        contains out-of-bounds indices.
+        If input arrays are not 1D, lengths disagree, ``order_map``
+        contains out-of-bounds indices, or either outlier cutoff is
+        non-finite or non-positive.
     """
+    if (
+        not math.isfinite(outlier_cutoff_lower)
+        or outlier_cutoff_lower <= 0.0
+        or not math.isfinite(outlier_cutoff_upper)
+        or outlier_cutoff_upper <= 0.0
+    ):
+        raise ValueError(
+            "outlier_cutoff_lower and outlier_cutoff_upper must be finite "
+            f"and positive, got ({outlier_cutoff_lower!r}, "
+            f"{outlier_cutoff_upper!r})"
+        )
     n_labels = _validate_consensus_inputs(spectra, labels, rts, order_map)
     bin_size = 2.0 * fragment_tol
     n_bins, start_dim, _ = mz_bin_bounds(min_mz, max_mz, bin_size)

@@ -37,20 +37,6 @@ def staging_work_dir(tmp_path):
 
 
 class TestResolveInputFiles:
-    def test_public_exports_match_expected_surface(self):
-        assert staging.__all__ == [
-            "STAGING_CACHE_FILENAME",
-            "STAGING_CACHE_SCHEMA_VERSION",
-            "ChargeRouter",
-            "build_staging_manifest",
-            "deserialize_cached_buckets",
-            "diff_staging_manifests",
-            "load_or_stage_buckets",
-            "resolve_input_files",
-            "serialize_cached_buckets",
-            "stage_spectra",
-        ]
-
     def test_expands_globs_sorted_deterministically_and_preserves_duplicates(
         self, tmp_path
     ):
@@ -176,6 +162,24 @@ class TestChargeRouter:
         with pytest.raises(ValueError, match=match):
             staging.ChargeRouter(bad_buckets)
 
+    @pytest.mark.parametrize(
+        ("bad_charge", "match"),
+        [
+            (True, "int8 integer or None"),
+            (False, "int8 integer or None"),
+            (2.5, "int8 integer or None"),
+            ("2", "int8 integer or None"),
+            (128, "outside int8 range"),
+            (-129, "outside int8 range"),
+        ],
+    )
+    def test_route_rejects_bool_non_integer_and_out_of_int8_charges(
+        self, bad_charge, match
+    ):
+        router = staging.ChargeRouter(None)
+        with pytest.raises(ValueError, match=match):
+            router.route(bad_charge)
+
 
 # ----------------------------------------------------------------------
 # Columnar Arrow conversion, Lance writing, and batch writer concurrency
@@ -219,13 +223,19 @@ class TestLanceWritingAndBatchWriter:
         assert empty_table.schema.equals(SPECTRUM_SCHEMA, check_metadata=True)
         assert empty_table.equals(pa.Table.from_pylist([], SPECTRUM_SCHEMA))
 
-    def test_spectra_to_arrow_table_rejects_mismatched_peak_lengths(
+    def test_spectra_to_arrow_table_rejects_mismatched_and_non_1d_peaks(
         self, spectrum_row
     ):
         bad = spectrum_row("s:bad", precursor_charge=2)
         bad["intensity"] = bad["intensity"][:-1]
         with pytest.raises(ValueError, match="mismatched mz"):
             staging_ingest._spectra_to_arrow_table([bad])
+
+        bad_2d = spectrum_row("s:2d", precursor_charge=2)
+        bad_2d["mz"] = np.zeros((2, 2), dtype=np.float32)
+        bad_2d["intensity"] = np.zeros((2, 2), dtype=np.float32)
+        with pytest.raises(ValueError, match="must be 1D"):
+            staging_ingest._spectra_to_arrow_table([bad_2d])
 
     def test_compute_list_offsets_raises_overflow_when_exceeding_int32_limit(
         self, monkeypatch
@@ -346,6 +356,85 @@ class TestLanceWritingAndBatchWriter:
             writer.add_spectra(
                 [spectrum_row(f"s_{i}", precursor_charge=2) for i in range(3)]
             )
+
+    def test_batch_writer_abort_prevents_queued_batches_from_writing(
+        self, staging_work_dir, monkeypatch, spectrum_row
+    ):
+        # Direct pre-lock and in-lock abort early exits.
+        aborted_state = staging_ingest._BucketState()
+        aborted_state.abort.set()
+        assert (
+            staging_ingest._write_to_dataset(
+                [spectrum_row("s0", precursor_charge=2)],
+                (2,),
+                aborted_state,
+                staging_work_dir,
+            )
+            == 0
+        )
+        assert not bucket_dataset_path(staging_work_dir, (2,)).exists()
+
+        # When batch 1 fails in lance.write_dataset while holding the
+        # lock, batch 2 waiting on state.lock sees abort and skips
+        # creating a partial dataset.
+        monkeypatch.setattr(staging_ingest, "_LANCE_WRITE_BATCH_SIZE", 1)
+        batch1_locked = threading.Event()
+        batch2_ready = threading.Event()
+        real_to_arrow = staging_ingest._spectra_to_arrow_table
+        converted = 0
+        conv_lock = threading.Lock()
+
+        def _sync_to_arrow(rows):
+            nonlocal converted
+            table = real_to_arrow(rows)
+            with conv_lock:
+                converted += 1
+                idx = converted
+            if idx == 2:
+                batch2_ready.set()
+            return table
+
+        def _fail_first_write(*_args, **_kwargs):
+            batch1_locked.set()
+            assert batch2_ready.wait(timeout=5.0)
+            raise RuntimeError("first batch boom")
+
+        monkeypatch.setattr(
+            staging_ingest, "_spectra_to_arrow_table", _sync_to_arrow
+        )
+        monkeypatch.setattr(lance, "write_dataset", _fail_first_write)
+
+        def _run_failing_batches() -> None:
+            with staging_ingest._LanceBatchWriter(
+                staging.ChargeRouter(None), staging_work_dir, max_workers=2
+            ) as writer:
+                writer.add_spectrum(spectrum_row("s_0", precursor_charge=2))
+                assert batch1_locked.wait(timeout=5.0)
+                writer.add_spectrum(spectrum_row("s_1", precursor_charge=2))
+                assert batch2_ready.wait(timeout=5.0)
+
+        with pytest.raises(RuntimeError, match="first batch boom"):
+            _run_failing_batches()
+
+        assert not bucket_dataset_path(staging_work_dir, (2,)).exists()
+
+        # Main-thread exception sets abort before joining workers.
+        monkeypatch.undo()
+        main_writer = staging_ingest._LanceBatchWriter(
+            staging.ChargeRouter(None), staging_work_dir, max_workers=1
+        )
+
+        def _run_main_error() -> None:
+            with main_writer:
+                main_writer.add_spectrum(
+                    spectrum_row("s_0", precursor_charge=2)
+                )
+                raise ValueError("main thread boom")
+
+        with pytest.raises(ValueError, match="main thread boom"):
+            _run_main_error()
+        assert main_writer._abort.is_set()
+        assert not bucket_dataset_path(staging_work_dir, (2,)).exists()
 
     def test_submit_failure_releases_semaphore_and_leaves_bucket_clean(
         self, staging_work_dir, monkeypatch, spectrum_row
@@ -681,3 +770,51 @@ class TestReadAndStageSpectra:
         ) == [(2,)]
         ds = lance.dataset(str(bucket_dataset_path(work_b, (2,))))
         assert ds.count_rows() == 2
+
+    def test_stage_spectra_preserves_symlink_extension_and_stem(
+        self, tmp_path, mgf_block, mgf_writer, monkeypatch
+    ):
+        store = tmp_path / "store"
+        store.mkdir()
+        raw_blob = store / "sha256_deadbeef"
+        mgf_writer(
+            raw_blob,
+            [mgf_block(TOY_PEAKS_5, 500.0, charge=2, scan=11)],
+        )
+        link_a = tmp_path / "sample_A.mgf"
+        link_b = tmp_path / "sample_B.mgf"
+        link_a.symlink_to(raw_blob)
+        link_b.symlink_to(raw_blob)
+
+        work_single = tmp_path / "work_single"
+        work_multi = tmp_path / "work_multi"
+        assert staging.stage_spectra(
+            [link_a], work_single, _TOY_PROC, None
+        ) == [(2,)]
+        ds_single = lance.dataset(str(bucket_dataset_path(work_single, (2,))))
+        assert ds_single.to_table(columns=["identifier"]).to_pydict()[
+            "identifier"
+        ] == ["sample_A:scan:11"]
+
+        monkeypatch.setattr(staging_ingest, "effective_n_workers", lambda: 2)
+        assert staging.stage_spectra(
+            [link_a, link_b], work_multi, _TOY_PROC, None
+        ) == [(2,)]
+        ds_multi = lance.dataset(str(bucket_dataset_path(work_multi, (2,))))
+        assert sorted(
+            ds_multi.to_table(columns=["identifier"]).to_pydict()["identifier"]
+        ) == ["sample_A:scan:11", "sample_B:scan:11"]
+
+    def test_stage_spectra_propagates_multi_file_worker_error(
+        self, staging_work_dir, mgf_block, mgf_writer, monkeypatch
+    ):
+        good = mgf_writer(
+            staging_work_dir / "good.mgf",
+            [mgf_block(TOY_PEAKS_5, 500.0, charge=2, scan=1)],
+        )
+        missing = staging_work_dir / "missing.mgf"
+        monkeypatch.setattr(staging_ingest, "effective_n_workers", lambda: 2)
+        with pytest.raises(FileNotFoundError, match="Non-existing peak file"):
+            staging.stage_spectra(
+                [good, missing], staging_work_dir, _TOY_PROC, None
+            )

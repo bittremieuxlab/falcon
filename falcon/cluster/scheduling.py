@@ -212,12 +212,18 @@ def precursor_mz_splits(
     Raises
     ------
     ValueError
-        If ``batch_size < 1``, ``precursor_tol_mode`` is invalid,
-        ``precursor_mzs`` is not 1D, or ``precursor_tol_mode == "ppm"``
-        with non-finite or non-positive m/z values.
+        If ``batch_size < 1``, ``precursor_tol_mass`` is non-finite or
+        negative, ``precursor_tol_mode`` is invalid, ``precursor_mzs``
+        is not 1D, or ``precursor_tol_mode == "ppm"`` with non-finite or
+        non-positive m/z values.
     """
     if batch_size < 1:
         raise ValueError(f"batch_size must be at least 1, got {batch_size}")
+    if not math.isfinite(precursor_tol_mass) or precursor_tol_mass < 0.0:
+        raise ValueError(
+            "precursor_tol_mass must be finite and non-negative, got "
+            f"{precursor_tol_mass!r}"
+        )
     if precursor_tol_mode not in _VALID_PRECURSOR_TOL_MODES:
         raise ValueError(
             "precursor_tol_mode must be 'Da' or 'ppm', "
@@ -414,17 +420,19 @@ def prepare_bucket_chunks(
         clustering.batch_size,
     )
 
-    all_specs = [
-        IntervalSpec(
+    normal_specs: list[IntervalSpec] = []
+    giant_specs: list[IntervalSpec] = []
+    for task_id in range(len(splits) - 1):
+        spec = IntervalSpec(
             task_id=task_id,
             row_ids=idx[
                 int(splits[task_id]) : int(splits[task_id + 1])
             ].copy(),
         )
-        for task_id in range(len(splits) - 1)
-    ]
-    normal_specs = [spec for spec in all_specs if spec.n_spectra < threshold]
-    giant_specs = [spec for spec in all_specs if spec.n_spectra >= threshold]
+        if spec.n_spectra < threshold:
+            normal_specs.append(spec)
+        else:
+            giant_specs.append(spec)
     normal_chunks = cost_based_chunking(normal_specs, num_chunks)
     return BucketPlan(
         n_spectra=n,

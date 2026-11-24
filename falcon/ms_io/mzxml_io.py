@@ -86,7 +86,12 @@ def _parse_spectrum(
         spectrum_dict.get("retentionTime")
     )
 
-    precursor = spectrum_dict["precursorMz"][0]
+    precursors = spectrum_dict["precursorMz"]
+    if isinstance(precursors, (str, bytes)):
+        raise TypeError(
+            f"Expected precursorMz sequence, got {type(precursors).__name__}"
+        )
+    precursor = precursors[0]
     if isinstance(precursor, Mapping):
         precursor_mz = precursor["precursorMz"]
         precursor_charge = reader_utils.parse_optional_charge(

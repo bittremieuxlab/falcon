@@ -391,6 +391,54 @@ def finalize_bucket(
     return ClusterResult(cluster_labels, representative_spectra)
 
 
+@dataclass(slots=True)
+class _Pass1Progress:
+    """Track Pass 1 cost/spectrum completion and throttled ETA logs."""
+
+    n_tasks: int
+    total_cost: float
+    total_spectra: int
+    done_tasks: int = 0
+    done_cost: float = 0.0
+    done_spectra: float = 0.0
+    next_log_pct: int = 5
+    start: float = 0.0
+
+    def __post_init__(self) -> None:
+        self.start = time.monotonic()
+
+    def record(self, cost: float, n_spectra: float) -> None:
+        """Record one finished task and log every 5% or on finish."""
+        self.done_tasks += 1
+        self.done_cost += cost
+        self.done_spectra += n_spectra
+        pct = (
+            min(100.0, 100.0 * self.done_cost / self.total_cost)
+            if self.total_cost
+            else 100.0
+        )
+        if pct >= self.next_log_pct or self.done_tasks == self.n_tasks:
+            elapsed = time.monotonic() - self.start
+            remaining_cost = max(0.0, self.total_cost - self.done_cost)
+            eta = (
+                elapsed * remaining_cost / self.done_cost
+                if self.done_cost
+                else 0.0
+            )
+            logger.info(
+                "Clustering progress: %3.0f%% | %d/%d tasks | "
+                "%d/%d spectra processed | elapsed %s | ETA ~%s",
+                pct,
+                self.done_tasks,
+                self.n_tasks,
+                min(self.total_spectra, round(self.done_spectra)),
+                self.total_spectra,
+                format_hms(elapsed),
+                format_hms(eta),
+            )
+            self.next_log_pct = (int(pct) // 5 + 1) * 5
+
+
 def _run_pass1(
     chunk_tasks: Sequence[ChunkTask],
     tile_tasks: Sequence[TileTask],
@@ -437,51 +485,26 @@ def _run_pass1(
             else:
                 yield joblib.delayed(run_chunk)(work_item)
 
-    done_cost = 0.0
-    done_spectra = 0.0
-    next_log_pct = 5
-    start = time.monotonic()
-
+    progress = _Pass1Progress(
+        n_tasks=n_pass1,
+        total_cost=total_cost,
+        total_spectra=total_spectra,
+    )
     done_gen: Any = loky_unordered_pool(pool_workers)(_jobs())
     with contextlib.closing(done_gen) as done_iter:
-        for done_tasks, done in enumerate(done_iter, start=1):
+        for done in done_iter:
             if isinstance(done, ChunkDone):
                 results_by_bucket.setdefault(done.bucket_id, []).extend(
                     done.results
                 )
-                done_cost += done.cost
-                done_spectra += done.n_spectra
+                progress.record(done.cost, done.n_spectra)
             elif isinstance(done, TileDone):
-                done_cost += done.tile_cost
-                done_spectra += done.tile_spectra
+                progress.record(done.tile_cost, done.tile_spectra)
             else:
                 raise TypeError(
                     f"Unexpected Pass 1 completion record: "
                     f"{type(done).__name__}"
                 )
-            pct = (
-                min(100.0, 100.0 * done_cost / total_cost)
-                if total_cost
-                else 100.0
-            )
-            if pct >= next_log_pct or done_tasks == n_pass1:
-                elapsed = time.monotonic() - start
-                remaining_cost = max(0.0, total_cost - done_cost)
-                eta = (
-                    elapsed * remaining_cost / done_cost if done_cost else 0.0
-                )
-                logger.info(
-                    "Clustering progress: %3.0f%% | %d/%d tasks | "
-                    "%d/%d spectra processed | elapsed %s | ETA ~%s",
-                    pct,
-                    done_tasks,
-                    n_pass1,
-                    min(total_spectra, round(done_spectra)),
-                    total_spectra,
-                    format_hms(elapsed),
-                    format_hms(eta),
-                )
-                next_log_pct = (int(pct) // 5 + 1) * 5
 
     return results_by_bucket
 
@@ -498,7 +521,7 @@ def _run_pass2(
     pass2_workers = _pass2_worker_limit(giants, n_workers)
     logger.info("Finalizing %d giant interval(s)...", len(giants))
     finalize_ctx: contextlib.AbstractContextManager[Iterable[GiantDone]]
-    if len(giants) == 1 or pass2_workers <= 1:
+    if pass2_workers <= 1:
         finalize_ctx = contextlib.nullcontext(
             finalize_giant(giant) for giant in giants
         )
@@ -552,6 +575,38 @@ def _plan_buckets(
         for spec in plan.giant_specs:
             raw_giants.append((bucket_id, dataset, spec))
     return plans, chunk_tasks, raw_giants
+
+
+def _prepare_giants(
+    raw_giants: Sequence[tuple[int, lance.LanceDataset, IntervalSpec]],
+    options: ClusteringOptions,
+    n_workers: int,
+    memmap_store: GiantMemmapStore,
+) -> tuple[list[GiantInterval], list[TileTask]]:
+    """Allocate giant memmaps, sort giants by LPT, and plan tiles."""
+    memmap_paths, tile_tasks = allocate_giant_tiles(
+        [(dataset, spec) for _bucket_id, dataset, spec in raw_giants],
+        options.clustering.fragment_tol,
+        options.clustering.min_matched_peaks,
+        n_workers,
+        memmap_store,
+    )
+    giants = [
+        GiantInterval(
+            giant_idx=giant_idx,
+            bucket_id=bucket_id,
+            dataset=dataset,
+            spec=spec,
+            memmap_path=path,
+            options=options,
+        )
+        for giant_idx, ((bucket_id, dataset, spec), path) in enumerate(
+            zip(raw_giants, memmap_paths, strict=True)
+        )
+    ]
+    # LPT ordering for Pass 2 giant finalization.
+    giants.sort(key=lambda giant: giant.spec.cost, reverse=True)
+    return giants, tile_tasks
 
 
 def generate_clusters_multi(
@@ -642,29 +697,9 @@ def generate_clusters_multi(
     )
 
     with GiantMemmapStore(temp_dir=temp_dir_str) as memmap_store:
-        memmap_paths, tile_tasks = allocate_giant_tiles(
-            [(dataset, spec) for _bucket_id, dataset, spec in raw_giants],
-            clustering.fragment_tol,
-            clustering.min_matched_peaks,
-            n_workers,
-            memmap_store,
+        giants, tile_tasks = _prepare_giants(
+            raw_giants, options, n_workers, memmap_store
         )
-        giants = [
-            GiantInterval(
-                giant_idx=giant_idx,
-                bucket_id=bucket_id,
-                dataset=dataset,
-                spec=spec,
-                memmap_path=path,
-                options=options,
-            )
-            for giant_idx, ((bucket_id, dataset, spec), path) in enumerate(
-                zip(raw_giants, memmap_paths, strict=True)
-            )
-        ]
-        # LPT ordering for Pass 2 giant finalization.
-        giants.sort(key=lambda giant: giant.spec.cost, reverse=True)
-
         total_spectra = sum(plan.n_spectra for plan in plans)
         results_by_bucket = _run_pass1(
             chunk_tasks,

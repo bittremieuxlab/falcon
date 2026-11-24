@@ -13,7 +13,7 @@ from . import ms_io
 from .config import format_metadata_lines
 from .dataset import METADATA_COLUMNS, read_canonical_metadata
 from .types import offset_cluster_result
-from .utils import expand_input_globs, find_path_alias
+from .utils import atomic_write_text, expand_input_globs, find_path_alias
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -36,18 +36,24 @@ __all__ = [
 ]
 
 
-def _check_input_output_aliasing(io_cfg: IOConfig) -> None:
-    """Raise ValueError if CSV or MGF output aliases an input file."""
+def _check_output_aliasing(io_cfg: IOConfig) -> None:
+    """Raise ValueError if CSV or MGF aliases input or ``work_dir``."""
     input_candidates = expand_input_globs(
         io_cfg.input_filenames, keep_unmatched_literals=True
     )
+    checks: list[tuple[str, Sequence[Path]]] = [
+        ("input file", input_candidates)
+    ]
+    if io_cfg.work_dir is not None:
+        checks.append(("working directory", (io_cfg.work_dir,)))
     for out_path in (io_cfg.csv_path, io_cfg.mgf_path):
-        alias = find_path_alias(out_path, input_candidates)
-        if alias is not None:
-            raise ValueError(
-                f"Output file {out_path} aliases input file "
-                f"{alias}; choose a distinct output prefix"
-            )
+        for kind, candidates in checks:
+            alias = find_path_alias(out_path, candidates)
+            if alias is not None:
+                raise ValueError(
+                    f"Output file {out_path} aliases {kind} "
+                    f"{alias}; choose a distinct output prefix"
+                )
 
 
 def remove_existing_outputs(io_cfg: IOConfig) -> None:
@@ -85,13 +91,14 @@ def prepare_outputs(io_cfg: IOConfig, *, unlink: bool = True) -> bool:
     Raises
     ------
     ValueError
-        If ``csv_path`` or ``mgf_path`` aliases an input file.
+        If ``csv_path`` or ``mgf_path`` aliases an input file or
+        ``work_dir``.
     FileNotFoundError
         If the parent directory for output files does not exist.
     IsADirectoryError
         If ``csv_path`` or ``mgf_path`` is an existing directory.
     """
-    _check_input_output_aliasing(io_cfg)
+    _check_output_aliasing(io_cfg)
     parent_dir = io_cfg.csv_path.parent
     if not parent_dir.is_dir():
         raise FileNotFoundError(
@@ -155,12 +162,110 @@ def write_cluster_csv(
     work_dir : Path
         Effective working directory recorded in the metadata header.
     """
-    with config.io.csv_path.open("w", encoding="utf-8") as f_out:
+    with atomic_write_text(config.io.csv_path, prefix=".csv_") as f_out:
         for line in format_metadata_lines(config, work_dir=work_dir):
             safe_line = line.replace("\r", "\\r").replace("\n", "\\n")
             f_out.write(f"# {safe_line}\n")
         f_out.write("#\n")
         clusters.to_csv(f_out, index=False, chunksize=1_000_000)
+
+
+def _assemble_cluster_results(
+    bucket_datasets: Sequence[lance.LanceDataset],
+    cluster_results: Sequence[ClusterResult],
+    *,
+    export_representatives: bool,
+) -> tuple[pd.DataFrame, list[ConsensusTuple]]:
+    """Offset bucket labels and assemble naturally sorted metadata."""
+    clusters_all: list[pd.DataFrame] = []
+    current_label = 0
+    representatives: list[ConsensusTuple] = []
+
+    for dataset, result in zip(bucket_datasets, cluster_results, strict=True):
+        n_rows = dataset.count_rows()
+        if n_rows != len(result.labels):
+            raise ValueError(
+                f"Bucket dataset row count ({n_rows}) does not match "
+                f"cluster label count ({len(result.labels)})"
+            )
+        shifted, current_label = offset_cluster_result(
+            result,
+            current_label,
+            include_representatives=export_representatives,
+        )
+        if len(shifted.labels) == 0:
+            continue
+        if export_representatives:
+            representatives.extend(shifted.representatives)
+
+        # Re-read metadata in the canonical order used for clustering.
+        metadata = read_canonical_metadata(dataset, METADATA_COLUMNS)
+        metadata["cluster"] = shifted.labels
+        clusters_all.append(metadata)
+
+    if len(clusters_all) == 1:
+        clusters_df = clusters_all[0]
+    elif clusters_all:
+        clusters_df = pd.concat(clusters_all, ignore_index=True)
+    else:
+        clusters_df = pd.DataFrame(columns=_OUTPUT_COLUMNS)
+    clusters_all.clear()
+
+    if not clusters_df.empty:
+        clusters_df["precursor_charge"] = clusters_df[
+            "precursor_charge"
+        ].astype("Int8")
+        clusters_df = clusters_df.iloc[
+            natsort.index_natsorted(clusters_df["identifier"])
+        ]
+    return clusters_df, representatives
+
+
+def _write_outputs(
+    clusters_df: pd.DataFrame,
+    representatives: Sequence[ConsensusTuple],
+    config: FalconConfig,
+    work_dir: Path,
+) -> None:
+    """Clear stale outputs if requested and write CSV/MGF files."""
+    if config.io.overwrite:
+        remove_existing_outputs(config.io)
+
+    csv_path = config.io.csv_path
+    logger.info(
+        "Export cluster assignments of %d spectra to %d unique "
+        "clusters to output file %s",
+        len(clusters_df),
+        clusters_df["cluster"].nunique(),
+        csv_path,
+    )
+
+    if not config.io.export_representatives:
+        write_cluster_csv(clusters_df, config, work_dir)
+        return
+
+    mgf_path = config.io.mgf_path
+    logger.info(
+        "Export %d cluster representative spectra to output file %s",
+        len(representatives),
+        mgf_path,
+    )
+
+    if clusters_df.empty or not representatives:
+        write_cluster_csv(clusters_df, config, work_dir)
+        ms_io.write_spectra(mgf_path, representatives)
+        return
+
+    # Overlap CSV and MGF writes on background IO threads.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        csv_future = executor.submit(
+            write_cluster_csv, clusters_df, config, work_dir
+        )
+        mgf_future = executor.submit(
+            ms_io.write_spectra, mgf_path, representatives
+        )
+        csv_future.result()
+        mgf_future.result()
 
 
 def export_results(
@@ -189,82 +294,9 @@ def export_results(
         Positionally aligned ``ClusterResult`` records for
         ``bucket_datasets``.
     """
-    clusters_all: list[pd.DataFrame] = []
-    current_label = 0
-    representatives: list[ConsensusTuple] = []
-    export_reps = config.io.export_representatives
-
-    for dataset, result in zip(bucket_datasets, cluster_results, strict=True):
-        n_rows = dataset.count_rows()
-        if n_rows != len(result.labels):
-            raise ValueError(
-                f"Bucket dataset row count ({n_rows}) does not match "
-                f"cluster label count ({len(result.labels)})"
-            )
-        shifted, current_label = offset_cluster_result(
-            result, current_label, include_representatives=export_reps
-        )
-        if len(shifted.labels) == 0:
-            continue
-        if export_reps:
-            representatives.extend(shifted.representatives)
-
-        # Re-read metadata in the canonical order used for clustering.
-        metadata = read_canonical_metadata(dataset, METADATA_COLUMNS)
-        metadata["cluster"] = shifted.labels
-        clusters_all.append(metadata)
-
-    if len(clusters_all) == 1:
-        clusters_df = clusters_all[0]
-    elif clusters_all:
-        clusters_df = pd.concat(clusters_all, ignore_index=True)
-    else:
-        clusters_df = pd.DataFrame(columns=_OUTPUT_COLUMNS)
-    clusters_all.clear()
-
-    if not clusters_df.empty:
-        clusters_df["precursor_charge"] = clusters_df[
-            "precursor_charge"
-        ].astype("Int8")
-        clusters_df = clusters_df.iloc[
-            natsort.index_natsorted(clusters_df["identifier"])
-        ]
-
-    if config.io.overwrite:
-        remove_existing_outputs(config.io)
-
-    csv_path = config.io.csv_path
-    logger.info(
-        "Export cluster assignments of %d spectra to %d unique "
-        "clusters to output file %s",
-        len(clusters_df),
-        clusters_df["cluster"].nunique(),
-        csv_path,
+    clusters_df, representatives = _assemble_cluster_results(
+        bucket_datasets,
+        cluster_results,
+        export_representatives=config.io.export_representatives,
     )
-
-    if not export_reps:
-        write_cluster_csv(clusters_df, config, work_dir)
-        return
-
-    mgf_path = config.io.mgf_path
-    logger.info(
-        "Export %d cluster representative spectra to output file %s",
-        len(representatives),
-        mgf_path,
-    )
-
-    if clusters_df.empty or not representatives:
-        write_cluster_csv(clusters_df, config, work_dir)
-        ms_io.write_spectra(mgf_path, representatives)
-        return
-
-    # Overlap CSV and MGF writes on background IO threads.
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-        csv_future = executor.submit(
-            write_cluster_csv, clusters_df, config, work_dir
-        )
-        mgf_future = executor.submit(
-            ms_io.write_spectra, mgf_path, representatives
-        )
-        csv_future.result()
-        mgf_future.result()
+    _write_outputs(clusters_df, representatives, config, work_dir)

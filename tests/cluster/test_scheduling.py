@@ -127,6 +127,13 @@ class TestPrecursorMzSplits:
             scheduling.precursor_mz_splits(
                 np.array([100.0]), 0.5, "Da", batch_size=0
             )
+        for bad_tol in (-0.1, float("nan"), float("inf")):
+            with pytest.raises(
+                ValueError, match="precursor_tol_mass must be finite"
+            ):
+                scheduling.precursor_mz_splits(
+                    np.array([100.0, 101.0]), bad_tol, "Da", batch_size=10
+                )
         with pytest.raises(ValueError, match="precursor_tol_mode"):
             scheduling.precursor_mz_splits(
                 np.array([100.0, 101.0]), 0.5, "da", batch_size=10

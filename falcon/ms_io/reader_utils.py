@@ -13,10 +13,11 @@ import logging
 import math
 import os
 import zlib
+from collections.abc import Mapping
 from pathlib import Path
 from typing import IO, TYPE_CHECKING, Any, cast
 
-from ..types import PathLike
+from ..types import PathLike, coerce_exact_int
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -57,6 +58,18 @@ def _is_blank(value: Any) -> bool:
     return value is None or (isinstance(value, str) and not value.strip())
 
 
+def _parse_finite_or_nan_rt(
+    raw: Any, *, label: str = "Retention time"
+) -> float:
+    """Convert scalar RT to float, rejecting bools and infinities."""
+    if isinstance(raw, bool):
+        raise TypeError(f"{label} must be numeric, not bool")
+    val = float(raw)
+    if math.isinf(val):
+        raise ValueError(f"{label} must be finite or NaN, got {val!r}")
+    return val
+
+
 def parse_optional_rt(raw_rt: Any) -> float:
     """
     Parse an optional retention time scalar or MGF ``(lo, hi)`` range.
@@ -77,25 +90,32 @@ def parse_optional_rt(raw_rt: Any) -> float:
 
     Raises
     ------
+    TypeError
+        If ``raw_rt`` (or a range endpoint) is a boolean or cannot be
+        converted to float.
     ValueError
-        If a range endpoint is infinite or numeric conversion fails.
+        If a value or range endpoint is infinite, a sequence has more
+        than two elements, or numeric conversion fails.
     """
-    if _is_blank(raw_rt):
-        return float("nan")
     if isinstance(raw_rt, (tuple, list)):
         if not raw_rt:
             return float("nan")
-        if len(raw_rt) >= 2:
-            lo = float(raw_rt[0])
-            hi = float(raw_rt[1])
-            if math.isinf(lo) or math.isinf(hi):
-                raise ValueError(
-                    "Retention time range endpoints must be finite or NaN, "
-                    f"got ({lo!r}, {hi!r})"
-                )
+        if len(raw_rt) == 2:
+            lo = _parse_finite_or_nan_rt(
+                raw_rt[0], label="Retention time range endpoints"
+            )
+            hi = _parse_finite_or_nan_rt(
+                raw_rt[1], label="Retention time range endpoints"
+            )
             return (lo + hi) / 2.0
-        return float(raw_rt[0])
-    return float(raw_rt)
+        if len(raw_rt) != 1:
+            raise ValueError(
+                f"Expected 1 or 2 retention time values, got {len(raw_rt)}"
+            )
+        raw_rt = raw_rt[0]
+    if _is_blank(raw_rt):
+        return float("nan")
+    return _parse_finite_or_nan_rt(raw_rt)
 
 
 def parse_optional_charge(
@@ -120,6 +140,12 @@ def parse_optional_charge(
     -------
     int | None
         Signed integer charge state, or ``None`` when absent.
+
+    Raises
+    ------
+    ValueError
+        If ``raw_charge`` is a boolean, non-integral, or cannot be
+        parsed as an int.
     """
     if isinstance(raw_charge, (list, tuple)):
         if not raw_charge:
@@ -127,7 +153,7 @@ def parse_optional_charge(
         raw_charge = raw_charge[0]
     if _is_blank(raw_charge):
         return None
-    charge = int(raw_charge)
+    charge = coerce_exact_int(raw_charge, label="Precursor charge")
     return -abs(charge) if negative else charge
 
 
@@ -259,20 +285,21 @@ def build_msms_spectrum(
 
     Raises
     ------
+    TypeError
+        If ``precursor_mz`` or ``retention_time`` is a boolean or
+        cannot be converted to float.
     ValueError
         If ``precursor_mz`` is non-finite, ``retention_time`` is
         infinite, or numeric conversion fails.
     """
+    if isinstance(precursor_mz, bool):
+        raise TypeError("Precursor m/z must be numeric, not bool")
     precursor_mz_val = float(precursor_mz)
     if not math.isfinite(precursor_mz_val):
         raise ValueError(
             f"Precursor m/z must be finite, got {precursor_mz_val!r}"
         )
-    retention_time_val = float(retention_time)
-    if math.isinf(retention_time_val):
-        raise ValueError(
-            f"Retention time must be finite or NaN, got {retention_time_val!r}"
-        )
+    retention_time_val = _parse_finite_or_nan_rt(retention_time)
     return _msms_spectrum_cls()(
         identifier,
         precursor_mz_val,
@@ -371,9 +398,12 @@ def iter_xml_spectra(
                     identifier = f"{filename}:scan:{scan_nr}"
                     spectrum = parse_spectrum(spectrum_dict, identifier)
                 except PARSE_EXCEPTIONS as exc:
-                    log_skipped_spectrum(
-                        source, spectrum_dict.get("id"), exc, log=log
+                    raw_id = (
+                        spectrum_dict.get("id")
+                        if isinstance(spectrum_dict, Mapping)
+                        else None
                     )
+                    log_skipped_spectrum(source, raw_id, exc, log=log)
                 else:
                     yield spectrum
     except (

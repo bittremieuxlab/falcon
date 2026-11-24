@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import contextlib
 import glob
 import logging
 import math
 import os
+import stat
 import sys
+import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import IO, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Sequence
+    from collections.abc import Generator, Iterable, Sequence
 
     import joblib
 
@@ -24,6 +27,7 @@ _CGROUP_MEMORY_PATHS: tuple[str, ...] = (
 )
 
 __all__ = [
+    "atomic_write_text",
     "configure_logger",
     "effective_memory_bytes",
     "effective_n_workers",
@@ -32,6 +36,8 @@ __all__ = [
     "format_hms",
     "loky_unordered_pool",
     "paths_alias",
+    "require_regular_file",
+    "resolve_input_files",
     "resolve_path",
 ]
 
@@ -234,6 +240,146 @@ def expand_input_globs(
         ):
             resolved.append(literal)
     return resolved
+
+
+def require_regular_file(
+    path: Path,
+    *,
+    dir_message: str,
+    missing_message: str,
+) -> None:
+    """
+    Verify ``path`` resolves to an existing regular file.
+
+    Uses ``os.stat`` directly so symlink loops (``ELOOP``) and
+    permission errors propagate instead of being masked as missing
+    files.
+
+    Parameters
+    ----------
+    path : Path
+        Filesystem path to verify.
+    dir_message : str
+        Message for ``IsADirectoryError`` when ``path`` is a directory.
+    missing_message : str
+        Message for ``FileNotFoundError`` when ``path`` does not exist
+        or is not a regular file.
+
+    Raises
+    ------
+    IsADirectoryError
+        If ``path`` refers to a directory.
+    FileNotFoundError
+        If ``path`` does not exist, is a broken symlink, or is not a
+        regular file.
+    OSError
+        If ``os.stat`` fails for another OS error such as ``ELOOP``.
+    """
+    try:
+        st = os.stat(path)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(missing_message) from exc
+    if stat.S_ISDIR(st.st_mode):
+        raise IsADirectoryError(dir_message)
+    if not stat.S_ISREG(st.st_mode):
+        raise FileNotFoundError(missing_message)
+
+
+def resolve_input_files(patterns: Sequence[str]) -> list[Path]:
+    """
+    Expand input peak-file glob patterns in deterministic sorted order.
+
+    Matches within each pattern are sorted lexicographically so staging
+    order and cache provenance do not depend on filesystem iteration
+    order. Repeated matches across patterns are preserved.
+
+    Parameters
+    ----------
+    patterns : Sequence[str]
+        File paths or glob patterns from ``config.io.input_filenames``.
+
+    Returns
+    -------
+    list[Path]
+        Expanded peak file paths.
+
+    Raises
+    ------
+    FileNotFoundError
+        If ``patterns`` is empty, any supplied pattern matches no
+        files, or any matched path is not an existing regular file
+        (e.g. a broken symlink).
+    IsADirectoryError
+        If any literal path or glob match refers to a directory.
+    """
+    resolved: list[Path] = []
+    for pattern in patterns:
+        matches = expand_input_globs([pattern])
+        if not matches:
+            raise FileNotFoundError(
+                f"Input peak path/pattern matched no files: {pattern!r}"
+            )
+        for path in matches:
+            require_regular_file(
+                path,
+                dir_message=(
+                    f"Input peak path is a directory, not a file: {path}"
+                ),
+                missing_message=(
+                    f"Input peak path is not an existing regular file: {path}"
+                ),
+            )
+        resolved.extend(matches)
+    if not resolved:
+        raise FileNotFoundError("No input peak files supplied")
+    return resolved
+
+
+@contextlib.contextmanager
+def atomic_write_text(
+    path: Path,
+    *,
+    prefix: str = ".falcon_",
+    encoding: str = "utf-8",
+) -> Generator[IO[str], None, None]:
+    """
+    Atomically write text to ``path`` via a sibling temporary file.
+
+    Creates a temporary file in ``path.parent``, yields an open text
+    stream, and atomically replaces ``path`` on normal exit. Closes the
+    descriptor and unlinks the temporary file if opening or writing
+    fails.
+
+    Parameters
+    ----------
+    path : Path
+        Destination file path whose parent directory must exist.
+    prefix : str, default=".falcon_"
+        Filename prefix for the sibling temporary file.
+    encoding : str, default="utf-8"
+        Text encoding for the yielded stream.
+
+    Yields
+    ------
+    IO[str]
+        Writable text stream backed by the sibling temporary file.
+    """
+    fd, tmp_name = tempfile.mkstemp(
+        dir=path.parent, prefix=prefix, suffix=".tmp"
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        try:
+            f_out = os.fdopen(fd, "w", encoding=encoding)
+        except BaseException:
+            os.close(fd)
+            raise
+        with f_out:
+            yield f_out
+        os.replace(tmp_path, path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
 
 
 def format_hms(seconds: float) -> str:

@@ -87,6 +87,17 @@ def _has_valid_metadata(spectrum: sus.MsmsSpectrum) -> bool:
     )
 
 
+def _subset_spectrum(
+    spectrum: sus.MsmsSpectrum, selector: slice | np.ndarray
+) -> sus.MsmsSpectrum:
+    """Slice ``mz``, ``intensity``, and optional ``annotation``."""
+    spectrum.mz = spectrum.mz[selector]
+    spectrum.intensity = spectrum.intensity[selector]
+    if spectrum.annotation is not None:
+        spectrum.annotation = spectrum.annotation[selector]
+    return spectrum
+
+
 def _restrict_mz_range(
     spectrum: sus.MsmsSpectrum,
     min_mz: float | None,
@@ -103,11 +114,7 @@ def _restrict_mz_range(
     )
     if lo == 0 and hi == n_peaks:
         return spectrum
-    spectrum.mz = spectrum.mz[lo:hi]
-    spectrum.intensity = spectrum.intensity[lo:hi]
-    if spectrum.annotation is not None:
-        spectrum.annotation = spectrum.annotation[lo:hi]
-    return spectrum
+    return _subset_spectrum(spectrum, slice(lo, hi))
 
 
 def _norm_intensity(spectrum_intensity: np.ndarray) -> np.ndarray:
@@ -158,11 +165,9 @@ def _remove_precursor_peak(
     keep = np.ones(len(spectrum.mz), dtype=bool)
     for target in targets:
         keep &= np.abs(mz_f64 - target) > remove_precursor_tol
-    spectrum.mz = spectrum.mz[keep]
-    spectrum.intensity = spectrum.intensity[keep]
-    if spectrum.annotation is not None:
-        spectrum.annotation = spectrum.annotation[keep]
-    return spectrum
+    if keep.all():
+        return spectrum
+    return _subset_spectrum(spectrum, keep)
 
 
 def process_spectrum(

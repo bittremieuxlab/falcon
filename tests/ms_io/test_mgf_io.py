@@ -21,6 +21,14 @@ def _mgf_entry(params, mz=(100.0, 200.0), intensity=(50.0, 100.0)):
     }
 
 
+def _read_mgf_dicts(
+    monkeypatch, fake_reader_factory, raw_dicts, source="run.mgf"
+):
+    """Run ``mgf_io.get_spectra`` against stubbed Pyteomics records."""
+    monkeypatch.setattr(pyteomics.mgf, "MGF", fake_reader_factory(raw_dicts))
+    return list(mgf_io.get_spectra(source))
+
+
 # ----------------------------------------------------------------------
 # Reading MGF spectra and identifier construction
 # ----------------------------------------------------------------------
@@ -112,8 +120,9 @@ class TestMgfRead:
                 {"scans": "4", "rtinseconds": (float("inf"), float("-inf"))}
             ),
         ]
-        monkeypatch.setattr(pyteomics.mgf, "MGF", fake_reader_factory(entries))
-        spectra = list(mgf_io.get_spectra("rt_edges.mgf"))
+        spectra = _read_mgf_dicts(
+            monkeypatch, fake_reader_factory, entries, source="rt_edges.mgf"
+        )
         assert [s.identifier for s in spectra] == [
             "rt_edges:scan:1",
             "rt_edges:scan:2",
@@ -132,9 +141,13 @@ class TestMgfRead:
             _mgf_entry({"scans": "3", "charge": "2-"}),
             _mgf_entry({"scans": "4", "charge": [2]}),
         ]
-        monkeypatch.setattr(pyteomics.mgf, "MGF", fake_reader_factory(entries))
         with caplog.at_level(logging.DEBUG, logger="falcon.ms_io.mgf_io"):
-            spectra = list(mgf_io.get_spectra("charges.mgf"))
+            spectra = _read_mgf_dicts(
+                monkeypatch,
+                fake_reader_factory,
+                entries,
+                source="charges.mgf",
+            )
         assert [s.identifier for s in spectra] == [
             "charges:scan:1",
             "charges:scan:2",
@@ -296,14 +309,12 @@ class TestMgfRead:
             "scans_edge:scan:0",
         ]
         # Numeric 0 in params dict is also preserved.
-        monkeypatch.setattr(
-            pyteomics.mgf,
-            "MGF",
-            fake_reader_factory([_mgf_entry({"scans": 0})]),
-        )
-        assert [s.identifier for s in mgf_io.get_spectra("run.mgf")] == [
-            "run:scan:0"
-        ]
+        assert [
+            s.identifier
+            for s in _read_mgf_dicts(
+                monkeypatch, fake_reader_factory, [_mgf_entry({"scans": 0})]
+            )
+        ] == ["run:scan:0"]
 
     def test_filename_param_overrides_disk_stem_unless_empty_stem(
         self, tmp_path
@@ -580,14 +591,67 @@ class TestMgfWriteAndRoundtrip:
     @pytest.mark.parametrize(
         "bad_precursor_mz", [float("nan"), float("inf"), float("-inf")]
     )
-    def test_non_finite_precursor_mz_raises_value_error(
+    def test_non_finite_precursor_mz_raises_and_leaves_no_partial_file(
         self, tmp_path, bad_precursor_mz, consensus_factory
     ):
+        target = tmp_path / "bad.mgf"
         spec = consensus_factory()._replace(precursor_mz=bad_precursor_mz)
         with pytest.raises(
             ValueError, match="Representative precursor_mz must be finite"
         ):
-            mgf_io.write_spectra(tmp_path / "bad.mgf", [spec])
+            mgf_io.write_spectra(target, [consensus_factory(), spec])
+        assert not target.exists()
+        assert list(tmp_path.glob(".mgf_*.tmp")) == []
+
+    @pytest.mark.parametrize(
+        ("field", "bad_val", "match"),
+        [
+            (
+                "mz",
+                np.array([100.0, np.nan], dtype=np.float32),
+                "must be finite",
+            ),
+            (
+                "intensity",
+                np.array([1.0, np.inf], dtype=np.float32),
+                "must be finite",
+            ),
+            ("precursor_charge", 2.7, "must be an integer"),
+        ],
+    )
+    def test_format_rejects_non_finite_peaks_and_non_integral_charge(
+        self, tmp_path, consensus_factory, field, bad_val, match
+    ):
+        target = tmp_path / "invalid.mgf"
+        spec = consensus_factory()._replace(**{field: bad_val})
+        with pytest.raises(ValueError, match=match):
+            mgf_io.write_spectra(target, [spec])
+        assert not target.exists()
+
+    @pytest.mark.parametrize(
+        "field", ["precursor_mz", "retention_time", "precursor_charge"]
+    )
+    def test_bool_metadata_fields_raise_value_error_and_leave_no_file(
+        self, tmp_path, consensus_factory, field
+    ):
+        out = tmp_path / f"bool_{field}.mgf"
+        spec = consensus_factory(charge=2)._replace(**{field: True})
+        with pytest.raises(ValueError, match="must be numeric, not bool"):
+            mgf_io.write_spectra(out, [spec])
+        assert not out.exists()
+
+    def test_bare_string_pepmass_is_skipped(
+        self, monkeypatch, fake_reader_factory
+    ):
+        # Bare string pepmass is skipped rather than indexing str[0].
+        raws = [
+            _mgf_entry({"pepmass": "450.25", "scans": 1}),
+            _mgf_entry({"pepmass": (500.0, None), "scans": 2}),
+        ]
+        spectra = _read_mgf_dicts(
+            monkeypatch, fake_reader_factory, raws, source="bad_pepmass.mgf"
+        )
+        assert [s.identifier for s in spectra] == ["bad_pepmass:scan:2"]
 
     def test_roundtrip_positive_negative_and_missing_metadata(
         self, tmp_path, consensus_factory

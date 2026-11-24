@@ -7,7 +7,12 @@ from typing import TYPE_CHECKING, Any
 
 from .. import __version__
 from ..types import NONE_SENTINEL
-from ..utils import expand_input_globs, find_path_alias, resolve_path
+from ..utils import (
+    atomic_write_text,
+    expand_input_globs,
+    find_path_alias,
+    resolve_path,
+)
 from .models import (
     ConfigError,
     FalconSettings,
@@ -374,8 +379,10 @@ def write_saved_config(config: FalconConfig, destination: str | Path) -> None:
         working-directory path, or cannot be written.
     """
     dest = _validate_save_destination(config, destination)
+    toml_text = format_toml(config)
     try:
-        dest.write_text(format_toml(config), encoding="utf-8")
+        with atomic_write_text(dest, prefix=".config_") as f_out:
+            f_out.write(toml_text)
     except OSError as exc:
         raise ConfigError(
             f"Failed to write configuration to {dest}: {exc}"

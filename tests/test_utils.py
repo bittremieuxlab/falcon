@@ -383,3 +383,61 @@ class TestMemoryAndCgroupLimits:
 
             monkeypatch.setattr(os, "sysconf", _fail)
             assert utils.effective_memory_bytes() is None
+
+
+class TestAtomicWriteText:
+    def test_writes_atomically_and_cleans_temp_file_on_error(self, tmp_path):
+        target = tmp_path / "result.txt"
+        with utils.atomic_write_text(target, prefix=".test_") as f_out:
+            f_out.write("hello\n")
+            assert not target.exists()
+        assert target.read_text(encoding="utf-8") == "hello\n"
+        assert list(tmp_path.glob(".test_*.tmp")) == []
+
+        def _fail_write() -> None:
+            with utils.atomic_write_text(target, prefix=".test_") as f_out:
+                f_out.write("partial")
+                raise RuntimeError("write failed")
+
+        with pytest.raises(RuntimeError, match="write failed"):
+            _fail_write()
+        assert target.read_text(encoding="utf-8") == "hello\n"
+        assert list(tmp_path.glob(".test_*.tmp")) == []
+
+
+class TestRequireRegularFile:
+    def test_accepts_regular_file_and_rejects_dir_missing_fifo_and_loop(
+        self, tmp_path
+    ):
+        regular = tmp_path / "ok.mgf"
+        regular.write_text("data", encoding="utf-8")
+        utils.require_regular_file(
+            regular, dir_message="is dir", missing_message="is missing"
+        )
+
+        with pytest.raises(IsADirectoryError, match="is dir"):
+            utils.require_regular_file(
+                tmp_path, dir_message="is dir", missing_message="is missing"
+            )
+
+        with pytest.raises(FileNotFoundError, match="is missing"):
+            utils.require_regular_file(
+                tmp_path / "missing.mgf",
+                dir_message="is dir",
+                missing_message="is missing",
+            )
+
+        fifo = tmp_path / "stream.mgf"
+        os.mkfifo(fifo)
+        with pytest.raises(FileNotFoundError, match="is missing"):
+            utils.require_regular_file(
+                fifo, dir_message="is dir", missing_message="is missing"
+            )
+
+        loop = tmp_path / "loop.mgf"
+        loop.symlink_to(loop)
+        with pytest.raises(OSError, match=r".+") as exc_info:
+            utils.require_regular_file(
+                loop, dir_message="is dir", missing_message="is missing"
+            )
+        assert not isinstance(exc_info.value, FileNotFoundError)

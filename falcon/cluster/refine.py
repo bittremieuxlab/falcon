@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING, get_args
 
 import numba as nb
@@ -41,7 +42,16 @@ def cut_linkage(linkage_matrix: np.ndarray, threshold: float) -> np.ndarray:
     -------
     np.ndarray
         Zero-based int32 flat cluster assignment array of length ``n``.
+
+    Raises
+    ------
+    ValueError
+        If ``threshold`` is negative or non-finite.
     """
+    if not math.isfinite(threshold) or threshold < 0.0:
+        raise ValueError(
+            f"threshold must be finite and non-negative, got {threshold!r}"
+        )
     return (sch.fcluster(linkage_matrix, threshold, "distance") - 1).astype(
         np.int32
     )

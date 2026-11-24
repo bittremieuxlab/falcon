@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import functools
 import math
+import numbers
 import os
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypedDict
 
@@ -63,6 +64,7 @@ __all__ = [
     "ScalingMethod",
     "SpectrumTuple",
     "charge_sort_key",
+    "coerce_exact_int",
     "make_consensus_tuple",
     "mz_bin_bounds",
     "offset_cluster_result",
@@ -151,6 +153,43 @@ class ClusterResult(NamedTuple):
     representatives: list[ConsensusTuple]
 
 
+def coerce_exact_int(value: Any, *, label: str = "Value") -> int:
+    """
+    Convert an integer, integral float, or integer string to ``int``.
+
+    Rejects booleans and non-integral or non-finite floats instead of
+    silently truncating them.
+
+    Parameters
+    ----------
+    value : Any
+        Numeric or integer-string value to convert.
+    label : str, default="Value"
+        Field label used in validation error messages.
+
+    Returns
+    -------
+    int
+        Exact integer value.
+
+    Raises
+    ------
+    ValueError
+        If ``value`` is a boolean, a non-integral or non-finite real
+        number, or an unparsable string.
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"{label} must be an integer, not bool")
+    if isinstance(value, numbers.Integral):
+        return int(value)
+    if isinstance(value, numbers.Real):
+        fval = float(value)
+        if not math.isfinite(fval) or not fval.is_integer():
+            raise ValueError(f"{label} must be an integer, got {value!r}")
+        return int(fval)
+    return int(value)
+
+
 def make_consensus_tuple(
     precursor_mz: float | np.floating[Any],
     precursor_charge: Any,
@@ -183,13 +222,24 @@ def make_consensus_tuple(
     -------
     ConsensusTuple
         Typed representative spectrum record.
+
+    Raises
+    ------
+    ValueError
+        If ``precursor_charge`` is a boolean or a non-integral finite
+        float.
     """
     np = _numpy()
 
-    if precursor_charge is None or not math.isfinite(float(precursor_charge)):
+    if precursor_charge is None or (
+        not isinstance(precursor_charge, bool)
+        and not math.isfinite(float(precursor_charge))
+    ):
         norm_charge: np.int32 | float = np.nan
     else:
-        norm_charge = np.int32(precursor_charge)
+        norm_charge = np.int32(
+            coerce_exact_int(precursor_charge, label="precursor_charge")
+        )
     return ConsensusTuple(
         precursor_mz=np.float32(precursor_mz),
         precursor_charge=norm_charge,
@@ -226,23 +276,47 @@ def offset_cluster_result(
     tuple[ClusterResult, int]
         Shifted ``ClusterResult`` and the next available global label
         offset (``max(shifted_labels) + 1``, or ``offset`` if empty).
+
+    Raises
+    ------
+    ValueError
+        If ``offset`` is negative or ``result.labels`` is not 1D.
+    OverflowError
+        If adding ``offset`` overflows int32 cluster IDs.
     """
     np = _numpy()
 
-    if len(result.labels) == 0:
+    if offset < 0:
+        raise ValueError(f"offset must be non-negative, got {offset}")
+    labels_arr = np.asarray(result.labels, dtype=np.int32)
+    if labels_arr.ndim != 1:
+        raise ValueError(
+            f"result.labels must be 1D, got shape {labels_arr.shape}"
+        )
+    if labels_arr.size == 0:
         return ClusterResult(np.empty(0, dtype=np.int32), []), offset
 
-    offset_labels = np.asarray(result.labels, dtype=np.int32) + np.int32(
-        offset
-    )
+    max_label = int(np.max(labels_arr))
+    if max_label + offset > INT32_MAX:
+        raise OverflowError(
+            f"Offsetting max cluster label {max_label} by {offset} exceeds "
+            f"int32 maximum ({INT32_MAX})"
+        )
+    offset_labels = labels_arr + np.int32(offset)
     if include_representatives and result.representatives:
-        offset_reps = [
-            rep._replace(cluster_id=np.int32(int(rep.cluster_id) + offset))
-            for rep in result.representatives
-        ]
+        offset_reps: list[ConsensusTuple] = []
+        for rep in result.representatives:
+            shifted_id = int(rep.cluster_id) + offset
+            if shifted_id > INT32_MAX:
+                raise OverflowError(
+                    f"Offsetting representative cluster_id "
+                    f"{int(rep.cluster_id)} by {offset} exceeds int32 "
+                    f"maximum ({INT32_MAX})"
+                )
+            offset_reps.append(rep._replace(cluster_id=np.int32(shifted_id)))
     else:
         offset_reps = []
-    next_offset = int(np.max(offset_labels)) + 1
+    next_offset = max_label + offset + 1
     return ClusterResult(offset_labels, offset_reps), next_offset
 
 

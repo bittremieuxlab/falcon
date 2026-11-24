@@ -12,6 +12,8 @@ import numpy as np
 import pyteomics.mgf
 from pyteomics.auxiliary import PyteomicsError
 
+from ..types import coerce_exact_int
+from ..utils import atomic_write_text
 from . import reader_utils
 
 if TYPE_CHECKING:
@@ -136,7 +138,12 @@ def _parse_spectrum(
     mz_array = spectrum_dict["m/z array"]
     intensity_array = spectrum_dict["intensity array"]
     retention_time = reader_utils.parse_optional_rt(params.get("rtinseconds"))
-    precursor_mz = params["pepmass"][0]
+    pepmass = params["pepmass"]
+    if isinstance(pepmass, (str, bytes)):
+        raise TypeError(
+            f"Expected pepmass sequence, got {type(pepmass).__name__}"
+        )
+    precursor_mz = pepmass[0]
     precursor_charge = reader_utils.parse_optional_charge(params.get("charge"))
 
     return reader_utils.build_msms_spectrum(
@@ -149,8 +156,10 @@ def _parse_spectrum(
     )
 
 
-def _is_present(value: Any) -> bool:
+def _is_present(value: Any, *, label: str) -> bool:
     """Return True if a numeric metadata value is present and finite."""
+    if isinstance(value, bool):
+        raise ValueError(f"{label} must be numeric, not bool")
     return value is not None and math.isfinite(float(value))
 
 
@@ -174,22 +183,39 @@ def _format_spectrum(spectrum: ConsensusTuple, scan_nr: int) -> str:
     Raises
     ------
     ValueError
-        If ``spectrum.precursor_mz`` is not finite.
+        If ``spectrum.precursor_mz``, ``spectrum.mz``, or
+        ``spectrum.intensity`` contains non-finite values, if any
+        numeric metadata field is a boolean, or if a present
+        ``precursor_charge`` is non-integral.
     """
-    if not _is_present(spectrum.precursor_mz):
+    if not _is_present(
+        spectrum.precursor_mz, label="Representative precursor_mz"
+    ):
         raise ValueError(
             "Representative precursor_mz must be finite, got "
             f"{spectrum.precursor_mz!r}"
         )
+    if not (
+        np.all(np.isfinite(spectrum.mz))
+        and np.all(np.isfinite(spectrum.intensity))
+    ):
+        raise ValueError("Representative peak arrays must be finite")
     lines = [
         "BEGIN IONS",
         f"TITLE=falcon:cluster:{spectrum.cluster_id}",
         f"PEPMASS={float(spectrum.precursor_mz)}",
     ]
-    if _is_present(spectrum.retention_time):
+    if _is_present(
+        spectrum.retention_time, label="Representative retention_time"
+    ):
         lines.append(f"RTINSECONDS={float(spectrum.retention_time)}")
-    if _is_present(spectrum.precursor_charge):
-        charge = int(spectrum.precursor_charge)
+    if _is_present(
+        spectrum.precursor_charge, label="Representative precursor_charge"
+    ):
+        charge = coerce_exact_int(
+            spectrum.precursor_charge,
+            label="Representative precursor_charge",
+        )
         sign = "+" if charge >= 0 else "-"
         lines.append(f"CHARGE={abs(charge)}{sign}")
     lines.append(f"SCANS={scan_nr}")
@@ -209,7 +235,7 @@ def write_spectra(
     filename: PathLike, spectra: Iterable[ConsensusTuple]
 ) -> None:
     """
-    Write representative spectra to an MGF file.
+    Write representative spectra atomically to an MGF file.
 
     Parameters
     ----------
@@ -220,7 +246,7 @@ def write_spectra(
     """
     buffer: list[str] = []
     buffered_chars = 0
-    with Path(filename).open("w", encoding="utf-8") as f_out:
+    with atomic_write_text(Path(filename), prefix=".mgf_") as f_out:
         for scan_nr, spectrum in enumerate(spectra, start=1):
             block = _format_spectrum(spectrum, scan_nr)
             buffer.append(block)

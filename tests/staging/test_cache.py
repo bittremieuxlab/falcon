@@ -637,3 +637,49 @@ class TestLoadOrStageBuckets:
             )
             == []
         )
+
+    def test_symlink_rename_or_repoint_invalidates_staging_cache(
+        self, tmp_path, config_factory
+    ):
+        store = tmp_path / "store"
+        store.mkdir()
+        target_a = store / "blob_a"
+        target_b = store / "blob_b"
+        target_a.write_text("AAAA", encoding="utf-8")
+        target_b.write_text("BBBB", encoding="utf-8")
+        st = os.stat(target_a)
+        os.utime(target_b, ns=(st.st_atime_ns, st.st_mtime_ns))
+
+        link_a = tmp_path / "sample_A.mgf"
+        link_b = tmp_path / "sample_B.mgf"
+        link_a.symlink_to(target_a)
+        link_b.symlink_to(target_a)
+
+        cfg_a = config_factory(
+            input_filenames=[str(link_a)], output_filename=tmp_path / "out"
+        )
+        cfg_b = config_factory(
+            input_filenames=[str(link_b)], output_filename=tmp_path / "out"
+        )
+        manifest_a = staging.build_staging_manifest(
+            cfg_a, [link_a], buckets=[(2,)]
+        )
+        manifest_b = staging.build_staging_manifest(
+            cfg_b, [link_b], buckets=[(2,)]
+        )
+        assert manifest_a["inputs"][0]["path"].endswith("sample_A.mgf")
+        assert manifest_a["inputs"][0]["target"] == str(target_a.resolve())
+        assert staging.diff_staging_manifests(manifest_a, manifest_b) == [
+            "inputs"
+        ]
+
+        # Repointing the symlink to another blob with equal size and
+        # mtime_ns also invalidates via the recorded target path.
+        link_a.unlink()
+        link_a.symlink_to(target_b)
+        manifest_repointed = staging.build_staging_manifest(
+            cfg_a, [link_a], buckets=[(2,)]
+        )
+        assert staging.diff_staging_manifests(
+            manifest_a, manifest_repointed
+        ) == ["inputs"]

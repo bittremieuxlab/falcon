@@ -1,4 +1,4 @@
-"""Input discovery, charge routing, and batch-routed Lance ingestion."""
+"""Charge routing and batch-routed Lance ingestion."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import collections
 import concurrent.futures
 import contextlib
 import logging
+import os
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -24,21 +25,18 @@ from ..dataset import (
     spectra_dir,
 )
 from ..types import (
+    INT8_MAX,
+    INT8_MIN,
     INT32_MAX,
     OTHER_BUCKET,
     UNKNOWN_CHARGE,
     charge_sort_key,
     parse_charge_bucket_list,
 )
-from ..utils import (
-    effective_n_workers,
-    expand_input_globs,
-    loky_unordered_pool,
-    resolve_path,
-)
+from ..utils import effective_n_workers, loky_unordered_pool
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping, Sequence
+    from collections.abc import Callable, Iterator, Mapping, Sequence
     from types import TracebackType
 
     import spectrum_utils.spectrum as sus
@@ -62,58 +60,8 @@ _MAX_AUTO_WRITER_WORKERS = 8
 
 __all__ = [
     "ChargeRouter",
-    "resolve_input_files",
     "stage_spectra",
 ]
-
-
-def resolve_input_files(patterns: Sequence[str]) -> list[Path]:
-    """
-    Expand input peak-file glob patterns in deterministic sorted order.
-
-    Matches within each pattern are sorted lexicographically so staging
-    order and cache provenance do not depend on filesystem iteration
-    order. Repeated matches across patterns are preserved.
-
-    Parameters
-    ----------
-    patterns : Sequence[str]
-        File paths or glob patterns from ``config.io.input_filenames``.
-
-    Returns
-    -------
-    list[Path]
-        Expanded peak file paths.
-
-    Raises
-    ------
-    FileNotFoundError
-        If ``patterns`` is empty, any supplied pattern matches no
-        files, or any matched path is not an existing regular file
-        (e.g. a broken symlink).
-    IsADirectoryError
-        If any literal path or glob match refers to a directory.
-    """
-    resolved: list[Path] = []
-    for pattern in patterns:
-        matches = expand_input_globs([pattern])
-        if not matches:
-            raise FileNotFoundError(
-                f"Input peak path/pattern matched no files: {pattern!r}"
-            )
-        for path in matches:
-            if path.is_dir():
-                raise IsADirectoryError(
-                    f"Input peak path is a directory, not a file: {path}"
-                )
-            if not path.is_file():
-                raise FileNotFoundError(
-                    f"Input peak path is not an existing regular file: {path}"
-                )
-        resolved.extend(matches)
-    if not resolved:
-        raise FileNotFoundError("No input peak files supplied")
-    return resolved
 
 
 class ChargeRouter:
@@ -183,10 +131,30 @@ class ChargeRouter:
         ChargeBucket | None
             Target charge bucket key, or ``None`` if the spectrum should
             be dropped.
+
+        Raises
+        ------
+        ValueError
+            If ``raw_charge`` is a boolean, not an integer/``None``, or
+            outside the int8 range ``[-128, 127]``.
         """
-        charge: ChargeValue = (
-            UNKNOWN_CHARGE if raw_charge is None else int(raw_charge)
-        )
+        if raw_charge is None:
+            charge: ChargeValue = UNKNOWN_CHARGE
+        elif isinstance(raw_charge, bool) or not isinstance(
+            raw_charge, (int, np.integer)
+        ):
+            raise ValueError(
+                "Precursor charge must be an int8 integer or None, got "
+                f"{raw_charge!r}"
+            )
+        else:
+            charge_int = int(raw_charge)
+            if not (INT8_MIN <= charge_int <= INT8_MAX):
+                raise ValueError(
+                    f"Precursor charge {charge_int} is outside int8 range "
+                    f"[{INT8_MIN}, {INT8_MAX}]"
+                )
+            charge = charge_int
         if self._canonical_buckets is None:
             return (charge,)
         bucket = self._charge_to_bucket.get(charge)
@@ -255,39 +223,42 @@ def _spectra_to_arrow_table(
     spec_to_write: Sequence[Mapping[str, Any]],
 ) -> pa.Table:
     """Build a columnar PyArrow table matching ``SPECTRUM_SCHEMA``."""
-    n = len(spec_to_write)
+    identifiers: list[str] = []
+    precursor_mzs: list[Any] = []
+    charges: list[int | None] = []
+    rts: list[Any] = []
     mz_arrays: list[np.ndarray] = []
     int_arrays: list[np.ndarray] = []
+
     for idx, spec in enumerate(spec_to_write):
         mz = np.asarray(spec["mz"], dtype=np.float32)
         intensity = np.asarray(spec["intensity"], dtype=np.float32)
+        if mz.ndim != 1 or intensity.ndim != 1:
+            raise ValueError(
+                f"Spectrum {idx} peak arrays must be 1D, got shapes "
+                f"{mz.shape} and {intensity.shape}"
+            )
         if len(mz) != len(intensity):
             raise ValueError(
                 f"Spectrum {idx} has mismatched mz ({len(mz)}) and intensity "
                 f"({len(intensity)}) lengths"
             )
+        identifiers.append(spec["identifier"])
+        precursor_mzs.append(spec["precursor_mz"])
+        charges.append(spec["precursor_charge"])
+        rts.append(spec["retention_time"])
         mz_arrays.append(mz)
         int_arrays.append(intensity)
 
     offsets = _compute_list_offsets(mz_arrays)
-    precursor_mz = np.fromiter(
-        (s["precursor_mz"] for s in spec_to_write), dtype=np.float32, count=n
-    )
     return pa.table(
         {
-            "identifier": pa.array(
-                [s["identifier"] for s in spec_to_write], type=pa.string()
-            ),
-            "precursor_mz": pa.array(precursor_mz, type=pa.float32()),
-            "precursor_charge": pa.array(
-                [s["precursor_charge"] for s in spec_to_write], type=pa.int8()
-            ),
+            "identifier": pa.array(identifiers, type=pa.string()),
+            "precursor_mz": pa.array(precursor_mzs, type=pa.float32()),
+            "precursor_charge": pa.array(charges, type=pa.int8()),
             "mz": _build_list_array(mz_arrays, offsets),
             "intensity": _build_list_array(int_arrays, offsets),
-            "retention_time": pa.array(
-                [s["retention_time"] for s in spec_to_write],
-                type=pa.float32(),
-            ),
+            "retention_time": pa.array(rts, type=pa.float32()),
         },
         schema=SPECTRUM_SCHEMA,
     )
@@ -295,10 +266,11 @@ def _spectra_to_arrow_table(
 
 @dataclass(slots=True)
 class _BucketState:
-    """Per-bucket serialization lock and first-batch init flag."""
+    """Per-bucket serialization lock, init flag, and shared abort."""
 
     lock: threading.Lock = field(default_factory=threading.Lock)
     initialized: bool = False
+    abort: threading.Event = field(default_factory=threading.Event)
 
 
 def _write_to_dataset(
@@ -308,20 +280,21 @@ def _write_to_dataset(
     work_dir: Path,
 ) -> int:
     """Convert a batch to Arrow and write or append it to Lance."""
+    if state.abort.is_set():
+        return 0
     new_rows = _spectra_to_arrow_table(spec_to_write)
     path = bucket_dataset_path(work_dir, charge_bucket)
     with state.lock:
+        if state.abort.is_set():
+            return 0
         if state.initialized:
             lance.write_dataset(new_rows, str(path), mode="append")
         else:
-            effective_mode = "overwrite" if path.exists() else "create"
-            logger.debug(
-                "Writing lance dataset at %s (mode=%s)", path, effective_mode
-            )
+            logger.debug("Writing lance dataset at %s (mode=overwrite)", path)
             lance.write_dataset(
                 new_rows,
                 str(path),
-                mode=effective_mode,
+                mode="overwrite",
                 data_storage_version="stable",
             )
             state.initialized = True
@@ -354,8 +327,9 @@ class _LanceBatchWriter:
         self._inflight_sem = threading.BoundedSemaphore(
             max(2, max_workers * 2)
         )
+        self._abort = threading.Event()
         self._bucket_states: dict[ChargeBucket, _BucketState] = (
-            collections.defaultdict(_BucketState)
+            collections.defaultdict(lambda: _BucketState(abort=self._abort))
         )
         self._pending: dict[ChargeBucket, list[ProcessedSpectrum]] = (
             collections.defaultdict(list)
@@ -385,15 +359,18 @@ class _LanceBatchWriter:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
-        if exc_type is not None:
-            self._executor.shutdown(wait=True, cancel_futures=True)
-            return
+        cancel = exc_type is not None
+        if cancel:
+            self._abort.set()
         try:
-            self._flush_and_wait()
+            if not cancel:
+                self._flush_and_wait()
         except BaseException:
-            self._executor.shutdown(wait=True, cancel_futures=True)
+            self._abort.set()
+            cancel = True
             raise
-        self._executor.shutdown(wait=True)
+        finally:
+            self._executor.shutdown(wait=True, cancel_futures=cancel)
 
     def _consume_future(self, fut: concurrent.futures.Future[int]) -> None:
         """Collect one completed future count or re-raise its error."""
@@ -416,6 +393,9 @@ class _LanceBatchWriter:
         def _task() -> int:
             try:
                 return _write_to_dataset(batch, bucket, state, self._work_dir)
+            except BaseException:
+                self._abort.set()
+                raise
             finally:
                 self._inflight_sem.release()
 
@@ -461,6 +441,18 @@ def _writer_workers(router: ChargeRouter, n_workers: int) -> int:
     return max(1, min(n_workers, _MAX_AUTO_WRITER_WORKERS))
 
 
+def _iter_processed_spectra(
+    filename: Path,
+    process_spectrum: Callable[[sus.MsmsSpectrum], ProcessedSpectrum | None],
+) -> Iterator[ProcessedSpectrum | None]:
+    """Yield preprocessed spectra (or ``None`` if rejected) per file."""
+    abs_path = (
+        filename if filename.is_absolute() else Path(os.path.abspath(filename))
+    )
+    for spec in ms_io.get_spectra(abs_path):
+        yield process_spectrum(spec)
+
+
 def _read_spectra(
     filename: Path,
     process_spectrum: Callable[[sus.MsmsSpectrum], ProcessedSpectrum | None],
@@ -468,14 +460,28 @@ def _read_spectra(
     """Read and preprocess all spectra from a single peak file."""
     low_quality_counter = 0
     spectra: list[ProcessedSpectrum] = []
-    abs_path = filename if filename.is_absolute() else resolve_path(filename)
-    for spec in ms_io.get_spectra(abs_path):
-        processed = process_spectrum(spec)
+    for processed in _iter_processed_spectra(filename, process_spectrum):
         if processed is None:
             low_quality_counter += 1
         else:
             spectra.append(processed)
     return spectra, low_quality_counter
+
+
+def _stream_files(
+    files: Sequence[Path],
+    process_spectrum: Callable[[sus.MsmsSpectrum], ProcessedSpectrum | None],
+    writer: _LanceBatchWriter,
+) -> int:
+    """Stream single-worker peak files directly into ``writer``."""
+    low_quality_counter = 0
+    for file in files:
+        for processed in _iter_processed_spectra(file, process_spectrum):
+            if processed is None:
+                low_quality_counter += 1
+            else:
+                writer.add_spectrum(processed)
+    return low_quality_counter
 
 
 def stage_spectra(
@@ -509,10 +515,20 @@ def stage_spectra(
     -------
     list[ChargeBucket]
         Charge buckets for which a Lance dataset was created.
+
+    Raises
+    ------
+    FileNotFoundError
+        If ``input_filenames`` is empty or a peak file does not exist.
+    IsADirectoryError
+        If an input path refers to a directory.
+    ValueError
+        If ``charge_buckets`` or a peak file extension is invalid.
     """
-    # Resolve in the parent process so warm loky workers do not look up
-    # relative paths against a stale working directory after chdir().
-    resolved_files = [resolve_path(Path(fn)) for fn in input_filenames]
+    # Absolutize without dereferencing symlinks so warm loky workers
+    # remain unaffected by os.chdir() while preserving symlink stems
+    # and extensions for format dispatch and spectrum identifiers.
+    resolved_files = [Path(os.path.abspath(fn)) for fn in input_filenames]
     if not resolved_files:
         raise FileNotFoundError("No input peak files supplied")
 
@@ -527,13 +543,9 @@ def stage_spectra(
     low_quality_counter = 0
     with _LanceBatchWriter(router, work_path, writer_workers) as writer:
         if max_file_workers == 1:
-            for file in resolved_files:
-                for spec in ms_io.get_spectra(file):
-                    processed = process_spectrum(spec)
-                    if processed is None:
-                        low_quality_counter += 1
-                    else:
-                        writer.add_spectrum(processed)
+            low_quality_counter = _stream_files(
+                resolved_files, process_spectrum, writer
+            )
         else:
             parallel_iter = loky_unordered_pool(max_file_workers)(
                 joblib.delayed(_read_spectra)(file, process_spectrum)

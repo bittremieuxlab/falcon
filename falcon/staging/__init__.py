@@ -8,9 +8,11 @@ bucket naming conventions live in :mod:`falcon.dataset`.
 
 from __future__ import annotations
 
+import importlib
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from ..utils import resolve_input_files
     from .cache import (
         STAGING_CACHE_FILENAME,
         STAGING_CACHE_SCHEMA_VERSION,
@@ -22,28 +24,21 @@ if TYPE_CHECKING:
     )
     from .ingest import (
         ChargeRouter,
-        resolve_input_files,
         stage_spectra,
     )
 
-_CACHE_EXPORTS = frozenset(
-    {
-        "STAGING_CACHE_FILENAME",
-        "STAGING_CACHE_SCHEMA_VERSION",
-        "build_staging_manifest",
-        "deserialize_cached_buckets",
-        "diff_staging_manifests",
-        "load_or_stage_buckets",
-        "serialize_cached_buckets",
-    }
-)
-_INGEST_EXPORTS = frozenset(
-    {
-        "ChargeRouter",
-        "resolve_input_files",
-        "stage_spectra",
-    }
-)
+_LAZY_EXPORTS: dict[str, str] = {
+    "STAGING_CACHE_FILENAME": ".cache",
+    "STAGING_CACHE_SCHEMA_VERSION": ".cache",
+    "build_staging_manifest": ".cache",
+    "deserialize_cached_buckets": ".cache",
+    "diff_staging_manifests": ".cache",
+    "load_or_stage_buckets": ".cache",
+    "serialize_cached_buckets": ".cache",
+    "ChargeRouter": ".ingest",
+    "stage_spectra": ".ingest",
+    "resolve_input_files": "..utils",
+}
 
 __all__ = [
     "STAGING_CACHE_FILENAME",
@@ -60,17 +55,11 @@ __all__ = [
 
 
 def __getattr__(name: str) -> Any:
-    """Lazily expose staging cache and ingestion APIs."""
-    if name in _CACHE_EXPORTS:
-        from . import cache
-
-        value = getattr(cache, name)
-        globals()[name] = value
-        return value
-    if name in _INGEST_EXPORTS:
-        from . import ingest
-
-        value = getattr(ingest, name)
+    """Lazily expose staging cache, input, and ingestion APIs."""
+    module_name = _LAZY_EXPORTS.get(name)
+    if module_name is not None:
+        module = importlib.import_module(module_name, __name__)
+        value = getattr(module, name)
         globals()[name] = value
         return value
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

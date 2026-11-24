@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import math
 import os
 import tempfile
 from typing import TYPE_CHECKING
@@ -135,25 +136,34 @@ def pack_spectra_csr(
     n = len(spec_tuples)
     offsets = np.empty(n + 1, dtype=np.int64)
     offsets[0] = 0
+    mz_arrays: list[np.ndarray] = []
+    int_arrays: list[np.ndarray] = []
     for i, spec in enumerate(spec_tuples):
-        n_mz = len(spec.mz)
-        if n_mz != len(spec.intensity):
+        mz_arr = np.asarray(spec.mz, dtype=np.float32)
+        int_arr = np.asarray(spec.intensity, dtype=np.float32)
+        if mz_arr.ndim != 1 or int_arr.ndim != 1:
+            raise ValueError(
+                f"Spectrum {i} peak arrays must be 1D, got shapes "
+                f"{mz_arr.shape} and {int_arr.shape}"
+            )
+        n_mz = len(mz_arr)
+        if n_mz != len(int_arr):
             raise ValueError(
                 f"Spectrum {i} has mismatched mz ({n_mz}) and intensity "
-                f"({len(spec.intensity)}) lengths"
+                f"({len(int_arr)}) lengths"
             )
         offsets[i + 1] = offsets[i] + n_mz
+        mz_arrays.append(mz_arr)
+        int_arrays.append(int_arr)
     total_peaks = int(offsets[n])
     if total_peaks == 0:
         empty = np.empty(0, dtype=np.float32)
         return empty, empty, offsets
-    mz_flat = np.concatenate(
-        [np.asarray(s.mz, dtype=np.float32) for s in spec_tuples]
+    return (
+        np.concatenate(mz_arrays),
+        np.concatenate(int_arrays),
+        offsets,
     )
-    intensity_flat = np.concatenate(
-        [np.asarray(s.intensity, dtype=np.float32) for s in spec_tuples]
-    )
-    return mz_flat, intensity_flat, offsets
 
 
 def open_shared_condensed(
@@ -241,6 +251,21 @@ def _validate_csr_buffers(
     return int(offsets.shape[0]) - 1
 
 
+def _validate_distance_params(
+    fragment_tol: float, min_matched_peaks: int
+) -> None:
+    """Validate fragment matching tolerance and peak-match floor."""
+    if not math.isfinite(fragment_tol) or fragment_tol < 0.0:
+        raise ValueError(
+            "fragment_tol must be finite and non-negative, got "
+            f"{fragment_tol!r}"
+        )
+    if min_matched_peaks < 0:
+        raise ValueError(
+            f"min_matched_peaks must be non-negative, got {min_matched_peaks}"
+        )
+
+
 def compute_condensed_distance_matrix_csr(
     mz_flat: np.ndarray,
     intensity_flat: np.ndarray,
@@ -286,6 +311,7 @@ def compute_condensed_distance_matrix_csr(
         If CSR arrays or offsets have invalid shape, dtype, order, or
         bounds.
     """
+    _validate_distance_params(fragment_tol, min_matched_peaks)
     n = _validate_csr_buffers(mz_flat, intensity_flat, offsets)
     if n < 2:
         return np.empty(0, dtype=np.float32)
@@ -366,6 +392,7 @@ def compute_condensed_distance_matrix(
         Float32 condensed upper-triangle distance vector of length
         ``n * (n - 1) // 2``.
     """
+    _validate_distance_params(fragment_tol, min_matched_peaks)
     if len(spec_tuples) < 2:
         return np.empty(0, dtype=np.float32)
     mz_flat, intensity_flat, offsets = pack_spectra_csr(spec_tuples)
@@ -421,6 +448,7 @@ def fill_condensed_rows_csr(
         If row bounds, condensed buffer dtype/size, or CSR arrays are
         invalid.
     """
+    _validate_distance_params(fragment_tol, min_matched_peaks)
     n = _validate_csr_buffers(mz_flat, intensity_flat, offsets)
     if r0 < 0 or r1 < 0 or r0 > n or r1 > n or r0 > r1:
         raise ValueError(

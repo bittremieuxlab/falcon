@@ -40,6 +40,14 @@ class TestCutLinkage:
             assert actual.dtype == np.int32
             np.testing.assert_array_equal(actual, expected)
 
+    @pytest.mark.parametrize(
+        "bad_threshold", [-0.1, float("nan"), float("inf"), float("-inf")]
+    )
+    def test_rejects_negative_or_non_finite_threshold(self, bad_threshold):
+        z = refine.linkage_1d(np.array([10.0, 11.0, 20.0]), "Da")
+        with pytest.raises(ValueError, match="finite and non-negative"):
+            refine.cut_linkage(z, bad_threshold)
+
 
 class TestLinkage1D:
     def test_da_exact_and_matches_scipy_complete_linkage(self):
